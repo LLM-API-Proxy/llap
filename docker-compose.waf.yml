@@ -1,0 +1,83 @@
+# docker/docker-compose.waf.yml — ModSecurity CRS WAF overlay.
+#
+# Adds an out-of-band ModSecurity CRS sidecar inspected via the
+# traefik-modsecurity-plugin. The sidecar only inspects request copies —
+# it is NOT in the response data path, so SSE streaming is unaffected.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.waf.yml up -d
+
+services:
+  modsecurity:
+    image: owasp/modsecurity-crs:4-nginx-alpine-202503170904
+    networks:
+      - proxy_net
+    ports:
+      - "[::1]:8180:80"
+    environment:
+      # CRS Paranoia Level 1 — catches the vast majority of real attacks
+      # with minimal false positives.
+      PARANOIA: "1"
+      # 50 MB body limit for LLM payloads (base64 vision images can be ~25 MB)
+      MODSEC_REQ_BODY_LIMIT: "52428800"
+      MODSEC_REQ_BODY_NOFILES_LIMIT: "52428800"
+      # Disable response body access — SSE streaming is incompatible with
+      # response buffering. The out-of-band model means this sidecar never
+      # sees responses anyway.
+      MODSEC_RESP_BODY_ACCESS: "Off"
+      # Audit logging — only log triggered rules
+      MODSEC_AUDIT_ENGINE: "RelevantOnly"
+      MODSEC_AUDIT_LOG_TYPE: "Serial"
+      # Allowed request content types
+      ALLOWED_REQUEST_CONTENT_TYPE: "application/json|application/x-www-form-urlencoded|multipart/form-data|text/event-stream|text/plain"
+    volumes:
+      - ./modsecurity/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+        reservations:
+          cpus: "0.1"
+          memory: 64m
+
+  # Add WAF middleware to the proxy-api router.
+  # Traefik uses host networking and reaches the sidecar at [::1]:8180.
+  proxy:
+    labels:
+      - traefik.http.routers.proxy-api.middlewares=modsecurity-waf@docker,hsts@docker
+      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.modSecurityUrl=http://[::1]:8180"
+      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.maxBodySize=52428800"
+
+  traefik:
+    command:
+      # IMPORTANT: Compose replaces command arrays entirely — this MUST include
+      # ALL flags from the base compose plus any new ones. If using multiple
+      # overlays that set command (hardened, tls, waf), only the LAST one wins.
+      # The installer's compose-command.sh ensures correct overlay ordering.
+      # Full base flags are repeated here for standalone WAF testing.
+      - "--providers.consul.endpoints=[::1]:8500"
+      - "--providers.consul.rootkey=traefik"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      - "--entrypoints.websecure.address=[::]:443"
+      - "--entrypoints.forward-proxy.address=[::]:8443"
+      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
+      - "--api=false"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      # Traefik metrics endpoint for Prometheus scraping
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entrypoint=metrics"
+      - "--entrypoints.metrics.address=[::1]:8082"
+      # ModSecurity WAF plugin
+      - "--experimental.plugins.modsecurity.moduleName=github.com/acouvreur/traefik-modsecurity-plugin"
+      - "--experimental.plugins.modsecurity.version=v1.6.0"

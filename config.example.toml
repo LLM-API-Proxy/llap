@@ -1,0 +1,163 @@
+# llm-api-proxy configuration example
+# Copy to config.toml and fill in your values.
+# All values can also be set via PROXY_* environment variables.
+
+# PostgreSQL connection URL (required)
+# database_url = "postgres://user:password@[::1]:5432/llm_proxy"
+
+# Address to bind the management API and reverse proxy server.
+# IPv6-first: "::" binds all IPv6 interfaces (dual-stack where kernel has net.ipv6.conf.all.disable_ipv6=0).
+listen_addr = "::"
+
+# Port for the management API and reverse proxy (HTTP/HTTPS via Traefik)
+listen_port = 3000
+
+# Port for the forward proxy (CONNECT handler / TLS interception)
+# Deprecated: prefer [forward_proxy] section below.
+forward_proxy_port = 3001
+
+# Source for the Key Encryption Key: "env" or "vault"
+kek_source = "env"
+
+# The KEK value when kek_source = "env" (required, no default — server refuses to start if unset)
+# Must be exactly 64 lowercase hex characters (32 bytes). Base64 is NOT accepted.
+# Generate with: openssl rand -hex 32
+# kek_value = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Log level filter
+# Examples: "info", "debug", "warn", "error", "warn,proxy_server=debug"
+log_level = "info"
+
+# Log format: "text" (human readable) or "json" (structured, for production)
+log_format = "text"
+
+# TLS configuration — managed by Traefik (see docs/tls-setup.md)
+# To enable automated TLS, run the stack with the TLS compose override:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.tls.yml \
+#     --env-file docker/tls.env up -d
+#
+# Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
+#   PROXY_TLS__ENABLED=true            (not PROXY_TLS_ENABLED — that is silently ignored)
+#   PROXY_TLS__DOMAIN=proxy.example.com
+#   PROXY_TLS__ACME_EMAIL=admin@example.com
+[tls]
+# Whether automated TLS (ACME/Let's Encrypt via DNS-01) is active.
+# Set to true when using docker/docker-compose.tls.yml.
+# Env: PROXY_TLS__ENABLED (double underscore)
+enabled = false
+
+# Your public hostname (e.g. proxy.example.com or *.example.com for wildcard).
+# Used in /.well-known/proxy-info.json and for HTTPS URL generation.
+# Must be a bare hostname without scheme or port.
+# Env: PROXY_TLS__DOMAIN (double underscore — figment nested struct convention)
+# domain = "proxy.example.com"
+
+# Email address for Let's Encrypt ACME registration.
+# Required when enabled = true. Also consumed by the Traefik container via
+# --certificatesresolvers.cloudflare.acme.email=${PROXY_TLS__ACME_EMAIL}.
+# One env var, two consumers (Rust config + Traefik CLI).
+# Env: PROXY_TLS__ACME_EMAIL (double underscore)
+# acme_email = "admin@example.com"
+
+# ACME CA server URL. Defaults to Let's Encrypt production when not set.
+# For testing, use the staging URL to avoid production rate limits:
+#   https://acme-staging-v02.api.letsencrypt.org/directory
+# This value is surfaced by /manage/v1/tls/status so operators can verify
+# which CA is in use without inspecting Traefik logs.
+# Env: PROXY_TLS__ACME_CA (double underscore)
+# acme_ca = "https://acme-v02.api.letsencrypt.org/directory"
+
+# ── mDNS / DNS-SD service discovery ──────────────────────────────────────────
+#
+# The proxy advertises itself on the local network via multicast DNS (mDNS /
+# DNS-SD, RFC 6762 / RFC 6763) so that operator tooling and clients can
+# discover it automatically without manual DNS configuration.
+#
+# mDNS is ON by default. To disable it set `enabled = false` here or:
+#   PROXY_MDNS__ENABLED=false
+#
+# Note on advertised ports: the ports announced in DNS-SD TXT/SRV records
+# are taken from `listen_port` (default 3000, the management API + reverse
+# proxy) and `forward_proxy_port` (default 3001, the CONNECT handler).  When
+# running with host networking (as the Docker Compose stack does) these ports
+# bind directly on the host interface.  If 3000 or 3001 are already in use on
+# your host, override them via:
+#   PROXY_LISTEN_PORT=<free_port>
+#   PROXY_FORWARD_PROXY_PORT=<free_port>
+#
+# Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
+#   PROXY_MDNS__ENABLED=false               (not PROXY_MDNS_ENABLED — silently ignored)
+#   PROXY_MDNS__INSTANCE_NAME=my-proxy
+#   PROXY_MDNS__SERVICE_TYPE=_llm-proxy._tcp
+#   PROXY_MDNS__REFRESH_INTERVAL_SECS=30
+[mdns]
+# Whether to advertise this proxy via mDNS on the local network.
+# Defaults to true. Set to false in cloud / restricted-multicast environments.
+# Env: PROXY_MDNS__ENABLED (double underscore)
+enabled = true
+
+# Human-readable instance name for DNS-SD records.
+# When empty (the default) the mDNS service layer uses "{hostname}-{listen_port}".
+# Must be ≤ 63 characters and contain only letters, digits, and hyphens when set.
+# Env: PROXY_MDNS__INSTANCE_NAME (double underscore)
+# instance_name = "my-llm-proxy"
+
+# DNS-SD service type WITHOUT the ".local." suffix (appended by the service layer).
+# Default: "_llm-proxy._tcp"
+# Must match "_<name>._tcp" or "_<name>._udp" pattern.
+# Env: PROXY_MDNS__SERVICE_TYPE (double underscore)
+service_type = "_llm-proxy._tcp"
+
+# How often (in seconds) the mDNS service re-announces the record.
+# Must be > 0. Validated at service-layer startup, not during config parsing.
+# Env: PROXY_MDNS__REFRESH_INTERVAL_SECS (double underscore)
+refresh_interval_secs = 30
+
+# ── Forward proxy TCP listener ────────────────────────────────────────────────
+#
+# Controls the raw TCP listener for HTTP CONNECT tunnelling.
+# Clients set HTTPS_PROXY=http://host:3001 to use this mode.
+#
+# Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
+#   PROXY_FORWARD_PROXY__ENABLED=true
+#   PROXY_FORWARD_PROXY__PORT=8080
+#   PROXY_FORWARD_PROXY__REQUIRE_AUTH=true
+[forward_proxy]
+# Whether the raw TCP CONNECT listener is active. Default: true.
+# Env: PROXY_FORWARD_PROXY__ENABLED (double underscore)
+enabled = true
+
+# Port for the TCP CONNECT listener. Default: 3001.
+# Env: PROXY_FORWARD_PROXY__PORT (double underscore)
+port = 3001
+
+# Whether Proxy-Authorization is required on every CONNECT request.
+# When false (default), unauthenticated tunnels are permitted.
+# Clients must then include Authorization: Bearer prx-... inside the tunnel.
+# Env: PROXY_FORWARD_PROXY__REQUIRE_AUTH (double underscore)
+require_auth = false
+
+# Whether TLS interception (MITM mode) is active. Default: true.
+#
+# The proxy MITMs ALL traffic (HTTP, HTTPS, WebSockets) by default — this is
+# the intended operating mode. Inspection is required to enforce per-key model
+# restrictions, rate limits, usage accounting, and request logging.
+#
+# Set to false only when MITM is explicitly undesired (e.g. non-LLM passthrough
+# or environments that prohibit TLS interception). Requires a CA certificate
+# (ca_storage_dir or ca_cert_pem / ca_key_pem) when true.
+#
+# Env: PROXY_FORWARD_PROXY__TLS_INTERCEPT (double underscore)
+tls_intercept = true
+
+# ── Forward proxy CA certificate persistence ──────────────────────────────────
+#
+# Path to directory for persisting the forward proxy CA certificate.
+# On first startup: CA cert and key are generated and written here.
+# On subsequent startups: the existing pair is loaded from this directory.
+# Partial state (one file without the other) causes a startup error.
+# Expired CA causes a startup error — delete both files and restart to rotate.
+# When unset: ephemeral CA is generated on each startup (development only).
+# In production, set to the proxy_ca_data volume mount path (/ca).
+# Env: PROXY_CA_STORAGE_DIR
+# ca_storage_dir = "/ca"

@@ -1,0 +1,165 @@
+# docker-compose.tls.yml — TLS override for automated HTTPS via Traefik ACME
+#
+# This file augments docker/docker-compose.yml to enable automated TLS termination
+# using Traefik's ACME integration with Let's Encrypt (DNS-01 challenge / Cloudflare).
+#
+# Usage:
+#   # Without TLS (default):
+#   docker compose -f docker/docker-compose.yml up -d
+#
+#   # With automated TLS:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.tls.yml \
+#     --env-file docker/tls.env up -d
+#
+# Required environment variables (set in docker/tls.env — copy from tls.env.example):
+#   PROXY_TLS__ACME_EMAIL   — ACME registration email address (also used by Rust config)
+#   PROXY_TLS__DOMAIN       — Public hostname for this proxy (e.g. proxy.example.com)
+#
+#   One of the following Cloudflare auth modes MUST be set:
+#
+#   Preferred — Scoped API Token (Zone > DNS > Edit for your specific zone only):
+#     CF_DNS_API_TOKEN=<scoped-token>
+#     Token scope: Zone > DNS > Edit for the specific zone only (NOT account-wide).
+#     A scoped token limits blast radius if the secret is exposed.
+#
+#   Legacy break-glass — Global API Key (high-privilege — avoid in production):
+#     CF_API_EMAIL=admin@example.com
+#     CF_API_KEY=<global-api-key>
+#     WARNING: The global API key has account-wide permissions. Treat it as a
+#     root credential. Use a scoped API token wherever possible.
+#
+#   WARNING: Do NOT set both CF_DNS_API_TOKEN and CF_API_EMAIL/CF_API_KEY simultaneously.
+#   The Cloudflare lego provider uses CF_DNS_API_TOKEN if set and falls back to the
+#   global key pair. Mixed configuration is unsupported and may produce unexpected errors.
+#
+# HTTP->HTTPS redirect policy:
+#   This overlay adds the web entrypoint ([::]:80) and configures Traefik to
+#   permanently redirect all HTTP traffic to HTTPS (301). API clients should use
+#   https:// directly, but the redirect provides a safe fallback for operators and
+#   browsers.
+#
+# Propagation checks:
+#   DNS propagation checking is disabled (propagation.disablechecks=true). No DNS
+#   resolver addresses are configured — none are needed since propagation checks are
+#   disabled. A fixed 30-second delay (propagation.delaybeforechecks=30s) allows the
+#   TXT record to propagate via Cloudflare's anycast DNS before Let's Encrypt verifies it.
+#
+# ACME CA server:
+#   Default: https://acme-v02.api.letsencrypt.org/directory (production)
+#   For development/testing use the staging server to avoid rate limits:
+#     ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
+#   Production rate limit: 5 duplicate certificate requests per domain per 7-day window.
+#   ALWAYS test with staging first.
+#
+# IMPORTANT — acme_data volume:
+#   The acme_data named volume stores issued certificates at /acme/acme.json.
+#   Running `docker compose down -v` DESTROYS this volume and all stored certificates.
+#   This will trigger a fresh certificate request on next startup. If you exceed the
+#   production rate limit (5 certs/domain/week) you must wait for the window to reset.
+#   Backup certificates before running `down -v`:
+#     docker run --rm -v acme_data:/data -v $PWD:/backup \
+#       busybox tar czf /backup/acme_backup.tar.gz /data
+#
+# Host networking:
+#   Traefik inherits network_mode: host from docker-compose.yml. Port mappings are
+#   not used — Traefik binds directly to the host's IPv6 interfaces.
+
+services:
+  traefik:
+    # network_mode: host is inherited from the base compose file.
+    # No ports: block — Traefik binds directly to host interfaces via host networking.
+    command:
+      # Consul KV provider: TLS options are seeded into Consul by consul-init (#240).
+      # Traefik inherits network_mode: host from base compose and reaches Consul at
+      # [::1]:8500 via the published host port. rootkey=traefik matches the KV prefix
+      # used by consul-init.
+      #
+      # Startup race note: if Consul is unavailable when Traefik starts, Traefik
+      # will load no TLS options from Consul and fall back to defaults (TLS 1.0
+      # allowed). The depends_on: consul-init: service_completed_successfully ordering
+      # in the base compose prevents this under normal operation.
+      - "--providers.consul.endpoints=[::1]:8500"
+      - "--providers.consul.rootkey=traefik"
+      # Docker provider: discovers routing config from container labels
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      # Entrypoints — IPv6-only; dual-stack where kernel has ipv6 enabled
+      - "--entrypoints.web.address=[::]:80"
+      - "--entrypoints.websecure.address=[::]:443"
+      - "--entrypoints.forward-proxy.address=[::]:8443"
+      # Disable response buffering for SSE streaming
+      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
+      # HTTP->HTTPS permanent redirect (301)
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      # ACME certificate resolver — DNS-01 challenge via Cloudflare
+      # Traefik v3 CLI flag names (all lowercase). Note: these differ from the YAML keys.
+      # delaybeforechecks uses Go duration string format ("30s"), not a plain integer.
+      # No resolver addresses: propagation.disablechecks=true means Traefik never
+      # queries DNS servers to verify TXT record propagation.
+      - "--certificatesresolvers.cloudflare.acme.email=${PROXY_TLS__ACME_EMAIL}"
+      - "--certificatesresolvers.cloudflare.acme.storage=/acme/acme.json"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge=true"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.propagation.disablechecks=true"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.propagation.delaybeforechecks=30s"
+      - "--certificatesresolvers.cloudflare.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+      # Pre-fetch certificate for the configured domain at startup.
+      # Required because the proxy-api router uses PathPrefix('/') with no Host() constraint;
+      # Traefik cannot derive the certificate domain from the router rule alone.
+      - "--entrypoints.websecure.http.tls.certresolver=cloudflare"
+      - "--entrypoints.websecure.http.tls.domains[0].main=${PROXY_TLS__DOMAIN}"
+      # Dashboard and API disabled
+      - "--api=false"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    environment:
+      # Pass TLS configuration env vars into the Traefik container.
+      # PROXY_TLS__ACME_EMAIL is shared: consumed by both the Rust proxy config
+      # (via figment double-underscore splitting) and by Traefik's ACME email flag.
+      - PROXY_TLS__ACME_EMAIL=${PROXY_TLS__ACME_EMAIL}
+      - PROXY_TLS__DOMAIN=${PROXY_TLS__DOMAIN}
+      # Cloudflare authentication — set ONLY ONE auth mode (see header comment).
+      # Unset variables are passed as empty strings and ignored by Traefik/lego.
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN:-}
+      - CF_API_EMAIL=${CF_API_EMAIL:-}
+      - CF_API_KEY=${CF_API_KEY:-}
+      # CA server override — use staging URL for testing (avoids rate limits)
+      - ACME_CA_SERVER=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+    volumes:
+      # Docker socket for label-based service discovery (inherited from base compose;
+      # listed here explicitly to ensure it remains present in TLS overlay merges)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # ACME certificate storage — writable named volume at /acme.
+      # /acme is a separate, clean mount point kept distinct from any config files.
+      - acme_data:/acme
+
+  # This overlay patches the `proxy` service from docker-compose.yml (the base compose).
+  # It is NOT designed for use with docker-compose.prod.yml, which uses `proxy-server`.
+  # For prod + TLS, docker-compose.prod.yml already includes certresolver=cloudflare on
+  # `proxy-server` directly (see that file for details).
+  proxy:
+    environment:
+      # Wire TLS config into the Rust proxy process so it knows TLS is active.
+      # These vars are consumed by ProxyConfig.tls (double-underscore figment splitting).
+      # Without this, the proxy will report tls.enabled=false even though Traefik
+      # is serving HTTPS, causing /manage/v1/tls/status and HTTPS URL generation to be wrong.
+      - PROXY_TLS__ENABLED=true
+      - PROXY_TLS__DOMAIN=${PROXY_TLS__DOMAIN}
+      - PROXY_TLS__ACME_EMAIL=${PROXY_TLS__ACME_EMAIL}
+    labels:
+      # TLS overlay: add certresolver so the ACME cloudflare resolver issues certificates
+      # for the proxy-api router. The base compose sets routing labels; this overlay adds
+      # the ACME certresolver label so certificates are obtained automatically.
+      # The entrypoints.websecure.http.tls.certresolver flag on Traefik pre-fetches a
+      # wildcard cert at startup; this label ensures the per-router resolver is also set.
+      - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
+
+volumes:
+  # Named volume for ACME certificate storage.
+  # WARNING: destroyed by `docker compose down -v`. Back up before running with -v.
+  # See backup instructions in the header comment above.
+  acme_data:

@@ -1,0 +1,437 @@
+# docker/docker-compose.prod.yml — Production-grade Docker Compose configuration.
+#
+# This file extends the base docker-compose.yml with production-specific
+# settings: resource limits, health checks, persistent volumes, TLS termination
+# via Traefik, and observability via Prometheus + Grafana.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
+#
+# Or standalone (supplies all services):
+#   docker compose -f docker/docker-compose.prod.yml up -d
+#
+# Environment variables are loaded from a `.env` file in the same directory.
+# See `tls.env.example` for the required variables.
+
+services:
+
+  # ─── TimescaleDB ─────────────────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
+      POSTGRES_USER: ${POSTGRES_USER:-proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxy} -d ${POSTGRES_DB:-llm_proxy}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+
+  # ─── Consul (service discovery / KV store) ────────────────────────────────────
+  consul:
+    image: hashicorp/consul:1.22
+    restart: unless-stopped
+    command: >-
+      consul agent
+      -server
+      -bootstrap-expect 1
+      -client=[::]
+      -data-dir=/consul/data
+      -acl-default-policy=deny
+      -acl-enable-token-persistence=true
+    volumes:
+      - consul_data:/consul/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://[::1]:8500/v1/status/leader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128m
+
+  # ─── Consul KV init (one-shot) ───────────────────────────────────────────────
+  # Seeds Traefik TLS options into Consul KV before Traefik starts, and
+  # provisions ACL policies + tokens for the backup subsystem (#279).
+  #
+  # Must run after Consul is healthy and must complete successfully before
+  # Traefik is allowed to start (see traefik.depends_on below).
+  #
+  # Requires Docker Compose v2.1+ for service_completed_successfully condition.
+  #
+  # In prod, Consul is reachable at consul:8500 via the Docker bridge network.
+  #
+  # ACL policy/token provisioning:
+  #   consul-init creates two least-privilege policies and their tokens on every
+  #   run.  All create operations are idempotent: duplicate names are silently
+  #   ignored (exit 0) and the existing policy/token is left untouched.
+  #   Token SecretIDs are printed to stdout so operators can capture them on the
+  #   first run and store them in their .env file.
+  #
+  #   Policies created:
+  #     backup-agent-write     — write on proxy/backup/* (backup service)
+  #     proxy-server-backup-rw — read/write on proxy/backup/* (proxy-server)
+  #
+  #   Tokens created (description used as stable idempotency key):
+  #     backup-agent-token        → set as BACKUP_CONSUL_HTTP_TOKEN
+  #     proxy-server-backup-token → set as PROXY_BACKUP_CONSUL_TOKEN
+  consul-init:
+    image: hashicorp/consul:1.22
+    # restart: "no" — one-shot init container; must not be restarted after exit.
+    restart: "no"
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - proxy-net
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      # ACL management token for consul-init.  Must have acl:write permission.
+      # On first deploy this is the bootstrap management token (obtained via
+      # `consul acl bootstrap`).  See tls.env.example for the bootstrap procedure.
+      # Leave empty in ACL-disabled environments (e.g. dev compose which uses
+      # Consul dev mode without ACL).
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+
+        # ── Traefik TLS KV options ─────────────────────────────────────────────
+        # Idempotent: only write each key if it does not already exist.
+        # This makes re-deploys safe — no data is overwritten.
+        consul kv get traefik/tls/options/strong-tls/minVersion > /dev/null 2>&1 || \
+          consul kv put traefik/tls/options/strong-tls/minVersion VersionTLS12
+        consul kv get traefik/tls/options/strong-tls/cipherSuites/0 > /dev/null 2>&1 || {
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/0 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/1 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/2 TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/3 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/4 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/5 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+
+        # ── Backup ACL policies ────────────────────────────────────────────────
+        # Skip policy/token provisioning when no management token is set.
+        # This keeps the init container functional in ACL-disabled dev environments.
+        if [ -n "${CONSUL_HTTP_TOKEN:-}" ]; then
+
+          # Policy: backup-agent-write
+          # Grants write (which implies read) on the proxy/backup/ KV prefix.
+          # Used by the restic backup agent to publish heartbeat, status, and job
+          # results, and to consume trigger requests written by the proxy-server.
+          consul acl policy create \
+            -name "backup-agent-write" \
+            -description "Backup agent: write proxy/backup/* KV keys" \
+            -rules 'key_prefix "proxy/backup/" { policy = "write" }' 2>/dev/null \
+          || consul acl policy update \
+            -name "backup-agent-write" \
+            -description "Backup agent: write proxy/backup/* KV keys" \
+            -rules 'key_prefix "proxy/backup/" { policy = "write" }'
+
+          # Policy: proxy-server-backup-rw
+          # Grants write (which implies read) on the proxy/backup/ KV prefix.
+          # Used by the proxy-server to trigger backup runs, read current status,
+          # and write operator configuration.  Narrowly scoped — no access to
+          # traefik/ or any other KV prefix.
+          consul acl policy create \
+            -name "proxy-server-backup-rw" \
+            -description "Proxy server: read/write proxy/backup/* KV keys" \
+            -rules 'key_prefix "proxy/backup/" { policy = "write" }' 2>/dev/null \
+          || consul acl policy update \
+            -name "proxy-server-backup-rw" \
+            -description "Proxy server: read/write proxy/backup/* KV keys" \
+            -rules 'key_prefix "proxy/backup/" { policy = "write" }'
+
+          # Token: backup-agent-token
+          # Idempotent: only create if no token with this description exists.
+          # Tokens are stored in Consul's token store only — never in KV or files.
+          EXISTING=$(consul acl token list -format=json 2>/dev/null | \
+            grep -o '"Description":"backup-agent-token"' | head -1) || EXISTING=""
+          if [ -z "$EXISTING" ]; then
+            echo ">>> Creating backup-agent-token — copy SecretID to BACKUP_CONSUL_HTTP_TOKEN"
+            consul acl token create \
+              -description "backup-agent-token" \
+              -policy-name "backup-agent-write"
+          else
+            echo ">>> backup-agent-token already exists — skipping creation"
+          fi
+
+          # Token: proxy-server-backup-token
+          EXISTING2=$(consul acl token list -format=json 2>/dev/null | \
+            grep -o '"Description":"proxy-server-backup-token"' | head -1) || EXISTING2=""
+          if [ -z "$EXISTING2" ]; then
+            echo ">>> Creating proxy-server-backup-token — copy SecretID to PROXY_BACKUP_CONSUL_TOKEN"
+            consul acl token create \
+              -description "proxy-server-backup-token" \
+              -policy-name "proxy-server-backup-rw"
+          else
+            echo ">>> proxy-server-backup-token already exists — skipping creation"
+          fi
+
+        else
+          echo ">>> CONSUL_HTTP_TOKEN not set — skipping ACL policy/token provisioning (dev/ACL-disabled mode)"
+        fi
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64m
+
+  # ─── Proxy server ─────────────────────────────────────────────────────────────
+  proxy-server:
+    image: ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:?}@timescaledb:5432/${POSTGRES_DB:-llm_proxy}
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      KEK_HEX: ${KEK_HEX:?KEK_HEX must be set}
+      LISTEN_ADDR: "::"
+      LISTEN_PORT: "8080"
+      # Forward proxy CA storage directory — persisted via the proxy_ca_data named volume.
+      # The ca_storage_dir config field (added in #243) reads this env var on startup.
+      PROXY_CA_STORAGE_DIR: "/ca"
+      # Consul token for the proxy-server to read/write the proxy/backup/* KV prefix.
+      # Provisioned by consul-init (proxy-server-backup-rw policy, #279).
+      # Obtain the SecretID from consul-init output on first deploy, then set in docker/.env.
+      # Leave empty to disable backup KV integration (backups will not be triggered via KV).
+      PROXY_BACKUP_CONSUL_TOKEN: ${PROXY_BACKUP_CONSUL_TOKEN:-}
+    volumes:
+      # Named volumes are writable even when read_only: true is set on the container.
+      # The read-only flag applies to the container's root filesystem overlay only;
+      # explicitly mounted named volumes remain writable and survive container restarts.
+      - proxy_ca_data:/ca
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+    healthcheck:
+      # Use the built-in healthcheck subcommand — no wget or shell required.
+      # This is compatible with both the distroless (production) and debian-slim
+      # (debug) runtime bases.
+      test: ["CMD", "/app/proxy-server", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Security hardening
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512m
+        reservations:
+          cpus: "0.5"
+          memory: 128m
+    labels:
+      - traefik.enable=true
+      # HTTP router — handles all HTTPS requests via the websecure entrypoint.
+      # Network topology note: in this prod compose both Traefik and proxy-server
+      # use the default Docker bridge network (not host networking). Traefik resolves
+      # the proxy-server backend by Docker hostname. Backend URL uses the service name
+      # and port 8080 (the LISTEN_PORT above), NOT [::1]:3000 which is the dev default.
+      - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
+      - traefik.http.routers.proxy-api.entrypoints=websecure
+      - traefik.http.routers.proxy-api.service=proxy-backend
+      - traefik.http.routers.proxy-api.middlewares=hsts@docker
+      # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
+      # active for this to take effect; falls back to default TLS options otherwise).
+      # Uses @consul suffix (migrated from @file provider in issue #241).
+      - traefik.http.routers.proxy-api.tls.options=strong-tls@consul
+      # ACME certificate resolver — DNS-01 via Cloudflare (activated by docker-compose.tls.yml).
+      # The certresolver flag is inert when no --certificatesresolvers.cloudflare.* flags are
+      # set in the Traefik command, so it is safe to include here unconditionally.
+      - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
+      # HSTS middleware — forces HTTPS with long max-age.
+      # WARNING: stsIncludeSubdomains=true commits ALL subdomains to HTTPS.
+      # stsPreload=false is the safe default — enabling preload is near-permanent.
+      - traefik.http.middlewares.hsts.headers.stsSeconds=31536000
+      - traefik.http.middlewares.hsts.headers.stsIncludeSubdomains=true
+      - "traefik.http.middlewares.hsts.headers.stsPreload=false"
+      - traefik.http.middlewares.hsts.headers.forceSTSHeader=true
+      # HTTP service — backend URL uses Docker hostname resolution.
+      # proxy-server listens on [::]:8080 in the prod compose network.
+      # Using http:// because TLS terminates at Traefik.
+      - traefik.http.services.proxy-backend.loadbalancer.server.url=http://proxy-server:8080
+      # Disable buffering for SSE streaming support
+      - traefik.http.services.proxy-backend.loadbalancer.responseForwarding.flushInterval=1ms
+      # TCP router — passthrough for the forward proxy (CONNECT mode / TLS interception).
+      - "traefik.tcp.routers.forward-proxy.rule=HostSNI(`*`)"
+      - traefik.tcp.routers.forward-proxy.entrypoints=forward-proxy
+      - traefik.tcp.routers.forward-proxy.service=proxy-forward
+      # TCP service — the forward-proxy (CONNECT mode) listens on port 3001 by default
+      # (PROXY_FORWARD_PROXY_PORT env var, default 3001 — see proxy-core/src/config.rs).
+      # The prod compose does not override this, so 3001 is the correct port.
+      - traefik.tcp.services.proxy-forward.loadbalancer.server.address=proxy-server:3001
+
+  # ─── Traefik (TLS termination) ────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3
+    restart: unless-stopped
+    command:
+      # Consul KV provider: TLS options are seeded into Consul by consul-init (#240).
+      # In prod, Traefik is on proxy-net and reaches Consul via Docker DNS at consul:8500.
+      # rootkey=traefik matches the KV prefix used by consul-init.
+      #
+      # Startup race note: if Consul is unavailable when Traefik starts, Traefik
+      # will load no TLS options from Consul and fall back to defaults (TLS 1.0
+      # allowed). The depends_on: consul-init: service_completed_successfully ordering
+      # below prevents this under normal operation.
+      - "--providers.consul.endpoints=consul:8500"
+      - "--providers.consul.rootkey=traefik"
+      # Docker provider: discovers routing config from container labels
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      # Entrypoints
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.forward-proxy.address=:8443"
+      # Disable response buffering for SSE streaming
+      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
+      - "--api=false"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      # Metrics for Prometheus scraping
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=:8082"
+    ports:
+      - "443:443"
+      - "8443:8443"
+    volumes:
+      # Docker socket for label-based service discovery
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # ACL token for Traefik (traefik-read policy: read on traefik/* KV prefix).
+      # Traefik reads this via the standard CONSUL_HTTP_TOKEN env var when communicating
+      # with the ACL-enabled Consul KV provider. Set in docker/.env — see tls.env.example
+      # for the ACL bootstrap procedure.
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+    depends_on:
+      proxy-server:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+      consul-init:
+        condition: service_completed_successfully
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+
+  # ─── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - proxy-server
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
+  # ─── Proxy TUI (optional — enable with --profile tui) ────────────────────────
+  proxy-tui:
+    image: ghcr.io/llm-api-proxy/cli:${PROXY_VERSION:-latest}
+    profiles: ["tui"]
+    environment:
+      PROXY_API_URL: http://proxy-server:8080
+    depends_on:
+      - proxy-server
+    stdin_open: true
+    tty: true
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64m
+
+networks:
+  proxy-net:
+    driver: bridge
+
+volumes:
+  timescaledb_data:
+  consul_data:
+  prometheus_data:
+  grafana_data:
+  # Persistent storage for the forward proxy CA certificate and key.
+  # Backup: docker run --rm -v proxy_ca_data:/ca -v $PWD:/backup busybox tar czf /backup/ca_backup.tar.gz /ca
+  proxy_ca_data:

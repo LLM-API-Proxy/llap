@@ -1,0 +1,228 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg18
+    environment:
+      POSTGRES_DB: llm_proxy
+      POSTGRES_USER: proxy
+      POSTGRES_PASSWORD: proxy_dev_password
+    ports:
+      # IPv6-only: [::] binds all IPv6 interfaces on the host.
+      # On dual-stack hosts (net.ipv6.conf.all.disable_ipv6=0) IPv4-mapped
+      # connections are also accepted via the kernel's IPv6 socket.
+      - "[::]:5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - proxy_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxy -d llm_proxy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  consul:
+    image: hashicorp/consul:1.22
+    # Dev mode: single-node, in-memory, no persistence.
+    # -client=[::] binds the HTTP API to all IPv6 interfaces (IPv6-first convention).
+    # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
+    # published host port below.
+    command: ["consul", "agent", "-dev", "-client=[::]"]
+    ports:
+      # Publish on [::] so Traefik (network_mode: host) can reach the HTTP API
+      # at [::1]:8500 on the host network stack.
+      - "[::]:8500:8500"
+    networks:
+      - proxy_net
+    healthcheck:
+      # Use the HTTP API status endpoint — it is ready only after the agent is
+      # fully initialised. `consul members` fires earlier and is not sufficient.
+      test: ["CMD-SHELL", "curl -sf http://[::1]:8500/v1/status/leader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ─── Consul KV init (one-shot) ───────────────────────────────────────────────
+  # Seeds Traefik TLS options into Consul KV before Traefik starts.
+  # Must run after Consul is healthy and must complete successfully before
+  # Traefik is allowed to start (see traefik.depends_on below).
+  #
+  # Requires Docker Compose v2.1+ for service_completed_successfully condition.
+  #
+  # In the base (dev) compose, Consul is reachable at consul:8500 via Docker
+  # bridge DNS since consul-init runs on proxy_net alongside consul.
+  consul-init:
+    image: hashicorp/consul:1.22
+    # restart: "no" — one-shot init container; must not be restarted after exit.
+    restart: "no"
+    depends_on:
+      consul:
+        condition: service_healthy
+    networks:
+      - proxy_net
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        # Idempotent: only write each key if it does not already exist.
+        # This makes re-deploys safe — no data is overwritten.
+        consul kv get traefik/tls/options/strong-tls/minVersion > /dev/null 2>&1 || \
+          consul kv put traefik/tls/options/strong-tls/minVersion VersionTLS12
+        consul kv get traefik/tls/options/strong-tls/cipherSuites/0 > /dev/null 2>&1 || {
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/0 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/1 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/2 TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/3 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/4 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+          consul kv put traefik/tls/options/strong-tls/cipherSuites/5 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+
+  traefik:
+    image: traefik:v3
+    # network_mode: host gives Traefik direct access to the host network stack.
+    # This is required so that client source IPs are real (not Docker bridge IPs).
+    # With host networking, port mappings are irrelevant — Traefik binds directly
+    # to the host interfaces on the ports declared in entrypoints ([::]:443 etc.).
+    # Note: network_mode: host is supported on Linux and macOS (Docker Desktop 4.34+
+    # with host networking enabled — Settings → Resources → Network). The installer
+    # detects and guides enablement automatically. Windows Docker Desktop does not
+    # support host networking — use WSL2 or a Linux host.
+    #
+    # Docker label discovery still works with network_mode: host because Docker
+    # socket access is independent of network mode. Traefik reads container
+    # metadata via the Docker API socket, not via the network stack.
+    # The proxy service also uses network_mode: host (required for mDNS multicast);
+    # both Traefik and the proxy are on the host network stack so Traefik routes
+    # to localhost:<port> directly — no Docker bridge network resolution needed.
+    network_mode: host
+    command:
+      # Consul KV provider: TLS options are seeded into Consul by consul-init (#240).
+      # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
+      # published host port. rootkey=traefik matches the KV prefix used by consul-init.
+      #
+      # Startup race note: if Consul is unavailable when Traefik starts, Traefik
+      # will load no TLS options from Consul and fall back to defaults (TLS 1.0
+      # allowed). The depends_on: consul-init: service_completed_successfully ordering
+      # below prevents this under normal operation.
+      - "--providers.consul.endpoints=[::1]:8500"
+      - "--providers.consul.rootkey=traefik"
+      # Docker provider: discovers routing config from container labels
+      - "--providers.docker=true"
+      - "--providers.docker.exposedByDefault=false"
+      # Entrypoints — IPv6-only; dual-stack where kernel has ipv6 enabled
+      - "--entrypoints.websecure.address=[::]:443"
+      - "--entrypoints.forward-proxy.address=[::]:8443"
+      # Disable response buffering for SSE streaming
+      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
+      # Dashboard and API disabled
+      - "--api=false"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    volumes:
+      # Docker socket for label-based service discovery
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      # consul-init must complete before Traefik starts — ensures TLS options KV
+      # entries are present before Traefik reads its Consul KV provider config.
+      consul-init:
+        condition: service_completed_successfully
+      proxy:
+        condition: service_started
+
+  proxy:
+    image: ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-edge}
+    # ── mDNS networking ──────────────────────────────────────────────────────────
+    # mDNS (RFC 6762/6763) uses link-local multicast (IPv4: 224.0.0.251:5353,
+    # IPv6: ff02::fb:5353). Multicast does NOT cross Docker bridge networks.
+    # network_mode: host is REQUIRED on Linux so the proxy can send and receive
+    # mDNS announcements on the host LAN.
+    #
+    # NOTE: Docker Desktop on macOS supports host networking since version 4.34
+    # (opt-in feature — enable in Settings → Resources → Network). The installer
+    # detects and guides enablement automatically. mDNS remains disabled on macOS
+    # (multicast doesn't cross the Docker Desktop VM boundary).
+    # For Docker Desktop < 4.34 or Windows, use the no-mdns override:
+    #   docker compose -f docker-compose.yml -f docker-compose.no-mdns.yml up -d
+    #
+    # ── Port conflict warning ─────────────────────────────────────────────────────
+    # With network_mode: host, the proxy binds DIRECTLY to the host interfaces.
+    # Ports 3000 and 3001 are commonly used — if they conflict with other services
+    # on your host, change them via environment variables BEFORE starting the stack:
+    #   PROXY_LISTEN_PORT=3000        (reverse proxy + management API, default 3000)
+    #   PROXY_FORWARD_PROXY_PORT=3001 (forward proxy / CONNECT mode, default 3001)
+    # Set these in docker/.env or export them in your shell before running compose.
+    #
+    # ── DATABASE_URL with host networking ────────────────────────────────────────
+    # With network_mode: host, the proxy is on the host network stack. TimescaleDB
+    # publishes its port on the host via "ports: [::]:5432:5432", so the correct
+    # address is localhost:5432 (not the Docker bridge hostname "timescaledb").
+    network_mode: host
+    environment:
+      # Pass-through so operators can customise bind ports without editing compose.
+      # Default 3000 — change if the port conflicts with another service on the host.
+      PROXY_LISTEN_PORT: ${PROXY_LISTEN_PORT:-3000}
+      # Default 3001 — change if the port conflicts with another service on the host.
+      PROXY_FORWARD_PROXY_PORT: ${PROXY_FORWARD_PROXY_PORT:-3001}
+      # With host networking, TimescaleDB is reachable at localhost:5432
+      # (published via "ports: [::]:5432:5432" on the timescaledb service).
+      DATABASE_URL: postgres://proxy:proxy_dev_password@localhost:5432/llm_proxy
+    depends_on:
+      consul:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      # HTTP router — handles all HTTPS requests via the websecure entrypoint
+      - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
+      - traefik.http.routers.proxy-api.entrypoints=websecure
+      - traefik.http.routers.proxy-api.service=proxy-backend
+      - traefik.http.routers.proxy-api.middlewares=hsts@docker
+      - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
+      # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
+      # active for this to take effect; falls back to default TLS options otherwise).
+      # Uses @consul suffix (migrated from @file provider in issue #241).
+      # Without @consul, Traefik uses default TLS options (TLS 1.0 allowed, weak ciphers)
+      # even if Consul KV has the options seeded. Requires issue #242 to be merged.
+      - traefik.http.routers.proxy-api.tls.options=strong-tls@consul
+      # HSTS middleware — forces HTTPS by instructing browsers to never connect over HTTP.
+      # OPERATOR WARNING: stsIncludeSubdomains: true means ALL subdomains of the domain
+      # will be required to serve HTTPS once a browser caches this header.
+      # stsPreload: false is the safe default — enabling preload is a near-permanent
+      # commitment for the entire domain tree via browser preload lists.
+      # Operators who understand the implications may override via docker-compose.override.yml.
+      - traefik.http.middlewares.hsts.headers.stsSeconds=31536000
+      - traefik.http.middlewares.hsts.headers.stsIncludeSubdomains=true
+      - "traefik.http.middlewares.hsts.headers.stsPreload=false"
+      - traefik.http.middlewares.hsts.headers.forceSTSHeader=true
+      # HTTP service — both Traefik and the proxy use network_mode: host, so both
+      # are on the host network stack. Traefik reaches the proxy at localhost on
+      # PROXY_LISTEN_PORT (default 3000). No Docker bridge network resolution needed.
+      # traefik.docker.network is NOT set (proxy is not on a Docker bridge network).
+      - "traefik.http.services.proxy-backend.loadbalancer.server.url=http://localhost:${PROXY_LISTEN_PORT:-3000}"
+      # Disable buffering for SSE streaming support
+      - traefik.http.services.proxy-backend.loadbalancer.responseForwarding.flushInterval=1ms
+      # TCP router — passthrough for the forward proxy (CONNECT mode / TLS interception).
+      # HSTS and TLS options are HTTP-layer concerns and do NOT apply to the TCP router.
+      - "traefik.tcp.routers.forward-proxy.rule=HostSNI(`*`)"
+      - traefik.tcp.routers.forward-proxy.entrypoints=forward-proxy
+      - traefik.tcp.routers.forward-proxy.service=proxy-forward
+      # TCP service — Traefik in host mode reaches the proxy via localhost.
+      # Default port 3001; change PROXY_FORWARD_PROXY_PORT env var if it conflicts.
+      - "traefik.tcp.services.proxy-forward.loadbalancer.server.address=localhost:${PROXY_FORWARD_PROXY_PORT:-3001}"
+
+networks:
+  proxy_net:
+    # IPv6-enabled internal network for service-to-service communication.
+    # ULA prefix (fc00::/7) — not routable on the public internet.
+    # Dual-stack: Docker also assigns an IPv4 subnet on this bridge by default.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "fd00:edde:acdc::/48"
+
+volumes:
+  timescaledb_data:

@@ -1,0 +1,70 @@
+# docker/docker-compose.no-mdns.yml — mDNS-disabled overlay for Docker Desktop / bridge networking.
+#
+# Use this file when mDNS is not needed or when host networking is unavailable:
+#   - Docker Desktop < 4.34 on macOS (host networking not available)
+#   - Docker Desktop 4.34+ on macOS where host networking has not been enabled
+#   - Docker Desktop on Windows (host networking not supported)
+#   - Environments where multicast is explicitly disabled
+#   - CI/CD pipelines that do not require mDNS service discovery
+#
+# Usage (always layer on top of the base compose):
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.no-mdns.yml up -d
+#
+# What this overlay does:
+#   1. Clears network_mode: host from the traefik service (restores bridge networking)
+#   2. Re-attaches traefik to the proxy_net bridge network with explicit port mappings
+#   3. Clears network_mode: host from the proxy service (restores bridge networking)
+#   4. Re-attaches the proxy service to the proxy_net bridge network
+#   5. Restores explicit port mappings for proxy (required without host networking)
+#   6. Sets PROXY_MDNS__ENABLED=false so the proxy does not attempt mDNS multicast
+#      (multicast packets are silently dropped on Docker bridge networks)
+#
+# NOTE: Without host networking, real client source IPs are lost. Docker Desktop NATs
+# all traffic through the Docker bridge, so rate limiting and audit logging will see
+# the Docker bridge gateway IP instead of the actual client IP. This is a known
+# limitation of Docker Desktop and is acceptable for development use.
+#
+# NOTE: Without mDNS, the proxy will NOT announce itself on the local network via
+# RFC 6762/6763 multicast DNS. Other services on the LAN cannot discover the proxy
+# by its mDNS hostname. This is acceptable for single-host or cloud deployments
+# where mDNS discovery is not required.
+
+services:
+  traefik:
+    # Clear network_mode: host — for environments where host networking is unavailable.
+    # Real client source IPs are lost (Docker Desktop NAT); rate limiting and
+    # audit logging will see the Docker bridge IP instead.
+    network_mode: ""
+    networks:
+      - proxy_net
+    ports:
+      # Publish Traefik entrypoints on all interfaces.
+      # Without host networking, explicit port mappings are required.
+      - "[::]:443:443"
+      - "[::]:8443:8443"
+      - "[::]:80:80"
+
+  proxy:
+    # Clear network_mode: host set in the base compose.
+    # An empty string in Docker Compose merge semantics removes the inherited value,
+    # restoring the default (bridge networking).
+    network_mode: ""
+    networks:
+      - proxy_net
+    ports:
+      # Publish on [::] (all IPv6 interfaces) — accepts IPv4-mapped connections on
+      # dual-stack hosts. Change PROXY_LISTEN_PORT / PROXY_FORWARD_PROXY_PORT in
+      # docker/.env if these ports conflict with another service on the host.
+      - "[::]:${PROXY_LISTEN_PORT:-7080}:${PROXY_LISTEN_PORT:-7080}"
+      - "[::]:${PROXY_FORWARD_PROXY_PORT:-7443}:${PROXY_FORWARD_PROXY_PORT:-7443}"
+    environment:
+      # Disable mDNS — multicast does not cross Docker bridge networks and the
+      # proxy would fail silently or log errors if mDNS were left enabled here.
+      PROXY_MDNS__ENABLED: "false"
+      # Restore the bridge-network DATABASE_URL. The base compose sets
+      # DATABASE_URL=...@localhost:5432/... which is correct for host networking
+      # (TimescaleDB publishes its port on the host). In bridge networking mode,
+      # 'localhost' inside the proxy container refers to the container itself, not
+      # TimescaleDB — so we must override DATABASE_URL to use the Docker bridge
+      # DNS hostname 'timescaledb' instead.
+      DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@timescaledb:5432/${POSTGRES_DB:-llm_proxy}

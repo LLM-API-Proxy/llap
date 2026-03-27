@@ -1,0 +1,128 @@
+# docker/docker-compose.backup.yml — Restic backup agent overlay.
+#
+# This file adds the `backup` service (restic-based backup agent) to the
+# production stack defined in docker-compose.prod.yml.
+#
+# Usage:
+#   docker compose \
+#     -f docker/docker-compose.yml \
+#     -f docker/docker-compose.prod.yml \
+#     -f docker/docker-compose.backup.yml \
+#     --env-file docker/tls.env \
+#     up -d
+#
+# Required environment variables (set in docker/tls.env):
+#   BACKUP_CONSUL_HTTP_TOKEN — Consul ACL token for the backup agent
+#                              (backup-agent-write policy: write proxy/backup/* KV prefix)
+#   RESTIC_REPOSITORY        — Restic repository URL (e.g. s3:s3.amazonaws.com/bucket/prefix)
+#   RESTIC_PASSWORD          — Restic repository encryption password (or use RESTIC_PASSWORD_FILE)
+#   POSTGRES_PASSWORD        — PostgreSQL password (required for pg_dump)
+#   AWS_ACCESS_KEY_ID        — S3 access key for Restic repository (if using S3 backend)
+#   AWS_SECRET_ACCESS_KEY    — S3 secret key for Restic repository (if using S3 backend)
+#
+# Optional environment variables:
+#   BACKUP_SCHEDULE          — Cron expression for automated backups (default: 0 2 * * *)
+#   POSTGRES_HOST            — PostgreSQL hostname (default: timescaledb)
+#   POSTGRES_DB              — PostgreSQL database name (default: llm_proxy)
+#   POSTGRES_USER            — PostgreSQL username (default: proxy)
+#   RESTIC_S3_ENDPOINT       — Custom S3 endpoint URL for non-AWS S3 (must be https://)
+#   BACKUP_ALLOW_HTTP_ENDPOINT — Set to "true" to allow http:// endpoint (dev/MinIO only)
+#
+# Consul ACL token provisioning:
+#   The BACKUP_CONSUL_HTTP_TOKEN is provisioned by consul-init on first deploy.
+#   See tls.env.example for the bootstrap procedure and how to extract the token
+#   SecretID from consul-init's output.
+#
+# Security:
+#   - The backup agent only holds the backup-agent-write token (proxy/backup/* write).
+#   - It has no access to traefik/ or any other Consul KV prefix.
+#   - Tokens are stored in Consul's internal token store only — never in KV or files.
+#   - Secrets (RESTIC_PASSWORD, AWS credentials, POSTGRES_PASSWORD) are never
+#     logged or written to Consul KV.
+#
+# Consul KV IPC keys written by this service:
+#   proxy/backup/trigger    — consumed and deleted to trigger an immediate backup
+#   proxy/backup/heartbeat  — RFC3339 timestamp written every 60 s during a run
+#   proxy/backup/status     — JSON overall status (idle|running|completed|failed)
+#   proxy/backup/last_job   — JSON last job record with per-target results
+#   proxy/backup/snapshots  — JSON snapshot list (refreshed after each run)
+#   proxy/backup/config     — JSON config (schedule, retention, targets) — read-only by agent
+
+services:
+  # ─── Restic backup agent ──────────────────────────────────────────────────
+  backup:
+    # Pre-built backup agent image from GHCR.
+    # The image bundles restic, supercronic, postgresql-client, and the
+    # backup.sh / entrypoint.sh scripts.
+    image: ghcr.io/llm-api-proxy/backup:${PROXY_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      consul:
+        condition: service_healthy
+      consul-init:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - proxy_net
+    volumes:
+      # CA certificates volume (read-only: backup agent must not modify certs)
+      - proxy_ca_data:/ca:ro
+    environment:
+      # Consul connectivity and ACL token.
+      # The backup agent uses the standard CONSUL_HTTP_ADDR / CONSUL_HTTP_TOKEN
+      # environment variables to connect to the Consul KV store (both the consul
+      # CLI and the official consul client libraries honour these names).
+      CONSUL_HTTP_ADDR: http://consul:8500
+      # CONSUL_HTTP_TOKEN is set to the backup-agent-write token so that the
+      # consul CLI / client libraries within the backup container authenticate
+      # automatically without any custom token-plumbing code.
+      # BACKUP_CONSUL_HTTP_TOKEN is the source value from docker/.env.
+      CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN:?BACKUP_CONSUL_HTTP_TOKEN is required — see tls.env.example for provisioning instructions}
+      # Expose the original variable name as well so that application code that
+      # explicitly reads BACKUP_CONSUL_HTTP_TOKEN (e.g. for audit logging) can
+      # find it without duplicating the value in the .env file.
+      BACKUP_CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN}
+      # Backup schedule (cron expression).
+      # Written to the supercronic crontab at container start.
+      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
+      # Restic repository configuration.
+      RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:?RESTIC_REPOSITORY must be set (e.g. s3:s3.amazonaws.com/mybucket/llm-proxy)}
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD:?RESTIC_PASSWORD must be set}
+      # Optional custom S3 endpoint (e.g. for MinIO or a non-AWS S3-compatible store).
+      # Must be https:// in production; set BACKUP_ALLOW_HTTP_ENDPOINT=true for local dev.
+      RESTIC_S3_ENDPOINT: ${RESTIC_S3_ENDPOINT:-}
+      BACKUP_ALLOW_HTTP_ENDPOINT: ${BACKUP_ALLOW_HTTP_ENDPOINT:-}
+      # S3 credentials for the Restic repository backend.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # PostgreSQL connection details for the pg_dump backup target.
+      POSTGRES_HOST: ${POSTGRES_HOST:-timescaledb}
+      POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
+      POSTGRES_USER: ${POSTGRES_USER:-proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for PostgreSQL backup}
+    # Security hardening — backup agent does not need elevated privileges.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      # /etc/supercronic is written at container start (crontab generation).
+      - /etc/supercronic:size=4m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+        reservations:
+          cpus: "0.1"
+          memory: 64m
+
+# ─── Volumes ──────────────────────────────────────────────────────────────────
+# proxy_ca_data is declared as external because it is created and owned by the
+# main docker-compose.prod.yml stack.  This overlay only mounts it read-only.
+volumes:
+  proxy_ca_data:
+    external: true
