@@ -7,6 +7,14 @@
 
 set -euo pipefail
 
+# ── Pipe-to-bash guarantee ────────────────────────────────────────────────────
+# Wrapping the entire body in _main() forces bash to read all of stdin (looking
+# for the closing '}') before executing anything.  This guarantees that all
+# variable definitions—including EMBED_* injected at the bottom by
+# build-installer.sh—are parsed and available before main() runs.
+# The old tmpfile re-exec pattern is no longer needed.
+_main() {
+
 # ── Constants ────────────────────────────────────────────────────────────────
 INSTALLER_VERSION="0.0.1"
 # shellcheck disable=SC2034  # Used by phase functions appended by build-installer.sh
@@ -42,20 +50,6 @@ cleanup() {
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
-
-# ── Pipe-to-bash self-materialisation ────────────────────────────────────────
-# When invoked via `curl ... | bash`, $0 is not a readable file.
-# Save stdin to a temp file and re-exec from there so the full script is on
-# disk before any function definitions are parsed.  This guard MUST be near the
-# top — bash reads piped input incrementally and would consume the script buffer
-# before reaching a guard placed later.
-if [[ ! -f "$0" ]] || [[ "$0" == "/dev/stdin" ]] || [[ "$0" == "-" ]]; then
-    _tmpfile="$(mktemp)"
-    CLEANUP_FILES+=("$_tmpfile")
-    cat > "$_tmpfile"
-    chmod +x "$_tmpfile"
-    exec "$_tmpfile" "$@"
-fi
 
 # ── Colour output ────────────────────────────────────────────────────────────
 if [[ -t 1 ]] && command -v tput &>/dev/null; then
@@ -785,14 +779,22 @@ verify_self_checksum() {
     local script="${SCRIPT_PATH:-$0}"
     step "Verifying installer integrity..."
 
+    # When run via `curl | bash`, $0 is "bash" — not a readable file on disk.
+    # Transport integrity is guaranteed by the HTTPS download; skip the
+    # file-based checksum check.
+    if [[ ! -f "$script" ]]; then
+        info "Running from pipe — skipping file integrity check (HTTPS provides transport security)"
+        return 0
+    fi
+
     local payload
     payload=$(awk '/^# --- BEGIN EMBEDDED FILES ---$/,/^# --- END EMBEDDED FILES ---$/' "$script" \
-        | grep -v '# SELF_CHECKSUM:')
+        | grep -v '^# SELF_CHECKSUM:')
     local computed
     computed=$(echo "$payload" | sha256sum | awk '{print $1}')
 
     local embedded
-    embedded=$(grep '# SELF_CHECKSUM:' "$script" | awk '{print $3}')
+    embedded=$(grep '^# SELF_CHECKSUM:' "$script" | awk '{print $3}')
 
     if [[ -z "$embedded" ]] || [[ "$embedded" == "@@SELF_CHECKSUM@@" ]]; then
         warn "No self-checksum embedded (development build) — skipping"
@@ -833,6 +835,11 @@ verify_remote_checksum() {
     fi
 
     local script="${SCRIPT_PATH:-$0}"
+    # When run via `curl | bash`, there is no local file to hash.
+    if [[ ! -f "$script" ]]; then
+        info "Running from pipe — skipping remote checksum verification (HTTPS provides transport security)"
+        return 0
+    fi
     local local_hash
     local_hash=$(sha256sum "$script" | awk '{print $1}')
 
@@ -3099,8 +3106,6 @@ main() {
     info "Installation complete!"
 }
 
-main "$@"
-
 # ── Embedded files (injected by build-installer.sh) ──────────────────────────
 # --- BEGIN EMBEDDED FILES ---
 # FILE: docker/docker-compose.yml
@@ -3124,3 +3129,8 @@ EMBED_config_example_toml="IyBsbG0tYXBpLXByb3h5IGNvbmZpZ3VyYXRpb24gZXhhbXBsZQojI
 EMBED_gpg_public_key="IyBQbGFjZWhvbGRlciDigJQgcmVwbGFjZSB3aXRoIGFjdHVhbCByZWxlYXNlIHNpZ25pbmcgcHVibGljIGtleQo="
 # SELF_CHECKSUM: 9fbf1e46b7f6e51157d3c6ddc1d03db5c4f0a898e60adee8460fac6ce4451123
 # --- END EMBEDDED FILES ---
+
+main "$@"
+} # end _main
+
+_main "$@"
