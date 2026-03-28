@@ -1466,10 +1466,15 @@ TOS_ACCEPTED_AT=""
 fetch_tos() {
     local fetched
     if fetched=$(curl -fsSL --max-time 15 "$TOS_URL" 2>/dev/null); then
-        TOS_CONTENT="$fetched"
-        TOS_SHA256=$(printf '%s' "$TOS_CONTENT" | sha256sum | awk '{print $1}')
-        log "Fetched ToS from ${TOS_URL} (sha256: ${TOS_SHA256:0:12}...)"
-        return 0
+        # Guard: SPA fallback returns HTML instead of plain-text terms
+        if printf '%s' "$fetched" | head -1 | grep -qi '<!doctype\|<html'; then
+            log "ToS endpoint returned HTML (SPA fallback) — treating as fetch failure"
+        else
+            TOS_CONTENT="$fetched"
+            TOS_SHA256=$(printf '%s' "$TOS_CONTENT" | sha256sum | awk '{print $1}')
+            log "Fetched ToS from ${TOS_URL} (sha256: ${TOS_SHA256:0:12}...)"
+            return 0
+        fi
     fi
 
     if [[ -n "${EMBED_tos_text:-}" ]]; then
@@ -1481,14 +1486,20 @@ fetch_tos() {
         return 0
     fi
 
-    if [[ "$OPT_NON_INTERACTIVE" == "true" ]] && [[ "$OPT_ACCEPT_TOS" == "true" ]]; then
-        warn "Could not fetch Terms of Service and no embedded copy available."
-        warn "Proceeding with --accept-tos (non-interactive). Review terms at: ${TOS_URL}"
-        TOS_CONTENT="(Terms not available at install time — accepted via --accept-tos)"
-        TOS_SHA256="unavailable"
-        return 0
-    fi
-    die "Could not fetch Terms of Service and no embedded copy available."
+    # No plain-text terms available — use a reference notice instead.
+    warn "Could not fetch Terms of Service text."
+    TOS_CONTENT="$(cat <<TERMS_NOTICE
+LLAP Terms of Service
+
+The full Terms of Service are available at:
+  ${TOS_URL}
+
+By proceeding with installation you confirm that you have read and
+accept the Terms of Service published at the URL above.
+TERMS_NOTICE
+)"
+    TOS_SHA256=$(printf '%s' "$TOS_CONTENT" | sha256sum | awk '{print $1}')
+    return 0
 }
 
 display_tos() {
@@ -1523,6 +1534,15 @@ run_tos() {
 
     fetch_tos
     display_tos
+
+    # When stdin is not a tty (curl | bash), interactive prompts are impossible.
+    # Proceeding with installation implies acceptance — print the notice and continue.
+    if [[ ! -t 0 ]]; then
+        info "Terms of Service accepted (proceeding with installation implies acceptance)"
+        # shellcheck disable=SC2034
+        TOS_ACCEPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        return 0
+    fi
 
     if ! ask_yesno "Terms of Service" "Do you accept the Terms of Service?" "no"; then
         die "You must accept the Terms of Service to install or upgrade llm-api-proxy."
