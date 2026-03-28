@@ -1180,10 +1180,12 @@ check_root() {
     if [[ "$IS_MACOS" == "true" ]]; then
         return 0
     fi
-    if [[ $EUID -ne 0 ]]; then
-        PREFLIGHT_FAIL+=("Root access required — run with sudo")
+    if [[ $EUID -eq 0 ]]; then
+        PREFLIGHT_PASS+=("Root access: running as root")
+    elif sudo -n true 2>/dev/null; then
+        PREFLIGHT_PASS+=("Root access: sudo available")
     else
-        PREFLIGHT_PASS+=("Root access: yes")
+        PREFLIGHT_FAIL+=("Root access required — run with: curl -fsSL .../install.sh | sudo bash")
     fi
 }
 
@@ -1318,7 +1320,7 @@ check_container() {
 }
 
 check_internet() {
-    local -a hosts=("ghcr.io" "registry-1.docker.io")
+    local -a hosts=("ghcr.io")
     local host
     for host in "${hosts[@]}"; do
         if ! curl -fsSL --max-time 5 "https://${host}" -o /dev/null 2>/dev/null; then
