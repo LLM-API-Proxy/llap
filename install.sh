@@ -30,6 +30,13 @@ SERVICE_USER="llm-proxy"
 LOG_FILE="/tmp/llm-api-proxy-install-$(date +%Y%m%d-%H%M%S).log"
 CLEANUP_FILES=()
 
+# Privilege escalation — empty when already root, "sudo" otherwise
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 # ── Security ─────────────────────────────────────────────────────────────────
 umask 077
 
@@ -282,9 +289,9 @@ extract_file() {
         warn "Embedded file '${var_name}' not available — skipping ${dest}"
         return 0
     fi
-    mkdir -p "$(dirname "$dest")"
-    echo "${!var_name}" | base64 -d > "$dest"
-    chmod 0640 "$dest"
+    $SUDO mkdir -p "$(dirname "$dest")"
+    echo "${!var_name}" | base64 -d | $SUDO tee "$dest" > /dev/null
+    $SUDO chmod 0640 "$dest"
 }
 
 # ── CLI argument parsing ─────────────────────────────────────────────────────
@@ -727,7 +734,7 @@ ghcr_login() {
 
     local login_output
     if login_output=$(echo "$GITHUB_TOKEN_RESOLVED" | \
-        docker login ghcr.io -u "$GITHUB_USER_RESOLVED" --password-stdin 2>&1); then
+        $SUDO docker login ghcr.io -u "$GITHUB_USER_RESOLVED" --password-stdin 2>&1); then
         info "Authenticated to ghcr.io as ${GITHUB_USER_RESOLVED}"
     else
         warn "docker login ghcr.io failed: ${login_output}. Proceeding without authentication."
@@ -1571,13 +1578,13 @@ prepare_system_upgrade() {
     step "  Updating system packages..."
     case "$PKG_MANAGER" in
         apt)
-            apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1
+            $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1
             ;;
-        dnf)    dnf upgrade -y -q >> "$LOG_FILE" 2>&1 ;;
-        yum)    yum update -y -q >> "$LOG_FILE" 2>&1 ;;
-        pacman) pacman -Syu --noconfirm >> "$LOG_FILE" 2>&1 ;;
-        zypper) zypper -n update >> "$LOG_FILE" 2>&1 ;;
+        dnf)    $SUDO dnf upgrade -y -q >> "$LOG_FILE" 2>&1 ;;
+        yum)    $SUDO yum update -y -q >> "$LOG_FILE" 2>&1 ;;
+        pacman) $SUDO pacman -Syu --noconfirm >> "$LOG_FILE" 2>&1 ;;
+        zypper) $SUDO zypper -n update >> "$LOG_FILE" 2>&1 ;;
         brew)   brew update >> "$LOG_FILE" 2>&1 && brew upgrade >> "$LOG_FILE" 2>&1 ;;
         *)      warn "Unknown package manager — skipping system upgrade" ;;
     esac
@@ -1594,23 +1601,23 @@ prepare_prerequisites() {
             if ! command -v dialog &>/dev/null && ! command -v whiptail &>/dev/null; then
                 pkgs+=(dialog)
             fi
-            apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >> "$LOG_FILE" 2>&1
+            $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${pkgs[@]}" >> "$LOG_FILE" 2>&1
             ;;
         dnf|yum)
             pkgs=(curl jq ca-certificates gnupg2)
             command -v dialog &>/dev/null || pkgs+=(dialog)
-            "$PKG_MANAGER" install -y -q "${pkgs[@]}" >> "$LOG_FILE" 2>&1
+            $SUDO "$PKG_MANAGER" install -y -q "${pkgs[@]}" >> "$LOG_FILE" 2>&1
             ;;
         pacman)
             pkgs=(curl jq ca-certificates gnupg)
             command -v dialog &>/dev/null || pkgs+=(dialog)
-            pacman -S --noconfirm --needed "${pkgs[@]}" >> "$LOG_FILE" 2>&1
+            $SUDO pacman -S --noconfirm --needed "${pkgs[@]}" >> "$LOG_FILE" 2>&1
             ;;
         zypper)
             pkgs=(curl jq ca-certificates gpg2)
             command -v dialog &>/dev/null || pkgs+=(dialog)
-            zypper -n install "${pkgs[@]}" >> "$LOG_FILE" 2>&1
+            $SUDO zypper -n install "${pkgs[@]}" >> "$LOG_FILE" 2>&1
             ;;
         brew)
             for pkg in curl jq gnupg; do
@@ -1629,8 +1636,8 @@ prepare_docker() {
             if [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
                 if ask_yesno "Docker" "Replace distro Docker with official docker-ce?" "yes"; then
                     case "$PKG_MANAGER" in
-                        apt) apt-get remove -y docker.io docker-doc docker-compose >> "$LOG_FILE" 2>&1 ;;
-                        dnf|yum) "$PKG_MANAGER" remove -y docker docker-common >> "$LOG_FILE" 2>&1 ;;
+                        apt) $SUDO apt-get remove -y docker.io docker-doc docker-compose >> "$LOG_FILE" 2>&1 ;;
+                        dnf|yum) $SUDO "$PKG_MANAGER" remove -y docker docker-common >> "$LOG_FILE" 2>&1 ;;
                     esac
                 else
                     info "Keeping existing Docker installation"
@@ -1646,34 +1653,34 @@ prepare_docker() {
     step "  Installing Docker..."
     case "$PKG_MANAGER" in
         apt)
-            install -m 0755 -d /etc/apt/keyrings
+            $SUDO install -m 0755 -d /etc/apt/keyrings
             local repo_url="https://download.docker.com/linux/${OS_ID}"
-            curl -fsSL "${repo_url}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1
-            chmod a+r /etc/apt/keyrings/docker.gpg
+            curl -fsSL "${repo_url}/gpg" | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg >> "$LOG_FILE" 2>&1
+            $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
             echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] ${repo_url} ${OS_CODENAME} stable" \
-                > /etc/apt/sources.list.d/docker.list
-            apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
+            $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
                 docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
             ;;
         dnf)
             local docker_repo="https://download.docker.com/linux/centos/docker-ce.repo"
             [[ "$OS_ID" == "fedora" ]] && docker_repo="https://download.docker.com/linux/fedora/docker-ce.repo"
-            dnf config-manager --add-repo "$docker_repo" >> "$LOG_FILE" 2>&1
-            dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
+            $SUDO dnf config-manager --add-repo "$docker_repo" >> "$LOG_FILE" 2>&1
+            $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
             ;;
         yum)
-            yum-config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" >> "$LOG_FILE" 2>&1
-            yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
+            $SUDO yum-config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" >> "$LOG_FILE" 2>&1
+            $SUDO yum install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
             ;;
         pacman)
-            pacman -S --noconfirm docker docker-compose >> "$LOG_FILE" 2>&1
+            $SUDO pacman -S --noconfirm docker docker-compose >> "$LOG_FILE" 2>&1
             ;;
         zypper)
-            zypper -n install docker docker-compose >> "$LOG_FILE" 2>&1 || {
+            $SUDO zypper -n install docker docker-compose >> "$LOG_FILE" 2>&1 || {
                 warn "Trying official Docker repo for openSUSE..."
-                zypper addrepo "https://download.docker.com/linux/sles/docker-ce.repo" >> "$LOG_FILE" 2>&1
-                zypper -n install docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
+                $SUDO zypper addrepo "https://download.docker.com/linux/sles/docker-ce.repo" >> "$LOG_FILE" 2>&1
+                $SUDO zypper -n install docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
             }
             ;;
         brew)
@@ -1709,8 +1716,8 @@ prepare_docker() {
     esac
 
     if [[ "$IS_MACOS" != "true" ]]; then
-        systemctl enable docker >> "$LOG_FILE" 2>&1
-        systemctl start docker >> "$LOG_FILE" 2>&1
+        $SUDO systemctl enable docker >> "$LOG_FILE" 2>&1
+        $SUDO systemctl start docker >> "$LOG_FILE" 2>&1
     fi
 
     if ! docker info &>/dev/null; then
@@ -1761,10 +1768,10 @@ prepare_docker_ipv6() {
     local tmpfile
     tmpfile=$(mktemp); CLEANUP_FILES+=("$tmpfile")
     echo "$merged" > "$tmpfile"
-    mv "$tmpfile" "$daemon_json"
-    chmod 0644 "$daemon_json"
+    $SUDO mv "$tmpfile" "$daemon_json"
+    $SUDO chmod 0644 "$daemon_json"
 
-    systemctl restart docker >> "$LOG_FILE" 2>&1
+    $SUDO systemctl restart docker >> "$LOG_FILE" 2>&1
     local attempts=0
     while ! docker info &>/dev/null; do
         attempts=$((attempts + 1))
@@ -1785,12 +1792,12 @@ prepare_system_user() {
         info "System user '${SERVICE_USER}' already exists"
     else
         step "  Creating system user '${SERVICE_USER}'..."
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+        $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
         info "Created system user '${SERVICE_USER}'"
     fi
 
     if ! groups "$SERVICE_USER" 2>/dev/null | grep -q docker; then
-        usermod -aG docker "$SERVICE_USER"
+        $SUDO usermod -aG docker "$SERVICE_USER"
         info "Added '${SERVICE_USER}' to docker group"
     fi
 }
@@ -1818,23 +1825,23 @@ prepare_firewall() {
     step "  Configuring firewall..."
     echo "  Opening ports: ${ports[*]}"
 
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+    if command -v ufw &>/dev/null && $SUDO ufw status | grep -q "active"; then
         for port in "${ports[@]}"; do
-            ufw allow "$port" >> "$LOG_FILE" 2>&1
+            $SUDO ufw allow "$port" >> "$LOG_FILE" 2>&1
             info "ufw: opened ${port}"
         done
-    elif command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
+    elif command -v firewall-cmd &>/dev/null && $SUDO systemctl is-active firewalld &>/dev/null; then
         for port in "${ports[@]}"; do
-            firewall-cmd --permanent --add-port="$port" >> "$LOG_FILE" 2>&1
+            $SUDO firewall-cmd --permanent --add-port="$port" >> "$LOG_FILE" 2>&1
             info "firewalld: opened ${port}"
         done
-        firewall-cmd --reload >> "$LOG_FILE" 2>&1
+        $SUDO firewall-cmd --reload >> "$LOG_FILE" 2>&1
     elif command -v iptables &>/dev/null; then
         for port in "${ports[@]}"; do
             local proto="${port##*/}"
             local num="${port%%/*}"
-            ip6tables -A INPUT -p "$proto" --dport "$num" -j ACCEPT >> "$LOG_FILE" 2>&1
-            iptables -A INPUT -p "$proto" --dport "$num" -j ACCEPT >> "$LOG_FILE" 2>&1
+            $SUDO ip6tables -A INPUT -p "$proto" --dport "$num" -j ACCEPT >> "$LOG_FILE" 2>&1
+            $SUDO iptables -A INPUT -p "$proto" --dport "$num" -j ACCEPT >> "$LOG_FILE" 2>&1
             info "iptables: opened ${port}"
         done
     else
@@ -1855,19 +1862,19 @@ prepare_security_updates() {
     step "  Configuring automatic security updates..."
     case "$PKG_MANAGER" in
         apt)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades >> "$LOG_FILE" 2>&1
-            dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq unattended-upgrades >> "$LOG_FILE" 2>&1
+            $SUDO dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
             info "unattended-upgrades configured"
             ;;
         dnf)
-            dnf install -y -q dnf-automatic >> "$LOG_FILE" 2>&1
-            sed -i 's/^apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true
-            systemctl enable --now dnf-automatic.timer >> "$LOG_FILE" 2>&1
+            $SUDO dnf install -y -q dnf-automatic >> "$LOG_FILE" 2>&1
+            $SUDO sed -i 's/^apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true
+            $SUDO systemctl enable --now dnf-automatic.timer >> "$LOG_FILE" 2>&1
             info "dnf-automatic configured"
             ;;
         yum)
-            yum install -y -q yum-cron >> "$LOG_FILE" 2>&1
-            systemctl enable --now yum-cron >> "$LOG_FILE" 2>&1
+            $SUDO yum install -y -q yum-cron >> "$LOG_FILE" 2>&1
+            $SUDO systemctl enable --now yum-cron >> "$LOG_FILE" 2>&1
             info "yum-cron configured"
             ;;
         *)
@@ -2255,17 +2262,17 @@ run_configure() {
 
 deploy_create_dirs() {
     step "  Creating install directory..."
-    mkdir -p "${INSTALL_DIR}/docker/modsecurity"
-    mkdir -p "${INSTALL_DIR}/docker/prometheus"
-    mkdir -p "${INSTALL_DIR}/docker/grafana/provisioning/dashboards"
-    mkdir -p "${INSTALL_DIR}/docker/grafana/provisioning/datasources"
-    mkdir -p "${METADATA_DIR}"
+    $SUDO mkdir -p "${INSTALL_DIR}/docker/modsecurity"
+    $SUDO mkdir -p "${INSTALL_DIR}/docker/prometheus"
+    $SUDO mkdir -p "${INSTALL_DIR}/docker/grafana/provisioning/dashboards"
+    $SUDO mkdir -p "${INSTALL_DIR}/docker/grafana/provisioning/datasources"
+    $SUDO mkdir -p "${METADATA_DIR}"
 
     if [[ "$IS_MACOS" != "true" ]]; then
-        chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
-        chmod 0750 "${INSTALL_DIR}"
-        chown root:root "${METADATA_DIR}"
-        chmod 0755 "${METADATA_DIR}"
+        $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
+        $SUDO chmod 0750 "${INSTALL_DIR}"
+        $SUDO chown root:root "${METADATA_DIR}"
+        $SUDO chmod 0755 "${METADATA_DIR}"
     fi
     info "Install directory created: ${INSTALL_DIR}"
 }
@@ -2305,7 +2312,7 @@ deploy_extract_files() {
         deploy_write_debug_overlay
     else
         # Clean up debug overlay if downgrading from debug to production
-        rm -f "${INSTALL_DIR}/docker/docker-compose.debug.yml"
+        $SUDO rm -f "${INSTALL_DIR}/docker/docker-compose.debug.yml"
     fi
 
     info "Files extracted"
@@ -2352,9 +2359,9 @@ deploy_write_debug_overlay() {
                 echo "      BACKUP_LOG_LEVEL: debug"
             fi
         fi
-    } > "$overlay_file"
+    } | $SUDO tee "$overlay_file" > /dev/null
 
-    chmod 0640 "$overlay_file"
+    $SUDO chmod 0640 "$overlay_file"
     info "docker-compose.debug.yml written"
 }
 
@@ -2362,7 +2369,8 @@ deploy_write_env() {
     step "  Writing .env configuration..."
     local env_file="${INSTALL_DIR}/docker/.env"
 
-    local tmpfile="${env_file}.tmp.$$"
+    local tmpfile
+    tmpfile=$(mktemp)
 
     local gen_date
     gen_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -2436,12 +2444,12 @@ deploy_write_env() {
         printf 'PROXY_DEBUG_PROFILE=%s\n' "$OPT_DEBUG_PROFILE"
     } >> "$tmpfile"
 
-    chmod 0640 "$tmpfile"
+    $SUDO chmod 0640 "$tmpfile"
     if [[ "$IS_MACOS" != "true" ]]; then
-        chown "root:${SERVICE_USER}" "$tmpfile" 2>/dev/null || true
+        $SUDO chown "root:${SERVICE_USER}" "$tmpfile" 2>/dev/null || true
     fi
 
-    mv "$tmpfile" "$env_file"
+    $SUDO mv "$tmpfile" "$env_file"
     info ".env written (atomic)"
     log "ENV: $(grep -c '=' "$env_file") variables set"
 }
@@ -2455,10 +2463,10 @@ deploy_upgrade_env() {
 
     local backup
     backup="${env_file}.backup.$(date +%Y%m%d-%H%M%S)"
-    cp "$env_file" "$backup"
+    $SUDO cp "$env_file" "$backup"
     info "Backed up .env to ${backup}"
 
-    sed -i "s/^PROXY_VERSION=.*/PROXY_VERSION=${OPT_VERSION}/" "$env_file"
+    $SUDO sed -i "s/^PROXY_VERSION=.*/PROXY_VERSION=${OPT_VERSION}/" "$env_file"
 
     local ref_file
     ref_file=$(mktemp); CLEANUP_FILES+=("$ref_file")
@@ -2476,13 +2484,13 @@ deploy_upgrade_env() {
                         <(sed -n 's/^\([A-Z_]*\)=.*/\1/p' "$old_env_file" | sort) || true)
 
     if [[ -n "$new_keys" ]]; then
-        echo "" >> "$old_env_file"
-        echo "# Added by upgrade to v${OPT_VERSION} on $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$old_env_file"
+        echo "" | $SUDO tee -a "$old_env_file" > /dev/null
+        echo "# Added by upgrade to v${OPT_VERSION} on $(date -u +%Y-%m-%dT%H:%M:%SZ)" | $SUDO tee -a "$old_env_file" > /dev/null
         while IFS= read -r key; do
             local value
             value=$(grep "^${key}" "$ref_file" | head -1 || true)
             if [[ -n "$value" ]]; then
-                echo "$value" >> "$old_env_file"
+                echo "$value" | $SUDO tee -a "$old_env_file" > /dev/null
                 info "Added new variable: ${key%%=*}"
             fi
         done <<< "$new_keys"
@@ -2564,25 +2572,25 @@ deploy_upgrade_debug_state() {
 
     if grep -qE '^PROXY_DEBUG=' "$env_file"; then
         # Update existing key
-        sed -i "s|^PROXY_DEBUG=.*|PROXY_DEBUG=${OPT_DEBUG}|" "$env_file"
+        $SUDO sed -i "s|^PROXY_DEBUG=.*|PROXY_DEBUG=${OPT_DEBUG}|" "$env_file"
     else
         # Append new key (upgrading from production to debug for first time)
-        echo "PROXY_DEBUG=${OPT_DEBUG}" >> "$env_file"
+        echo "PROXY_DEBUG=${OPT_DEBUG}" | $SUDO tee -a "$env_file" > /dev/null
     fi
 
     if [[ "$OPT_DEBUG" == "true" ]]; then
         if grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
-            sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}|" "$env_file"
+            $SUDO sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}|" "$env_file"
         else
-            echo "PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}" >> "$env_file"
+            echo "PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}" | $SUDO tee -a "$env_file" > /dev/null
         fi
     else
         # Clear profile when disabling debug (prevent stale state)
         if grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
-            sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=|" "$env_file"
+            $SUDO sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=|" "$env_file"
         else
             # Append empty profile key so future loads have a consistent key present
-            echo "PROXY_DEBUG_PROFILE=" >> "$env_file"
+            echo "PROXY_DEBUG_PROFILE=" | $SUDO tee -a "$env_file" > /dev/null
         fi
     fi
 }
@@ -2608,6 +2616,8 @@ deploy_write_compose_command() {
     # Debug overlay must be last — overrides hardened overlay settings
     [[ "$OPT_DEBUG" == "true" ]] && overlays+=("docker-compose.debug.yml")
 
+    local tmpfile
+    tmpfile=$(mktemp)
     {
         echo '#!/bin/bash'
         echo "# compose-command.sh — single source of truth for running the stack."
@@ -2623,11 +2633,12 @@ deploy_write_compose_command() {
         # shellcheck disable=SC1003  # Backslash is a line continuation in the generated script
         echo '  --env-file .env \'
         echo '  "$@"'
-    } > "$cmd_file"
+    } > "$tmpfile"
 
-    chmod 0750 "$cmd_file"
+    $SUDO mv "$tmpfile" "$cmd_file"
+    $SUDO chmod 0750 "$cmd_file"
     if [[ "$IS_MACOS" != "true" ]]; then
-        chown "root:${SERVICE_USER}" "$cmd_file" 2>/dev/null || true
+        $SUDO chown "root:${SERVICE_USER}" "$cmd_file" 2>/dev/null || true
     fi
     info "compose-command.sh generated with overlays: ${overlays[*]}"
 }
@@ -2638,15 +2649,15 @@ deploy_backup_compose_files() {
     fi
     local backup_dir
     backup_dir="${INSTALL_DIR}/compose-backup-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup_dir"
-    cp "${INSTALL_DIR}"/docker/docker-compose*.yml "$backup_dir/" 2>/dev/null || true
-    cp "${INSTALL_DIR}/compose-command.sh" "$backup_dir/" 2>/dev/null || true
+    $SUDO mkdir -p "$backup_dir"
+    $SUDO cp "${INSTALL_DIR}"/docker/docker-compose*.yml "$backup_dir/" 2>/dev/null || true
+    $SUDO cp "${INSTALL_DIR}/compose-command.sh" "$backup_dir/" 2>/dev/null || true
     info "Compose files backed up to ${backup_dir}"
 }
 
 deploy_pull_images() {
     step "  Pulling Docker images..."
-    "${INSTALL_DIR}/compose-command.sh" pull >> "$LOG_FILE" 2>&1 || {
+    $SUDO "${INSTALL_DIR}/compose-command.sh" pull >> "$LOG_FILE" 2>&1 || {
         if [[ "$OPT_DEBUG" == "true" ]]; then
             local version_tag="${OPT_VERSION:-edge}-debug"
             local images="ghcr.io/llm-api-proxy/server-debug:${version_tag}"
@@ -2691,7 +2702,7 @@ deploy_pull_images() {
 
 deploy_start_stack() {
     step "  Starting services..."
-    "${INSTALL_DIR}/compose-command.sh" up -d >> "$LOG_FILE" 2>&1
+    $SUDO "${INSTALL_DIR}/compose-command.sh" up -d >> "$LOG_FILE" 2>&1
 
     local -a services=("timescaledb" "consul")
     [[ "$OPT_MONITORING" == "true" ]] && services+=("prometheus" "grafana")
@@ -2703,8 +2714,8 @@ deploy_start_stack() {
     for svc in "${services[@]}"; do
         local status="starting"
         while [[ "$status" != "healthy" ]]; do
-            status=$(docker inspect --format='{{.State.Health.Status}}' \
-                "$("${INSTALL_DIR}/compose-command.sh" ps -q "$svc" 2>/dev/null || true)" \
+            status=$($SUDO docker inspect --format='{{.State.Health.Status}}' \
+                "$($SUDO "${INSTALL_DIR}/compose-command.sh" ps -q "$svc" 2>/dev/null || true)" \
                 2>/dev/null || echo "starting")
 
             local elapsed=$(( $(date +%s) - start_time ))
@@ -2744,12 +2755,12 @@ deploy_consul_acl_bootstrap() {
     local delay=5
 
     if [[ -f "$token_file" ]]; then
-        bootstrap_token=$(<"$token_file")
+        bootstrap_token=$($SUDO cat "$token_file")
         info "Using existing bootstrap token from ${token_file}"
     else
         while [[ $attempts -lt $max_attempts ]]; do
             local result
-            if result=$(docker exec "$("${INSTALL_DIR}/compose-command.sh" ps -q consul 2>/dev/null || true)" \
+            if result=$($SUDO docker exec "$($SUDO "${INSTALL_DIR}/compose-command.sh" ps -q consul 2>/dev/null || true)" \
                 consul acl bootstrap -format=json 2>/dev/null); then
                 bootstrap_token=$(echo "$result" | jq -r '.SecretID')
                 break
@@ -2774,45 +2785,45 @@ deploy_consul_acl_bootstrap() {
             exit 1
         fi
 
-        echo "$bootstrap_token" > "$token_file"
-        chmod 0600 "$token_file"
-        chown root:root "$token_file" 2>/dev/null || true
+        echo "$bootstrap_token" | $SUDO tee "$token_file" > /dev/null
+        $SUDO chmod 0600 "$token_file"
+        $SUDO chown root:root "$token_file" 2>/dev/null || true
         info "Bootstrap token stored at ${token_file} (root-only)"
     fi
 
     local consul_container
-    consul_container=$("${INSTALL_DIR}/compose-command.sh" ps -q consul 2>/dev/null || true)
+    consul_container=$($SUDO "${INSTALL_DIR}/compose-command.sh" ps -q consul 2>/dev/null || true)
 
     # consul-init-rw policy
-    docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    $SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl policy create -name consul-init-rw \
         -rules='key_prefix "traefik/" { policy = "write" }' 2>/dev/null || true
     local consul_init_token
-    consul_init_token=$(docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    consul_init_token=$($SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl token create -policy-name consul-init-rw \
         -description "consul-init KV writer" -format=json 2>/dev/null | jq -r '.SecretID')
 
     # backup-agent-write policy
-    docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    $SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl policy create -name backup-agent-write \
         -rules='key_prefix "proxy/backup/" { policy = "write" }' 2>/dev/null || true
     local backup_token
-    backup_token=$(docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    backup_token=$($SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl token create -policy-name backup-agent-write \
         -description "Backup agent KV writer" -format=json 2>/dev/null | jq -r '.SecretID')
 
     # proxy-server-backup-rw policy
-    docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    $SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl policy create -name proxy-server-backup-rw \
         -rules='key_prefix "proxy/backup/" { policy = "write" }' 2>/dev/null || true
     local proxy_backup_token
-    proxy_backup_token=$(docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
+    proxy_backup_token=$($SUDO docker exec -e "CONSUL_HTTP_TOKEN=${bootstrap_token}" "$consul_container" \
         consul acl token create -policy-name proxy-server-backup-rw \
         -description "Proxy server backup KV" -format=json 2>/dev/null | jq -r '.SecretID')
 
     local tmpenv
     tmpenv=$(mktemp); CLEANUP_FILES+=("$tmpenv")
-    cat "$env_file" > "$tmpenv"
+    $SUDO cat "$env_file" > "$tmpenv"
     cat >> "$tmpenv" <<ACLEOF
 
 # ── Consul ACL (provisioned by installer) ────────────────────
@@ -2820,19 +2831,19 @@ CONSUL_HTTP_TOKEN=${consul_init_token}
 BACKUP_CONSUL_HTTP_TOKEN=${backup_token}
 PROXY_BACKUP_CONSUL_TOKEN=${proxy_backup_token}
 ACLEOF
-    chmod 0640 "$tmpenv"
+    $SUDO chmod 0640 "$tmpenv"
     if [[ "$IS_MACOS" != "true" ]]; then
-        chown "root:${SERVICE_USER}" "$tmpenv" 2>/dev/null || true
+        $SUDO chown "root:${SERVICE_USER}" "$tmpenv" 2>/dev/null || true
     fi
-    mv "$tmpenv" "$env_file"
+    $SUDO mv "$tmpenv" "$env_file"
 
     log "Consul tokens: init=$(mask_secret "$consul_init_token") backup=$(mask_secret "$backup_token")"
 
-    "${INSTALL_DIR}/compose-command.sh" run --rm consul-init >> "$LOG_FILE" 2>&1 || true
+    $SUDO "${INSTALL_DIR}/compose-command.sh" run --rm consul-init >> "$LOG_FILE" 2>&1 || true
 
-    "${INSTALL_DIR}/compose-command.sh" restart proxy >> "$LOG_FILE" 2>&1
+    $SUDO "${INSTALL_DIR}/compose-command.sh" restart proxy >> "$LOG_FILE" 2>&1
     if [[ "$OPT_BACKUP" == "true" ]]; then
-        "${INSTALL_DIR}/compose-command.sh" restart backup >> "$LOG_FILE" 2>&1 || true
+        $SUDO "${INSTALL_DIR}/compose-command.sh" restart backup >> "$LOG_FILE" 2>&1 || true
     fi
 
     info "Consul ACLs bootstrapped with scoped tokens"
@@ -2875,7 +2886,7 @@ PLISTEOF
     fi
 
     local unit_file="/etc/systemd/system/llm-api-proxy.service"
-    cat > "$unit_file" <<UNITEOF
+    $SUDO tee "$unit_file" > /dev/null <<UNITEOF
 [Unit]
 Description=LLM API Proxy
 Documentation=https://llm-api-proxy.com/docs
@@ -2898,8 +2909,8 @@ TimeoutStopSec=60
 WantedBy=multi-user.target
 UNITEOF
 
-    systemctl daemon-reload
-    systemctl enable llm-api-proxy >> "$LOG_FILE" 2>&1
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable llm-api-proxy >> "$LOG_FILE" 2>&1
     info "systemd service installed and enabled"
 }
 
@@ -2917,7 +2928,7 @@ deploy_write_metadata() {
     [[ "$OPT_MDNS" == "true" ]] && features+='"mdns",'
     features="${features%,}]"
 
-    cat > "$meta_file" <<METAEOF
+    $SUDO tee "$meta_file" > /dev/null <<METAEOF
 {
   "install_dir": "${INSTALL_DIR}",
   "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -2932,8 +2943,8 @@ deploy_write_metadata() {
 }
 METAEOF
 
-    chmod 0644 "$meta_file"
-    echo "${OPT_VERSION}" > "${INSTALL_DIR}/.version"
+    $SUDO chmod 0644 "$meta_file"
+    echo "${OPT_VERSION}" | $SUDO tee "${INSTALL_DIR}/.version" > /dev/null
     info "Metadata written to ${meta_file}"
 }
 
@@ -3046,7 +3057,7 @@ run_uninstall() {
     fi
 
     if [[ -x "${INSTALL_DIR}/compose-command.sh" ]]; then
-        "${INSTALL_DIR}/compose-command.sh" down >> "$LOG_FILE" 2>&1 || true
+        $SUDO "${INSTALL_DIR}/compose-command.sh" down >> "$LOG_FILE" 2>&1 || true
         info "Stack stopped"
     fi
 
@@ -3055,22 +3066,22 @@ run_uninstall() {
         launchctl unload "$plist" 2>/dev/null || true
         rm -f "$plist"
     else
-        systemctl stop llm-api-proxy 2>/dev/null || true
-        systemctl disable llm-api-proxy 2>/dev/null || true
-        rm -f /etc/systemd/system/llm-api-proxy.service
-        systemctl daemon-reload 2>/dev/null || true
+        $SUDO systemctl stop llm-api-proxy 2>/dev/null || true
+        $SUDO systemctl disable llm-api-proxy 2>/dev/null || true
+        $SUDO rm -f /etc/systemd/system/llm-api-proxy.service
+        $SUDO systemctl daemon-reload 2>/dev/null || true
     fi
     info "System service removed"
 
-    rm -rf "$INSTALL_DIR"
+    $SUDO rm -rf "$INSTALL_DIR"
     info "Install directory removed: ${INSTALL_DIR}"
 
     if [[ "$IS_MACOS" != "true" ]] && id "$SERVICE_USER" &>/dev/null; then
-        userdel "$SERVICE_USER" 2>/dev/null || true
+        $SUDO userdel "$SERVICE_USER" 2>/dev/null || true
         info "System user '${SERVICE_USER}' removed"
     fi
 
-    rm -rf "$METADATA_DIR"
+    $SUDO rm -rf "$METADATA_DIR"
     info "Metadata removed"
 
     if [[ "$OPT_PURGE" == "true" ]]; then
@@ -3086,9 +3097,9 @@ run_uninstall() {
         fi
 
         local -a volumes=("timescaledb_data")
-        docker volume rm "${volumes[@]}" 2>/dev/null || true
-        docker volume rm "acme_data" "proxy_ca_data" 2>/dev/null || true
-        docker volume rm "prometheus_data" "grafana_data" 2>/dev/null || true
+        $SUDO docker volume rm "${volumes[@]}" 2>/dev/null || true
+        $SUDO docker volume rm "acme_data" "proxy_ca_data" 2>/dev/null || true
+        $SUDO docker volume rm "prometheus_data" "grafana_data" 2>/dev/null || true
         info "Docker volumes purged"
     fi
 
