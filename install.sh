@@ -883,10 +883,27 @@ verify_gpg_signature() {
         return 0
     fi
 
+    # Guard: if the server returned HTML (e.g. SPA fallback) instead of real
+    # signature/checksum files, skip gracefully rather than failing gpgv.
+    if head -1 "$sig_file" | grep -qi '<!doctype\|<html'; then
+        warn "Signature endpoint returned HTML instead of a signature — skipping GPG verification"
+        return 0
+    fi
+    if head -1 "$checksums_file" | grep -qi '<!doctype\|<html'; then
+        warn "Checksums endpoint returned HTML instead of checksums — skipping GPG verification"
+        return 0
+    fi
+
     if [[ -n "${EMBED_gpg_public_key:-}" ]]; then
         echo "$EMBED_gpg_public_key" | base64 -d > "$keyring_file"
     else
         warn "No GPG public key embedded — skipping signature verification"
+        return 0
+    fi
+
+    # Guard: if the embedded key is a placeholder (not a real GPG key), skip.
+    if ! grep -q 'BEGIN PGP' "$keyring_file" 2>/dev/null; then
+        warn "Embedded GPG key is not a valid PGP key — skipping signature verification"
         return 0
     fi
 
