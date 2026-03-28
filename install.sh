@@ -1720,7 +1720,7 @@ prepare_docker() {
         $SUDO systemctl start docker >> "$LOG_FILE" 2>&1
     fi
 
-    if ! docker info &>/dev/null; then
+    if ! $SUDO docker info &>/dev/null; then
         die "Docker installed but not responding. Check: systemctl status docker"
     fi
     info "Docker installed and running"
@@ -1730,7 +1730,7 @@ prepare_docker_ipv6() {
     step "  Configuring Docker IPv6..."
 
     if [[ "$IS_MACOS" == "true" ]]; then
-        if docker info --format '{{.IPv6Forwarding}}' 2>/dev/null | grep -qi "true"; then
+        if $SUDO docker info --format '{{.IPv6Forwarding}}' 2>/dev/null | grep -qi "true"; then
             info "Docker IPv6 already enabled"
             return 0
         fi
@@ -1749,7 +1749,7 @@ prepare_docker_ipv6() {
     local daemon_json="/etc/docker/daemon.json"
     local existing="{}"
     if [[ -f "$daemon_json" ]]; then
-        existing=$(<"$daemon_json")
+        existing=$($SUDO cat "$daemon_json")
     fi
 
     if echo "$existing" | jq -e '.ipv6 == true' &>/dev/null; then
@@ -1773,7 +1773,7 @@ prepare_docker_ipv6() {
 
     $SUDO systemctl restart docker >> "$LOG_FILE" 2>&1
     local attempts=0
-    while ! docker info &>/dev/null; do
+    while ! $SUDO docker info &>/dev/null; do
         attempts=$((attempts + 1))
         if [[ $attempts -ge 15 ]]; then
             die "Docker did not restart after IPv6 configuration. Check: journalctl -u docker"
