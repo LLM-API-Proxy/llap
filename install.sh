@@ -1813,7 +1813,7 @@ prepare_firewall() {
         return 0
     fi
 
-    local -a ports=()
+    local -a ports=(22/tcp)   # SSH — always open to prevent lockout
     if [[ "$OPT_TLS" == "true" ]]; then
         ports+=(443/tcp)
     else
@@ -1863,7 +1863,7 @@ prepare_security_updates() {
     case "$PKG_MANAGER" in
         apt)
             DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq unattended-upgrades >> "$LOG_FILE" 2>&1
-            $SUDO dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive $SUDO dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
             info "unattended-upgrades configured"
             ;;
         dnf)
