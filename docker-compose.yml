@@ -3,8 +3,8 @@ services:
     image: timescale/timescaledb:latest-pg18
     environment:
       POSTGRES_DB: llm_proxy
-      POSTGRES_USER: proxy
-      POSTGRES_PASSWORD: proxy_dev_password
+      POSTGRES_USER: ${POSTGRES_USER:-proxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-proxy_dev_password}
     ports:
       # IPv6-only: [::] binds all IPv6 interfaces on the host.
       # On dual-stack hosts (net.ipv6.conf.all.disable_ipv6=0) IPv4-mapped
@@ -170,7 +170,15 @@ services:
       PROXY_FORWARD_PROXY_PORT: ${PROXY_FORWARD_PROXY_PORT:-3001}
       # With host networking, TimescaleDB is reachable at localhost:5432
       # (published via "ports: [::]:5432:5432" on the timescaledb service).
-      DATABASE_URL: postgres://proxy:proxy_dev_password@localhost:5432/llm_proxy
+      DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/llm_proxy
+      # Auth / encryption — populated by the installer in .env
+      PROXY_JWT_SECRET: ${PROXY_JWT_SECRET:-}
+      PROXY_KEK_VALUE: ${PROXY_KEK_VALUE:-}
+      PROXY_KEK_PASSPHRASE: ${PROXY_KEK_PASSPHRASE:-}
+      PROXY_ALLOW_FIRSTRUN_WIZARD: ${PROXY_ALLOW_FIRSTRUN_WIZARD:-true}
+      # Consul KV — host networking means consul is at localhost
+      CONSUL_HTTP_ADDR: http://localhost:8500
+      CONSUL_HTTP_TOKEN: ${PROXY_CONSUL_TOKEN:-}
     depends_on:
       consul:
         condition: service_healthy
