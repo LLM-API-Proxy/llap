@@ -1579,7 +1579,7 @@ prepare_system_upgrade() {
     case "$PKG_MANAGER" in
         apt)
             $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive $SUDO apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1
             ;;
         dnf)    $SUDO dnf upgrade -y -q >> "$LOG_FILE" 2>&1 ;;
         yum)    $SUDO yum update -y -q >> "$LOG_FILE" 2>&1 ;;
@@ -1602,7 +1602,7 @@ prepare_prerequisites() {
                 pkgs+=(dialog)
             fi
             $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${pkgs[@]}" >> "$LOG_FILE" 2>&1
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >> "$LOG_FILE" 2>&1
             ;;
         dnf|yum)
             pkgs=(curl jq ca-certificates gnupg2)
@@ -1660,7 +1660,7 @@ prepare_docker() {
             echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] ${repo_url} ${OS_CODENAME} stable" \
                 | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
             $SUDO apt-get update -qq >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
                 docker-ce docker-ce-cli containerd.io docker-compose-plugin >> "$LOG_FILE" 2>&1
             ;;
         dnf)
@@ -1862,8 +1862,8 @@ prepare_security_updates() {
     step "  Configuring automatic security updates..."
     case "$PKG_MANAGER" in
         apt)
-            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq unattended-upgrades >> "$LOG_FILE" 2>&1
-            DEBIAN_FRONTEND=noninteractive $SUDO dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades >> "$LOG_FILE" 2>&1
+            $SUDO env DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -plow unattended-upgrades >> "$LOG_FILE" 2>&1 || true
             info "unattended-upgrades configured"
             ;;
         dnf)
