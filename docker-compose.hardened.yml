@@ -40,7 +40,16 @@ services:
     # The entrypoint writes this to /consul/config/local.json so that path
     # must be writable (tmpfs satisfies this while keeping the container
     # otherwise read-only).
-    command: ["consul", "agent", "-dev", "-client=[::]"]
+    # Inherits server mode + persistent storage from base compose.
+    # The command override here adds ACL config dir to the base command args.
+    # See base docker-compose.yml for the full command and #335 for why -dev was removed.
+    command:
+      - "consul"
+      - "agent"
+      - "-server"
+      - "-bootstrap-expect=1"
+      - "-client=[::]"
+      - "-data-dir=/consul/data"
     environment:
       CONSUL_LOCAL_CONFIG: '{"acl":{"enabled":true,"default_policy":"deny"}}'
     tmpfs:

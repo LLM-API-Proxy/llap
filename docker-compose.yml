@@ -22,15 +22,27 @@ services:
 
   consul:
     image: hashicorp/consul:1.22
-    # Dev mode: single-node, in-memory, no persistence.
+    # Single-node server with persistent storage.
+    # Previous versions used -dev mode (in-memory), which caused complete Traefik
+    # routing failure on any Consul restart — all KV data (including TLS options
+    # seeded by consul-init) was lost, and Traefik's proxy-api router failed with
+    # "unknown TLS options: strong-tls@consul". See issue #335.
     # -client=[::] binds the HTTP API to all IPv6 interfaces (IPv6-first convention).
     # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
     # published host port below.
-    command: ["consul", "agent", "-dev", "-client=[::]"]
+    command:
+      - "consul"
+      - "agent"
+      - "-server"
+      - "-bootstrap-expect=1"
+      - "-client=[::]"
+      - "-data-dir=/consul/data"
     ports:
       # Publish on [::] so Traefik (network_mode: host) can reach the HTTP API
       # at [::1]:8500 on the host network stack.
       - "[::]:8500:8500"
+    volumes:
+      - consul_data:/consul/data
     networks:
       - proxy_net
     healthcheck:
@@ -234,3 +246,4 @@ networks:
 
 volumes:
   timescaledb_data:
+  consul_data:
