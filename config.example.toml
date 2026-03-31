@@ -150,6 +150,54 @@ require_auth = false
 # Env: PROXY_FORWARD_PROXY__TLS_INTERCEPT (double underscore)
 tls_intercept = true
 
+# ── Unexpected request trap ───────────────────────────────────────────────────
+#
+# The trap system detects and logs requests that do not match any known
+# provider route.  It samples these "unexpected" requests, stores metadata
+# for debugging, and can optionally file GitHub issues for new patterns.
+#
+# Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
+#   PROXY_TRAP__ENABLED=true
+#   PROXY_TRAP__SAMPLING_RATE=0.01
+#   PROXY_TRAP__MAX_SAMPLES_PER_PATTERN=100
+#   PROXY_TRAP__BODY_SUMMARY_MAX_BYTES=1024
+#   PROXY_TRAP__GITHUB__DEFAULT_REPO=owner/repo
+#   PROXY_TRAP__GITHUB__TOKEN_ENV=TRAP_GITHUB_TOKEN
+[trap]
+# Master switch for trap detection. Default: true.
+# Env: PROXY_TRAP__ENABLED (double underscore)
+enabled = true
+
+# Sampling rate after first occurrence (0.0-1.0).
+# First occurrence is always captured; subsequent ones are sampled at this rate.
+# Default: 0.01 (1%). Set to 1.0 to capture every occurrence.
+# Env: PROXY_TRAP__SAMPLING_RATE (double underscore)
+sampling_rate = 0.01
+
+# Maximum samples stored per unique trap pattern. Must be >= 1.
+# Env: PROXY_TRAP__MAX_SAMPLES_PER_PATTERN (double underscore)
+max_samples_per_pattern = 100
+
+# Max bytes of body structure summary to store per sample. Must be >= 64.
+# Body content is never stored verbatim — only structural summaries.
+# Env: PROXY_TRAP__BODY_SUMMARY_MAX_BYTES (double underscore)
+body_summary_max_bytes = 1024
+
+# Additional redaction patterns beyond built-in defaults.
+# Applied to request metadata before storage.
+# redaction_patterns = ["Bearer ", "prx-", "sk-ant-"]
+
+[trap.github]
+# Default GitHub repo for issue filing (owner/repo format).
+# Leave empty to disable GitHub issue filing.
+# Env: PROXY_TRAP__GITHUB__DEFAULT_REPO (double underscore)
+# default_repo = "myorg/my-proxy"
+
+# Environment variable name holding the GitHub PAT.
+# The token value is NEVER stored in config — only the env var name.
+# Env: PROXY_TRAP__GITHUB__TOKEN_ENV (double underscore)
+token_env = "TRAP_GITHUB_TOKEN"
+
 # ── Forward proxy CA certificate persistence ──────────────────────────────────
 #
 # Path to directory for persisting the forward proxy CA certificate.

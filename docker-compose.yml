@@ -11,7 +11,7 @@ services:
       # connections are also accepted via the kernel's IPv6 socket.
       - "[::]:5432:5432"
     volumes:
-      - timescaledb_data:/var/lib/postgresql/data
+      - timescaledb_data:/var/lib/postgresql/18/docker
     networks:
       - proxy_net
     healthcheck:
@@ -232,7 +232,7 @@ services:
       - traefik.tcp.routers.forward-proxy.service=proxy-forward
       # TCP service — Traefik in host mode reaches the proxy via localhost.
       # Default port 3001; change PROXY_FORWARD_PROXY_PORT env var if it conflicts.
-      - "traefik.tcp.services.proxy-forward.loadbalancer.server.address=localhost:${PROXY_FORWARD_PROXY_PORT:-3001}"
+      - "traefik.tcp.services.proxy-forward.loadbalancer.server.port=${PROXY_FORWARD_PROXY_PORT:-3001}"
 
 networks:
   proxy_net:
