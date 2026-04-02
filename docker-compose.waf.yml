@@ -9,7 +9,7 @@
 
 services:
   modsecurity:
-    image: owasp/modsecurity-crs:4-nginx-alpine-202503170904
+    image: owasp/modsecurity-crs:4-nginx-alpine-202603150103
     networks:
       - proxy_net
     ports:

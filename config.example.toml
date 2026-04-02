@@ -198,6 +198,17 @@ body_summary_max_bytes = 1024
 # Env: PROXY_TRAP__GITHUB__TOKEN_ENV (double underscore)
 token_env = "TRAP_GITHUB_TOKEN"
 
+# ── Provider notes ───────────────────────────────────────────────────────────
+#
+# Provider accounts (Anthropic, OpenAI, OpenRouter, Ollama, etc.) are configured
+# via the management API or web dashboard — not in this config file.
+# Each provider account stores its credential (API key or OAuth token) encrypted
+# in the database using envelope encryption (see kek_source above).
+#
+# OpenRouter: uses the standard api_key auth path. No provider-specific config
+# keys are required. The model catalogue is cached per-account in the
+# openrouter_models table and refreshable via the management API.
+
 # ── Forward proxy CA certificate persistence ──────────────────────────────────
 #
 # Path to directory for persisting the forward proxy CA certificate.
