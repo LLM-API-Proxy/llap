@@ -24,6 +24,12 @@ kek_source = "env"
 # Generate with: openssl rand -hex 32
 # kek_value = "0000000000000000000000000000000000000000000000000000000000000000"
 
+# HMAC-SHA256 pepper for proxy key hashing and HKDF input for credential export.
+# MUST be identical on source and destination servers for credential migration to work.
+# Generate with: openssl rand -hex 32
+# Set via PROXY_PROXY_KEY_PEPPER environment variable.
+# proxy_key_pepper = ""  # Set via PROXY_PROXY_KEY_PEPPER env var
+
 # Log level filter
 # Examples: "info", "debug", "warn", "error", "warn,proxy_server=debug"
 log_level = "info"

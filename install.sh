@@ -16,7 +16,7 @@ set -euo pipefail
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.14"
+INSTALLER_VERSION="0.0.15"
 # shellcheck disable=SC2034  # Used by phase functions appended by build-installer.sh
 INSTALL_DIR_LINUX="/opt/llm-api-proxy"
 # shellcheck disable=SC2034
@@ -173,7 +173,10 @@ ask_input() {
     local title="$1" text="$2" default="${3:-}"
     if [[ -n "$DIALOG_CMD" ]] && [[ -t 0 ]]; then
         local result
-        result=$("$DIALOG_CMD" --title "$title" --inputbox "$text" 10 60 "$default" 3>&1 1>&2 2>&3) || return 1
+        # On Escape/cancel, fall back to default rather than propagating non-zero exit
+        # (which would kill the script under set -e)
+        result=$("$DIALOG_CMD" --title "$title" --inputbox "$text" 10 60 "$default" 3>&1 1>&2 2>&3) \
+            || { echo "$default"; return 0; }
         echo "$result"
     else
         local answer
@@ -192,7 +195,9 @@ ask_password() {
     local title="$1" text="$2"
     if [[ -n "$DIALOG_CMD" ]] && [[ -t 0 ]]; then
         local result
-        result=$("$DIALOG_CMD" --title "$title" --passwordbox "$text" 10 60 3>&1 1>&2 2>&3) || return 1
+        # On Escape/cancel, return empty string rather than propagating non-zero exit
+        result=$("$DIALOG_CMD" --title "$title" --passwordbox "$text" 10 60 3>&1 1>&2 2>&3) \
+            || { echo ""; return 0; }
         echo "$result"
     else
         local answer
@@ -316,6 +321,7 @@ OPT_MDNS="true"
 # Core settings
 OPT_POSTGRES_PASSWORD=""
 OPT_KEK_HEX=""
+OPT_PROXY_KEY_PEPPER=""
 OPT_LISTEN_PORT="7080"
 OPT_FORWARD_PROXY_PORT="7443"
 
@@ -412,6 +418,8 @@ Features (all ON by default):
 Core:
   --postgres-password=    DB password (auto-generated if omitted)
   --kek-hex=              Encryption key (auto-generated if omitted)
+  --proxy-key-pepper=HEX  64-char hex proxy key HMAC pepper (auto-generated if not set)
+                          MUST match source server for credential migrations
   --listen-port=          Proxy HTTP service port (default: 7080)
   --forward-proxy-port=   Forward proxy CONNECT port (default: 7443)
 
@@ -476,6 +484,7 @@ parse_args() {
             --no-mdns)            OPT_MDNS="false" ;;
             --postgres-password=*) OPT_POSTGRES_PASSWORD="${1#*=}" ;;
             --kek-hex=*)          OPT_KEK_HEX="${1#*=}" ;;
+            --proxy-key-pepper=*) OPT_PROXY_KEY_PEPPER="${1#*=}" ;;
             --listen-port=*)      OPT_LISTEN_PORT="${1#*=}" ;;
             --forward-proxy-port=*) OPT_FORWARD_PROXY_PORT="${1#*=}" ;;
             --domain=*)           OPT_DOMAIN="${1#*=}" ;;
@@ -522,6 +531,7 @@ apply_env_defaults() {
     [[ -z "$OPT_CF_API_KEY" ]]         && OPT_CF_API_KEY="${PROXY_INSTALL_CF_API_KEY:-}"
     [[ -z "$OPT_POSTGRES_PASSWORD" ]]  && OPT_POSTGRES_PASSWORD="${PROXY_INSTALL_POSTGRES_PASSWORD:-}"
     [[ -z "$OPT_KEK_HEX" ]]           && OPT_KEK_HEX="${PROXY_INSTALL_KEK_VALUE:-}"
+    [[ -z "$OPT_PROXY_KEY_PEPPER" ]] && OPT_PROXY_KEY_PEPPER="${PROXY_INSTALL_PROXY_KEY_PEPPER:-}"
     [[ -z "$OPT_RESTIC_REPOSITORY" ]]  && OPT_RESTIC_REPOSITORY="${PROXY_INSTALL_RESTIC_REPOSITORY:-}"
     [[ -z "$OPT_RESTIC_PASSWORD" ]]    && OPT_RESTIC_PASSWORD="${PROXY_INSTALL_RESTIC_PASSWORD:-}"
     [[ -z "$OPT_AWS_ACCESS_KEY_ID" ]]  && OPT_AWS_ACCESS_KEY_ID="${PROXY_INSTALL_AWS_ACCESS_KEY_ID:-}"
@@ -761,7 +771,7 @@ resolve_setting() {
     # 2. Existing .env from previous installation
     if [[ -f "${INSTALL_DIR:-}/docker/.env" ]]; then
         local env_value
-        env_value=$(grep "^${env_key}=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+        env_value=$($SUDO grep "^${env_key}=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
         if [[ -n "$env_value" ]]; then
             echo "$env_value"
             return 0
@@ -1539,6 +1549,15 @@ run_tos() {
         return 0
     fi
 
+    # If --accept-tos was passed, skip display and accept immediately
+    if [[ "$OPT_ACCEPT_TOS" == "true" ]]; then
+        fetch_tos
+        # shellcheck disable=SC2034
+        TOS_ACCEPTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        info "Terms of Service accepted (--accept-tos flag)"
+        return 0
+    fi
+
     fetch_tos
     display_tos
 
@@ -1979,38 +1998,40 @@ configure_version() {
         return 0
     fi
 
-    local registry_image scope tag_filter
+    local latest=""
+
     if [[ "$OPT_DEBUG" == "true" ]]; then
-        registry_image="server-debug"
-        scope="repository:llm-api-proxy/server-debug:pull"
-        tag_filter='^[0-9]+\.[0-9]+\.[0-9]+-debug$'
-    else
-        registry_image="server"
-        scope="repository:llm-api-proxy/server:pull"
-        tag_filter='^[0-9]+\.[0-9]+\.[0-9]+$'
-    fi
-
-    local tags_json
-    if tags_json=$(ghcr_api_request "https://ghcr.io/v2/llm-api-proxy/${registry_image}/tags/list" "$scope"); then
-        local available latest
-        available=$(echo "$tags_json" | jq -r '.tags[]' 2>/dev/null | grep -E "$tag_filter" | sort -V | tail -5)
-        latest=$(echo "$available" | tail -1)
-
-        # Strip -debug suffix from display and OPT_VERSION
-        if [[ "$OPT_DEBUG" == "true" ]]; then
+        # Debug images are not published to the public releases repo.
+        # Fall back to GHCR tag list which requires auth (may return 401 without a PAT).
+        local scope="repository:llm-api-proxy/server-debug:pull"
+        local tags_json
+        if tags_json=$(ghcr_api_request "https://ghcr.io/v2/llm-api-proxy/server-debug/tags/list" "$scope"); then
+            latest=$(echo "$tags_json" | jq -r '.tags[]' 2>/dev/null \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-debug$' | sort -V | tail -1)
             latest="${latest%-debug}"
         fi
-
-        if [[ -n "$latest" ]] && [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
-            OPT_VERSION=$(ask_input "Version" "Enter version to install" "$latest")
-        else
-            OPT_VERSION="${latest:-edge}"
+    else
+        # Query the public GitHub Releases API — no auth required.
+        local releases_url="https://api.github.com/repos/LLM-API-Proxy/llap/releases?per_page=10"
+        local releases_json
+        if releases_json=$(curl -fsSL --max-time 10 \
+                -H "Accept: application/vnd.github+json" \
+                "$releases_url" 2>/dev/null); then
+            latest=$(echo "$releases_json" \
+                | jq -r '[.[] | select(.prerelease==false and .draft==false) | .tag_name] | first' \
+                2>/dev/null | sed 's/^v//')
         fi
+    fi
+
+    if [[ -n "$latest" ]] && [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
+        OPT_VERSION=$(ask_input "Version" "Enter version to install" "$latest")
+    elif [[ -n "$latest" ]]; then
+        OPT_VERSION="$latest"
     else
         if [[ "$OPT_NON_INTERACTIVE" == "true" ]]; then
             OPT_VERSION="edge"
         else
-            OPT_VERSION=$(ask_input "Version" "Could not query GHCR. Enter version" "edge")
+            OPT_VERSION=$(ask_input "Version" "Could not query releases. Enter version" "edge")
         fi
     fi
 
@@ -2061,7 +2082,7 @@ configure_core() {
     if [[ -z "$OPT_KEK_HEX" ]]; then
         local existing_kek=""
         if [[ -f "${INSTALL_DIR}/docker/.env" ]]; then
-            existing_kek=$(grep "^PROXY_KEK_VALUE=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+            existing_kek=$($SUDO grep "^PROXY_KEK_VALUE=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
         fi
         if [[ -n "$existing_kek" ]]; then
             OPT_KEK_HEX="$existing_kek"
@@ -2072,7 +2093,7 @@ configure_core() {
 
     if [[ "${COMMAND:-}" == "reconfigure" ]] && [[ -f "${INSTALL_DIR}/docker/.env" ]]; then
         local old_kek
-        old_kek=$(grep "^PROXY_KEK_VALUE=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+        old_kek=$($SUDO grep "^PROXY_KEK_VALUE=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
         if [[ -n "$old_kek" ]] && [[ "$old_kek" != "$OPT_KEK_HEX" ]]; then
             warn "KEK is changing! All encrypted provider credentials will become unreadable."
             if [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
@@ -2081,6 +2102,35 @@ configure_core() {
                 fi
             fi
         fi
+    fi
+
+    # ── Proxy key pepper ───────────────────────────────────────────────────────
+    local existing_pepper=""
+    if [[ -f "${INSTALL_DIR}/docker/.env" ]]; then
+        existing_pepper=$($SUDO grep "^PROXY_PROXY_KEY_PEPPER=" "${INSTALL_DIR}/docker/.env" \
+            2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+    fi
+
+    if [[ -z "$OPT_PROXY_KEY_PEPPER" ]]; then
+        if [[ -n "$existing_pepper" ]]; then
+            OPT_PROXY_KEY_PEPPER="$existing_pepper"
+            log "Preserving existing PROXY_PROXY_KEY_PEPPER"
+        else
+            OPT_PROXY_KEY_PEPPER=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n')
+            log "Generated new PROXY_PROXY_KEY_PEPPER"
+            warn "IMPORTANT: Save your PROXY_PROXY_KEY_PEPPER value securely."
+            warn "This value must be IDENTICAL on the destination server when migrating credentials."
+            warn "Losing this value will break proxy key validation after a migration."
+        fi
+    fi
+
+    # Warn if pepper is changing on reconfigure
+    if [[ "${COMMAND:-}" == "reconfigure" ]] && \
+       [[ -n "$existing_pepper" ]] && \
+       [[ "$existing_pepper" != "$OPT_PROXY_KEY_PEPPER" ]]; then
+        warn "WARNING: PROXY_PROXY_KEY_PEPPER is changing!"
+        warn "All existing proxy key hashes will become INVALID."
+        warn "Users will need to regenerate their proxy keys after reconfiguration."
     fi
 
     if [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
@@ -2098,14 +2148,14 @@ configure_tls() {
 
     if [[ -z "$OPT_CF_DNS_API_TOKEN" ]] && [[ -z "$OPT_CF_API_KEY" ]]; then
         local existing_token existing_key
-        existing_token=$(grep "^CF_DNS_API_TOKEN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
-        existing_key=$(grep "^CF_API_KEY=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+        existing_token=$($SUDO grep "^CF_DNS_API_TOKEN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+        existing_key=$($SUDO grep "^CF_API_KEY=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
 
         if [[ -n "$existing_token" ]]; then
             OPT_CF_DNS_API_TOKEN="$existing_token"
         elif [[ -n "$existing_key" ]]; then
             OPT_CF_API_KEY="$existing_key"
-            OPT_CF_API_EMAIL=$(grep "^CF_API_EMAIL=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
+            OPT_CF_API_EMAIL=$($SUDO grep "^CF_API_EMAIL=" "${INSTALL_DIR}/docker/.env" 2>/dev/null | cut -d= -f2- || true)
         elif [[ "$OPT_NON_INTERACTIVE" != "true" ]]; then
             if ask_yesno "Cloudflare Auth" "Use scoped API token (recommended)? No=use global API key" "yes"; then
                 OPT_CF_DNS_API_TOKEN=$(ask_password "Cloudflare" "Enter Cloudflare scoped API token")
@@ -2388,6 +2438,7 @@ deploy_write_env() {
         printf 'POSTGRES_USER=proxy\n'
         printf 'POSTGRES_PASSWORD=%s\n' "$OPT_POSTGRES_PASSWORD"
         printf 'PROXY_KEK_VALUE=%s\n' "$OPT_KEK_HEX"
+        printf 'PROXY_PROXY_KEY_PEPPER=%s\n' "$OPT_PROXY_KEY_PEPPER"
         printf 'PROXY_JWT_SECRET=%s\n' "$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n')"
         printf 'RUST_LOG=info\n'
         printf 'LOG_FORMAT=json\n'
@@ -2707,16 +2758,20 @@ deploy_pull_images() {
 
 deploy_start_stack() {
     step "  Starting services..."
-    $SUDO "${INSTALL_DIR}/compose-command.sh" up -d >> "$LOG_FILE" 2>&1
-
-    local -a services=("timescaledb" "consul")
-    [[ "$OPT_MONITORING" == "true" ]] && services+=("prometheus" "grafana")
+    # Start only the infrastructure services first. consul-init requires a
+    # Consul ACL token which doesn't exist until deploy_consul_acl_bootstrap()
+    # runs. Starting the full stack here would cause consul-init to exit 1
+    # (no token) and abort compose up. The full stack is brought up after
+    # ACL bootstrap in deploy_start_remaining_services().
+    local -a bootstrap_services=("timescaledb" "consul")
+    [[ "$OPT_MONITORING" == "true" ]] && bootstrap_services+=("prometheus" "grafana")
+    $SUDO "${INSTALL_DIR}/compose-command.sh" up -d "${bootstrap_services[@]}" >> "$LOG_FILE" 2>&1
 
     local timeout=120
     local start_time
     start_time=$(date +%s)
 
-    for svc in "${services[@]}"; do
+    for svc in "${bootstrap_services[@]}"; do
         local status="starting"
         while [[ "$status" != "healthy" ]]; do
             status=$($SUDO docker inspect --format='{{.State.Health.Status}}' \
@@ -2739,6 +2794,14 @@ deploy_start_stack() {
         done
         info "${svc} healthy"
     done
+    info "Infrastructure services running"
+}
+
+deploy_start_remaining_services() {
+    step "  Starting remaining services..."
+    # Bring up the full stack now that Consul ACL tokens are in .env.
+    # consul-init will succeed this time because CONSUL_HTTP_TOKEN is set.
+    $SUDO "${INSTALL_DIR}/compose-command.sh" up -d >> "$LOG_FILE" 2>&1
     info "All services running"
 }
 
@@ -2763,14 +2826,17 @@ deploy_consul_acl_bootstrap() {
         bootstrap_token=$($SUDO cat "$token_file")
         info "Using existing bootstrap token from ${token_file}"
     else
+        local bootstrap_error=""
         while [[ $attempts -lt $max_attempts ]]; do
             local result
             if result=$($SUDO docker exec \
                 -e "CONSUL_HTTP_ADDR=http://[::1]:8500" \
                 "$($SUDO "${INSTALL_DIR}/compose-command.sh" ps -q consul 2>/dev/null || true)" \
-                consul acl bootstrap -format=json 2>/dev/null); then
-                bootstrap_token=$(echo "$result" | jq -r '.SecretID')
+                consul acl bootstrap -format=json 2>&1); then
+                bootstrap_token=$(echo "$result" | jq -r '.SecretID' 2>/dev/null || true)
                 break
+            else
+                bootstrap_error="$result"
             fi
             attempts=$((attempts + 1))
             if [[ $attempts -lt $max_attempts ]]; then
@@ -2781,14 +2847,33 @@ deploy_consul_acl_bootstrap() {
         done
 
         if [[ -z "$bootstrap_token" ]]; then
-            draw_box "FAILED: Consul ACL bootstrap" \
-                "" \
-                "Could not bootstrap Consul ACLs after ${max_attempts} attempts." \
-                "" \
-                "Manual bootstrap:" \
-                "  docker exec -it <consul-container> consul acl bootstrap" \
-                "" \
-                "Full log: ${LOG_FILE}"
+            # Detect "already bootstrapped" — occurs when reinstalling without --purge
+            # and the consul volume still has ACL state from a prior install
+            if echo "$bootstrap_error" | grep -qiE "no longer allowed|bootstrap.*done|ACL bootstrap already"; then
+                draw_box "FAILED: Consul ACLs already bootstrapped" \
+                    "" \
+                    "Consul ACLs were bootstrapped in a previous install but the" \
+                    "bootstrap token file is missing from ${METADATA_DIR}." \
+                    "" \
+                    "Recovery options:" \
+                    "  1. Re-run with --purge to reset all state (DATA LOSS)" \
+                    "  2. Manually recover the bootstrap token:" \
+                    "       docker exec -it <consul-container> consul acl token list" \
+                    "     Then save it to: ${token_file}" \
+                    "" \
+                    "Full log: ${LOG_FILE}"
+            else
+                draw_box "FAILED: Consul ACL bootstrap" \
+                    "" \
+                    "Could not bootstrap Consul ACLs after ${max_attempts} attempts." \
+                    "" \
+                    "Last error: ${bootstrap_error}" \
+                    "" \
+                    "Manual bootstrap:" \
+                    "  docker exec -it <consul-container> consul acl bootstrap" \
+                    "" \
+                    "Full log: ${LOG_FILE}"
+            fi
             exit 1
         fi
 
@@ -3043,6 +3128,7 @@ run_deploy() {
     deploy_pull_images
     deploy_start_stack
     deploy_consul_acl_bootstrap
+    deploy_start_remaining_services
     deploy_install_service
     deploy_write_metadata
     deploy_post_install_summary
@@ -3192,9 +3278,9 @@ EMBED_grafana_backup_health_json="ewogICJfX2lucHV0cyI6IFtdLAogICJfX3JlcXVpcmVzIj
 # FILE: docker/grafana/provisioning/datasources/prometheus.yml
 EMBED_grafana_datasources_yml="IyBkb2NrZXIvZ3JhZmFuYS9wcm92aXNpb25pbmcvZGF0YXNvdXJjZXMvcHJvbWV0aGV1cy55bWwKIyBBdXRvLXByb3Zpc2lvbnMgdGhlIFByb21ldGhldXMgZGF0YSBzb3VyY2UgaW4gR3JhZmFuYSBvbiBmaXJzdCBzdGFydHVwLgoKYXBpVmVyc2lvbjogMQoKZGF0YXNvdXJjZXM6CiAgLSBuYW1lOiBQcm9tZXRoZXVzCiAgICB0eXBlOiBwcm9tZXRoZXVzCiAgICBhY2Nlc3M6IHByb3h5CiAgICB1cmw6IGh0dHA6Ly9wcm9tZXRoZXVzOjkwOTAKICAgIGlzRGVmYXVsdDogdHJ1ZQogICAgZWRpdGFibGU6IGZhbHNlCg=="
 # FILE: config.example.toml
-EMBED_config_example_toml="IyBsbG0tYXBpLXByb3h5IGNvbmZpZ3VyYXRpb24gZXhhbXBsZQojIENvcHkgdG8gY29uZmlnLnRvbWwgYW5kIGZpbGwgaW4geW91ciB2YWx1ZXMuCiMgQWxsIHZhbHVlcyBjYW4gYWxzbyBiZSBzZXQgdmlhIFBST1hZXyogZW52aXJvbm1lbnQgdmFyaWFibGVzLgoKIyBQb3N0Z3JlU1FMIGNvbm5lY3Rpb24gVVJMIChyZXF1aXJlZCkKIyBkYXRhYmFzZV91cmwgPSAicG9zdGdyZXM6Ly91c2VyOnBhc3N3b3JkQFs6OjFdOjU0MzIvbGxtX3Byb3h5IgoKIyBBZGRyZXNzIHRvIGJpbmQgdGhlIG1hbmFnZW1lbnQgQVBJIGFuZCByZXZlcnNlIHByb3h5IHNlcnZlci4KIyBJUHY2LWZpcnN0OiAiOjoiIGJpbmRzIGFsbCBJUHY2IGludGVyZmFjZXMgKGR1YWwtc3RhY2sgd2hlcmUga2VybmVsIGhhcyBuZXQuaXB2Ni5jb25mLmFsbC5kaXNhYmxlX2lwdjY9MCkuCmxpc3Rlbl9hZGRyID0gIjo6IgoKIyBQb3J0IGZvciB0aGUgbWFuYWdlbWVudCBBUEkgYW5kIHJldmVyc2UgcHJveHkgKEhUVFAvSFRUUFMgdmlhIFRyYWVmaWspCmxpc3Rlbl9wb3J0ID0gMzAwMAoKIyBQb3J0IGZvciB0aGUgZm9yd2FyZCBwcm94eSAoQ09OTkVDVCBoYW5kbGVyIC8gVExTIGludGVyY2VwdGlvbikKIyBEZXByZWNhdGVkOiBwcmVmZXIgW2ZvcndhcmRfcHJveHldIHNlY3Rpb24gYmVsb3cuCmZvcndhcmRfcHJveHlfcG9ydCA9IDMwMDEKCiMgU291cmNlIGZvciB0aGUgS2V5IEVuY3J5cHRpb24gS2V5OiAiZW52IiBvciAidmF1bHQiCmtla19zb3VyY2UgPSAiZW52IgoKIyBUaGUgS0VLIHZhbHVlIHdoZW4ga2VrX3NvdXJjZSA9ICJlbnYiIChyZXF1aXJlZCwgbm8gZGVmYXVsdCDigJQgc2VydmVyIHJlZnVzZXMgdG8gc3RhcnQgaWYgdW5zZXQpCiMgTXVzdCBiZSBleGFjdGx5IDY0IGxvd2VyY2FzZSBoZXggY2hhcmFjdGVycyAoMzIgYnl0ZXMpLiBCYXNlNjQgaXMgTk9UIGFjY2VwdGVkLgojIEdlbmVyYXRlIHdpdGg6IG9wZW5zc2wgcmFuZCAtaGV4IDMyCiMga2VrX3ZhbHVlID0gIjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiCgojIExvZyBsZXZlbCBmaWx0ZXIKIyBFeGFtcGxlczogImluZm8iLCAiZGVidWciLCAid2FybiIsICJlcnJvciIsICJ3YXJuLHByb3h5X3NlcnZlcj1kZWJ1ZyIKbG9nX2xldmVsID0gImluZm8iCgojIExvZyBmb3JtYXQ6ICJ0ZXh0IiAoaHVtYW4gcmVhZGFibGUpIG9yICJqc29uIiAoc3RydWN0dXJlZCwgZm9yIHByb2R1Y3Rpb24pCmxvZ19mb3JtYXQgPSAidGV4dCIKCiMgVExTIGNvbmZpZ3VyYXRpb24g4oCUIG1hbmFnZWQgYnkgVHJhZWZpayAoc2VlIGRvY3MvdGxzLXNldHVwLm1kKQojIFRvIGVuYWJsZSBhdXRvbWF0ZWQgVExTLCBydW4gdGhlIHN0YWNrIHdpdGggdGhlIFRMUyBjb21wb3NlIG92ZXJyaWRlOgojICAgZG9ja2VyIGNvbXBvc2UgLWYgZG9ja2VyL2RvY2tlci1jb21wb3NlLnltbCAtZiBkb2NrZXIvZG9ja2VyLWNvbXBvc2UudGxzLnltbCBcCiMgICAgIC0tZW52LWZpbGUgZG9ja2VyL3Rscy5lbnYgdXAgLWQKIwojIE5vdGUgb24gZW52IHZhciBuYW1pbmc6IG5lc3RlZCBzdHJ1Y3QgZmllbGRzIHJlcXVpcmUgRE9VQkxFLVVOREVSU0NPUkUgc2VwYXJhdG9ycy4KIyAgIFBST1hZX1RMU19fRU5BQkxFRD10cnVlICAgICAgICAgICAgKG5vdCBQUk9YWV9UTFNfRU5BQkxFRCDigJQgdGhhdCBpcyBzaWxlbnRseSBpZ25vcmVkKQojICAgUFJPWFlfVExTX19ET01BSU49cHJveHkuZXhhbXBsZS5jb20KIyAgIFBST1hZX1RMU19fQUNNRV9FTUFJTD1hZG1pbkBleGFtcGxlLmNvbQpbdGxzXQojIFdoZXRoZXIgYXV0b21hdGVkIFRMUyAoQUNNRS9MZXQncyBFbmNyeXB0IHZpYSBETlMtMDEpIGlzIGFjdGl2ZS4KIyBTZXQgdG8gdHJ1ZSB3aGVuIHVzaW5nIGRvY2tlci9kb2NrZXItY29tcG9zZS50bHMueW1sLgojIEVudjogUFJPWFlfVExTX19FTkFCTEVEIChkb3VibGUgdW5kZXJzY29yZSkKZW5hYmxlZCA9IGZhbHNlCgojIFlvdXIgcHVibGljIGhvc3RuYW1lIChlLmcuIHByb3h5LmV4YW1wbGUuY29tIG9yICouZXhhbXBsZS5jb20gZm9yIHdpbGRjYXJkKS4KIyBVc2VkIGluIC8ud2VsbC1rbm93bi9wcm94eS1pbmZvLmpzb24gYW5kIGZvciBIVFRQUyBVUkwgZ2VuZXJhdGlvbi4KIyBNdXN0IGJlIGEgYmFyZSBob3N0bmFtZSB3aXRob3V0IHNjaGVtZSBvciBwb3J0LgojIEVudjogUFJPWFlfVExTX19ET01BSU4gKGRvdWJsZSB1bmRlcnNjb3JlIOKAlCBmaWdtZW50IG5lc3RlZCBzdHJ1Y3QgY29udmVudGlvbikKIyBkb21haW4gPSAicHJveHkuZXhhbXBsZS5jb20iCgojIEVtYWlsIGFkZHJlc3MgZm9yIExldCdzIEVuY3J5cHQgQUNNRSByZWdpc3RyYXRpb24uCiMgUmVxdWlyZWQgd2hlbiBlbmFibGVkID0gdHJ1ZS4gQWxzbyBjb25zdW1lZCBieSB0aGUgVHJhZWZpayBjb250YWluZXIgdmlhCiMgLS1jZXJ0aWZpY2F0ZXNyZXNvbHZlcnMuY2xvdWRmbGFyZS5hY21lLmVtYWlsPSR7UFJPWFlfVExTX19BQ01FX0VNQUlMfS4KIyBPbmUgZW52IHZhciwgdHdvIGNvbnN1bWVycyAoUnVzdCBjb25maWcgKyBUcmFlZmlrIENMSSkuCiMgRW52OiBQUk9YWV9UTFNfX0FDTUVfRU1BSUwgKGRvdWJsZSB1bmRlcnNjb3JlKQojIGFjbWVfZW1haWwgPSAiYWRtaW5AZXhhbXBsZS5jb20iCgojIEFDTUUgQ0Egc2VydmVyIFVSTC4gRGVmYXVsdHMgdG8gTGV0J3MgRW5jcnlwdCBwcm9kdWN0aW9uIHdoZW4gbm90IHNldC4KIyBGb3IgdGVzdGluZywgdXNlIHRoZSBzdGFnaW5nIFVSTCB0byBhdm9pZCBwcm9kdWN0aW9uIHJhdGUgbGltaXRzOgojICAgaHR0cHM6Ly9hY21lLXN0YWdpbmctdjAyLmFwaS5sZXRzZW5jcnlwdC5vcmcvZGlyZWN0b3J5CiMgVGhpcyB2YWx1ZSBpcyBzdXJmYWNlZCBieSAvbWFuYWdlL3YxL3Rscy9zdGF0dXMgc28gb3BlcmF0b3JzIGNhbiB2ZXJpZnkKIyB3aGljaCBDQSBpcyBpbiB1c2Ugd2l0aG91dCBpbnNwZWN0aW5nIFRyYWVmaWsgbG9ncy4KIyBFbnY6IFBST1hZX1RMU19fQUNNRV9DQSAoZG91YmxlIHVuZGVyc2NvcmUpCiMgYWNtZV9jYSA9ICJodHRwczovL2FjbWUtdjAyLmFwaS5sZXRzZW5jcnlwdC5vcmcvZGlyZWN0b3J5IgoKIyDilIDilIAgbUROUyAvIEROUy1TRCBzZXJ2aWNlIGRpc2NvdmVyeSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIFRoZSBwcm94eSBhZHZlcnRpc2VzIGl0c2VsZiBvbiB0aGUgbG9jYWwgbmV0d29yayB2aWEgbXVsdGljYXN0IEROUyAobUROUyAvCiMgRE5TLVNELCBSRkMgNjc2MiAvIFJGQyA2NzYzKSBzbyB0aGF0IG9wZXJhdG9yIHRvb2xpbmcgYW5kIGNsaWVudHMgY2FuCiMgZGlzY292ZXIgaXQgYXV0b21hdGljYWxseSB3aXRob3V0IG1hbnVhbCBETlMgY29uZmlndXJhdGlvbi4KIwojIG1ETlMgaXMgT04gYnkgZGVmYXVsdC4gVG8gZGlzYWJsZSBpdCBzZXQgYGVuYWJsZWQgPSBmYWxzZWAgaGVyZSBvcjoKIyAgIFBST1hZX01ETlNfX0VOQUJMRUQ9ZmFsc2UKIwojIE5vdGUgb24gYWR2ZXJ0aXNlZCBwb3J0czogdGhlIHBvcnRzIGFubm91bmNlZCBpbiBETlMtU0QgVFhUL1NSViByZWNvcmRzCiMgYXJlIHRha2VuIGZyb20gYGxpc3Rlbl9wb3J0YCAoZGVmYXVsdCAzMDAwLCB0aGUgbWFuYWdlbWVudCBBUEkgKyByZXZlcnNlCiMgcHJveHkpIGFuZCBgZm9yd2FyZF9wcm94eV9wb3J0YCAoZGVmYXVsdCAzMDAxLCB0aGUgQ09OTkVDVCBoYW5kbGVyKS4gIFdoZW4KIyBydW5uaW5nIHdpdGggaG9zdCBuZXR3b3JraW5nIChhcyB0aGUgRG9ja2VyIENvbXBvc2Ugc3RhY2sgZG9lcykgdGhlc2UgcG9ydHMKIyBiaW5kIGRpcmVjdGx5IG9uIHRoZSBob3N0IGludGVyZmFjZS4gIElmIDMwMDAgb3IgMzAwMSBhcmUgYWxyZWFkeSBpbiB1c2Ugb24KIyB5b3VyIGhvc3QsIG92ZXJyaWRlIHRoZW0gdmlhOgojICAgUFJPWFlfTElTVEVOX1BPUlQ9PGZyZWVfcG9ydD4KIyAgIFBST1hZX0ZPUldBUkRfUFJPWFlfUE9SVD08ZnJlZV9wb3J0PgojCiMgTm90ZSBvbiBlbnYgdmFyIG5hbWluZzogbmVzdGVkIHN0cnVjdCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3JzLgojICAgUFJPWFlfTUROU19fRU5BQkxFRD1mYWxzZSAgICAgICAgICAgICAgIChub3QgUFJPWFlfTUROU19FTkFCTEVEIOKAlCBzaWxlbnRseSBpZ25vcmVkKQojICAgUFJPWFlfTUROU19fSU5TVEFOQ0VfTkFNRT1teS1wcm94eQojICAgUFJPWFlfTUROU19fU0VSVklDRV9UWVBFPV9sbG0tcHJveHkuX3RjcAojICAgUFJPWFlfTUROU19fUkVGUkVTSF9JTlRFUlZBTF9TRUNTPTMwClttZG5zXQojIFdoZXRoZXIgdG8gYWR2ZXJ0aXNlIHRoaXMgcHJveHkgdmlhIG1ETlMgb24gdGhlIGxvY2FsIG5ldHdvcmsuCiMgRGVmYXVsdHMgdG8gdHJ1ZS4gU2V0IHRvIGZhbHNlIGluIGNsb3VkIC8gcmVzdHJpY3RlZC1tdWx0aWNhc3QgZW52aXJvbm1lbnRzLgojIEVudjogUFJPWFlfTUROU19fRU5BQkxFRCAoZG91YmxlIHVuZGVyc2NvcmUpCmVuYWJsZWQgPSB0cnVlCgojIEh1bWFuLXJlYWRhYmxlIGluc3RhbmNlIG5hbWUgZm9yIEROUy1TRCByZWNvcmRzLgojIFdoZW4gZW1wdHkgKHRoZSBkZWZhdWx0KSB0aGUgbUROUyBzZXJ2aWNlIGxheWVyIHVzZXMgIntob3N0bmFtZX0te2xpc3Rlbl9wb3J0fSIuCiMgTXVzdCBiZSDiiaQgNjMgY2hhcmFjdGVycyBhbmQgY29udGFpbiBvbmx5IGxldHRlcnMsIGRpZ2l0cywgYW5kIGh5cGhlbnMgd2hlbiBzZXQuCiMgRW52OiBQUk9YWV9NRE5TX19JTlNUQU5DRV9OQU1FIChkb3VibGUgdW5kZXJzY29yZSkKIyBpbnN0YW5jZV9uYW1lID0gIm15LWxsbS1wcm94eSIKCiMgRE5TLVNEIHNlcnZpY2UgdHlwZSBXSVRIT1VUIHRoZSAiLmxvY2FsLiIgc3VmZml4IChhcHBlbmRlZCBieSB0aGUgc2VydmljZSBsYXllcikuCiMgRGVmYXVsdDogIl9sbG0tcHJveHkuX3RjcCIKIyBNdXN0IG1hdGNoICJfPG5hbWU+Ll90Y3AiIG9yICJfPG5hbWU+Ll91ZHAiIHBhdHRlcm4uCiMgRW52OiBQUk9YWV9NRE5TX19TRVJWSUNFX1RZUEUgKGRvdWJsZSB1bmRlcnNjb3JlKQpzZXJ2aWNlX3R5cGUgPSAiX2xsbS1wcm94eS5fdGNwIgoKIyBIb3cgb2Z0ZW4gKGluIHNlY29uZHMpIHRoZSBtRE5TIHNlcnZpY2UgcmUtYW5ub3VuY2VzIHRoZSByZWNvcmQuCiMgTXVzdCBiZSA+IDAuIFZhbGlkYXRlZCBhdCBzZXJ2aWNlLWxheWVyIHN0YXJ0dXAsIG5vdCBkdXJpbmcgY29uZmlnIHBhcnNpbmcuCiMgRW52OiBQUk9YWV9NRE5TX19SRUZSRVNIX0lOVEVSVkFMX1NFQ1MgKGRvdWJsZSB1bmRlcnNjb3JlKQpyZWZyZXNoX2ludGVydmFsX3NlY3MgPSAzMAoKIyDilIDilIAgRm9yd2FyZCBwcm94eSBUQ1AgbGlzdGVuZXIg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiMKIyBDb250cm9scyB0aGUgcmF3IFRDUCBsaXN0ZW5lciBmb3IgSFRUUCBDT05ORUNUIHR1bm5lbGxpbmcuCiMgQ2xpZW50cyBzZXQgSFRUUFNfUFJPWFk9aHR0cDovL2hvc3Q6MzAwMSB0byB1c2UgdGhpcyBtb2RlLgojCiMgTm90ZSBvbiBlbnYgdmFyIG5hbWluZzogbmVzdGVkIHN0cnVjdCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3JzLgojICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9fRU5BQkxFRD10cnVlCiMgICBQUk9YWV9GT1JXQVJEX1BST1hZX19QT1JUPTgwODAKIyAgIFBST1hZX0ZPUldBUkRfUFJPWFlfX1JFUVVJUkVfQVVUSD10cnVlCltmb3J3YXJkX3Byb3h5XQojIFdoZXRoZXIgdGhlIHJhdyBUQ1AgQ09OTkVDVCBsaXN0ZW5lciBpcyBhY3RpdmUuIERlZmF1bHQ6IHRydWUuCiMgRW52OiBQUk9YWV9GT1JXQVJEX1BST1hZX19FTkFCTEVEIChkb3VibGUgdW5kZXJzY29yZSkKZW5hYmxlZCA9IHRydWUKCiMgUG9ydCBmb3IgdGhlIFRDUCBDT05ORUNUIGxpc3RlbmVyLiBEZWZhdWx0OiAzMDAxLgojIEVudjogUFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVCAoZG91YmxlIHVuZGVyc2NvcmUpCnBvcnQgPSAzMDAxCgojIFdoZXRoZXIgUHJveHktQXV0aG9yaXphdGlvbiBpcyByZXF1aXJlZCBvbiBldmVyeSBDT05ORUNUIHJlcXVlc3QuCiMgV2hlbiBmYWxzZSAoZGVmYXVsdCksIHVuYXV0aGVudGljYXRlZCB0dW5uZWxzIGFyZSBwZXJtaXR0ZWQuCiMgQ2xpZW50cyBtdXN0IHRoZW4gaW5jbHVkZSBBdXRob3JpemF0aW9uOiBCZWFyZXIgcHJ4LS4uLiBpbnNpZGUgdGhlIHR1bm5lbC4KIyBFbnY6IFBST1hZX0ZPUldBUkRfUFJPWFlfX1JFUVVJUkVfQVVUSCAoZG91YmxlIHVuZGVyc2NvcmUpCnJlcXVpcmVfYXV0aCA9IGZhbHNlCgojIFdoZXRoZXIgVExTIGludGVyY2VwdGlvbiAoTUlUTSBtb2RlKSBpcyBhY3RpdmUuIERlZmF1bHQ6IHRydWUuCiMKIyBUaGUgcHJveHkgTUlUTXMgQUxMIHRyYWZmaWMgKEhUVFAsIEhUVFBTLCBXZWJTb2NrZXRzKSBieSBkZWZhdWx0IOKAlCB0aGlzIGlzCiMgdGhlIGludGVuZGVkIG9wZXJhdGluZyBtb2RlLiBJbnNwZWN0aW9uIGlzIHJlcXVpcmVkIHRvIGVuZm9yY2UgcGVyLWtleSBtb2RlbAojIHJlc3RyaWN0aW9ucywgcmF0ZSBsaW1pdHMsIHVzYWdlIGFjY291bnRpbmcsIGFuZCByZXF1ZXN0IGxvZ2dpbmcuCiMKIyBTZXQgdG8gZmFsc2Ugb25seSB3aGVuIE1JVE0gaXMgZXhwbGljaXRseSB1bmRlc2lyZWQgKGUuZy4gbm9uLUxMTSBwYXNzdGhyb3VnaAojIG9yIGVudmlyb25tZW50cyB0aGF0IHByb2hpYml0IFRMUyBpbnRlcmNlcHRpb24pLiBSZXF1aXJlcyBhIENBIGNlcnRpZmljYXRlCiMgKGNhX3N0b3JhZ2VfZGlyIG9yIGNhX2NlcnRfcGVtIC8gY2Ffa2V5X3BlbSkgd2hlbiB0cnVlLgojCiMgRW52OiBQUk9YWV9GT1JXQVJEX1BST1hZX19UTFNfSU5URVJDRVBUIChkb3VibGUgdW5kZXJzY29yZSkKdGxzX2ludGVyY2VwdCA9IHRydWUKCiMg4pSA4pSAIFVuZXhwZWN0ZWQgcmVxdWVzdCB0cmFwIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgVGhlIHRyYXAgc3lzdGVtIGRldGVjdHMgYW5kIGxvZ3MgcmVxdWVzdHMgdGhhdCBkbyBub3QgbWF0Y2ggYW55IGtub3duCiMgcHJvdmlkZXIgcm91dGUuICBJdCBzYW1wbGVzIHRoZXNlICJ1bmV4cGVjdGVkIiByZXF1ZXN0cywgc3RvcmVzIG1ldGFkYXRhCiMgZm9yIGRlYnVnZ2luZywgYW5kIGNhbiBvcHRpb25hbGx5IGZpbGUgR2l0SHViIGlzc3VlcyBmb3IgbmV3IHBhdHRlcm5zLgojCiMgTm90ZSBvbiBlbnYgdmFyIG5hbWluZzogbmVzdGVkIHN0cnVjdCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3JzLgojICAgUFJPWFlfVFJBUF9fRU5BQkxFRD10cnVlCiMgICBQUk9YWV9UUkFQX19TQU1QTElOR19SQVRFPTAuMDEKIyAgIFBST1hZX1RSQVBfX01BWF9TQU1QTEVTX1BFUl9QQVRURVJOPTEwMAojICAgUFJPWFlfVFJBUF9fQk9EWV9TVU1NQVJZX01BWF9CWVRFUz0xMDI0CiMgICBQUk9YWV9UUkFQX19HSVRIVUJfX0RFRkFVTFRfUkVQTz1vd25lci9yZXBvCiMgICBQUk9YWV9UUkFQX19HSVRIVUJfX1RPS0VOX0VOVj1UUkFQX0dJVEhVQl9UT0tFTgpbdHJhcF0KIyBNYXN0ZXIgc3dpdGNoIGZvciB0cmFwIGRldGVjdGlvbi4gRGVmYXVsdDogdHJ1ZS4KIyBFbnY6IFBST1hZX1RSQVBfX0VOQUJMRUQgKGRvdWJsZSB1bmRlcnNjb3JlKQplbmFibGVkID0gdHJ1ZQoKIyBTYW1wbGluZyByYXRlIGFmdGVyIGZpcnN0IG9jY3VycmVuY2UgKDAuMC0xLjApLgojIEZpcnN0IG9jY3VycmVuY2UgaXMgYWx3YXlzIGNhcHR1cmVkOyBzdWJzZXF1ZW50IG9uZXMgYXJlIHNhbXBsZWQgYXQgdGhpcyByYXRlLgojIERlZmF1bHQ6IDAuMDEgKDElKS4gU2V0IHRvIDEuMCB0byBjYXB0dXJlIGV2ZXJ5IG9jY3VycmVuY2UuCiMgRW52OiBQUk9YWV9UUkFQX19TQU1QTElOR19SQVRFIChkb3VibGUgdW5kZXJzY29yZSkKc2FtcGxpbmdfcmF0ZSA9IDAuMDEKCiMgTWF4aW11bSBzYW1wbGVzIHN0b3JlZCBwZXIgdW5pcXVlIHRyYXAgcGF0dGVybi4gTXVzdCBiZSA+PSAxLgojIEVudjogUFJPWFlfVFJBUF9fTUFYX1NBTVBMRVNfUEVSX1BBVFRFUk4gKGRvdWJsZSB1bmRlcnNjb3JlKQptYXhfc2FtcGxlc19wZXJfcGF0dGVybiA9IDEwMAoKIyBNYXggYnl0ZXMgb2YgYm9keSBzdHJ1Y3R1cmUgc3VtbWFyeSB0byBzdG9yZSBwZXIgc2FtcGxlLiBNdXN0IGJlID49IDY0LgojIEJvZHkgY29udGVudCBpcyBuZXZlciBzdG9yZWQgdmVyYmF0aW0g4oCUIG9ubHkgc3RydWN0dXJhbCBzdW1tYXJpZXMuCiMgRW52OiBQUk9YWV9UUkFQX19CT0RZX1NVTU1BUllfTUFYX0JZVEVTIChkb3VibGUgdW5kZXJzY29yZSkKYm9keV9zdW1tYXJ5X21heF9ieXRlcyA9IDEwMjQKCiMgQWRkaXRpb25hbCByZWRhY3Rpb24gcGF0dGVybnMgYmV5b25kIGJ1aWx0LWluIGRlZmF1bHRzLgojIEFwcGxpZWQgdG8gcmVxdWVzdCBtZXRhZGF0YSBiZWZvcmUgc3RvcmFnZS4KIyByZWRhY3Rpb25fcGF0dGVybnMgPSBbIkJlYXJlciAiLCAicHJ4LSIsICJzay1hbnQtIl0KClt0cmFwLmdpdGh1Yl0KIyBEZWZhdWx0IEdpdEh1YiByZXBvIGZvciBpc3N1ZSBmaWxpbmcgKG93bmVyL3JlcG8gZm9ybWF0KS4KIyBMZWF2ZSBlbXB0eSB0byBkaXNhYmxlIEdpdEh1YiBpc3N1ZSBmaWxpbmcuCiMgRW52OiBQUk9YWV9UUkFQX19HSVRIVUJfX0RFRkFVTFRfUkVQTyAoZG91YmxlIHVuZGVyc2NvcmUpCiMgZGVmYXVsdF9yZXBvID0gIm15b3JnL215LXByb3h5IgoKIyBFbnZpcm9ubWVudCB2YXJpYWJsZSBuYW1lIGhvbGRpbmcgdGhlIEdpdEh1YiBQQVQuCiMgVGhlIHRva2VuIHZhbHVlIGlzIE5FVkVSIHN0b3JlZCBpbiBjb25maWcg4oCUIG9ubHkgdGhlIGVudiB2YXIgbmFtZS4KIyBFbnY6IFBST1hZX1RSQVBfX0dJVEhVQl9fVE9LRU5fRU5WIChkb3VibGUgdW5kZXJzY29yZSkKdG9rZW5fZW52ID0gIlRSQVBfR0lUSFVCX1RPS0VOIgoKIyDilIDilIAgUHJvdmlkZXIgbm90ZXMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiMKIyBQcm92aWRlciBhY2NvdW50cyAoQW50aHJvcGljLCBPcGVuQUksIE9wZW5Sb3V0ZXIsIE9sbGFtYSwgZXRjLikgYXJlIGNvbmZpZ3VyZWQKIyB2aWEgdGhlIG1hbmFnZW1lbnQgQVBJIG9yIHdlYiBkYXNoYm9hcmQg4oCUIG5vdCBpbiB0aGlzIGNvbmZpZyBmaWxlLgojIEVhY2ggcHJvdmlkZXIgYWNjb3VudCBzdG9yZXMgaXRzIGNyZWRlbnRpYWwgKEFQSSBrZXkgb3IgT0F1dGggdG9rZW4pIGVuY3J5cHRlZAojIGluIHRoZSBkYXRhYmFzZSB1c2luZyBlbnZlbG9wZSBlbmNyeXB0aW9uIChzZWUga2VrX3NvdXJjZSBhYm92ZSkuCiMKIyBPcGVuUm91dGVyOiB1c2VzIHRoZSBzdGFuZGFyZCBhcGlfa2V5IGF1dGggcGF0aC4gTm8gcHJvdmlkZXItc3BlY2lmaWMgY29uZmlnCiMga2V5cyBhcmUgcmVxdWlyZWQuIFRoZSBtb2RlbCBjYXRhbG9ndWUgaXMgY2FjaGVkIHBlci1hY2NvdW50IGluIHRoZQojIG9wZW5yb3V0ZXJfbW9kZWxzIHRhYmxlIGFuZCByZWZyZXNoYWJsZSB2aWEgdGhlIG1hbmFnZW1lbnQgQVBJLgoKIyDilIDilIAgRm9yd2FyZCBwcm94eSBDQSBjZXJ0aWZpY2F0ZSBwZXJzaXN0ZW5jZSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIFBhdGggdG8gZGlyZWN0b3J5IGZvciBwZXJzaXN0aW5nIHRoZSBmb3J3YXJkIHByb3h5IENBIGNlcnRpZmljYXRlLgojIE9uIGZpcnN0IHN0YXJ0dXA6IENBIGNlcnQgYW5kIGtleSBhcmUgZ2VuZXJhdGVkIGFuZCB3cml0dGVuIGhlcmUuCiMgT24gc3Vic2VxdWVudCBzdGFydHVwczogdGhlIGV4aXN0aW5nIHBhaXIgaXMgbG9hZGVkIGZyb20gdGhpcyBkaXJlY3RvcnkuCiMgUGFydGlhbCBzdGF0ZSAob25lIGZpbGUgd2l0aG91dCB0aGUgb3RoZXIpIGNhdXNlcyBhIHN0YXJ0dXAgZXJyb3IuCiMgRXhwaXJlZCBDQSBjYXVzZXMgYSBzdGFydHVwIGVycm9yIOKAlCBkZWxldGUgYm90aCBmaWxlcyBhbmQgcmVzdGFydCB0byByb3RhdGUuCiMgV2hlbiB1bnNldDogZXBoZW1lcmFsIENBIGlzIGdlbmVyYXRlZCBvbiBlYWNoIHN0YXJ0dXAgKGRldmVsb3BtZW50IG9ubHkpLgojIEluIHByb2R1Y3Rpb24sIHNldCB0byB0aGUgcHJveHlfY2FfZGF0YSB2b2x1bWUgbW91bnQgcGF0aCAoL2NhKS4KIyBFbnY6IFBST1hZX0NBX1NUT1JBR0VfRElSCiMgY2Ffc3RvcmFnZV9kaXIgPSAiL2NhIgo="
+EMBED_config_example_toml="IyBsbG0tYXBpLXByb3h5IGNvbmZpZ3VyYXRpb24gZXhhbXBsZQojIENvcHkgdG8gY29uZmlnLnRvbWwgYW5kIGZpbGwgaW4geW91ciB2YWx1ZXMuCiMgQWxsIHZhbHVlcyBjYW4gYWxzbyBiZSBzZXQgdmlhIFBST1hZXyogZW52aXJvbm1lbnQgdmFyaWFibGVzLgoKIyBQb3N0Z3JlU1FMIGNvbm5lY3Rpb24gVVJMIChyZXF1aXJlZCkKIyBkYXRhYmFzZV91cmwgPSAicG9zdGdyZXM6Ly91c2VyOnBhc3N3b3JkQFs6OjFdOjU0MzIvbGxtX3Byb3h5IgoKIyBBZGRyZXNzIHRvIGJpbmQgdGhlIG1hbmFnZW1lbnQgQVBJIGFuZCByZXZlcnNlIHByb3h5IHNlcnZlci4KIyBJUHY2LWZpcnN0OiAiOjoiIGJpbmRzIGFsbCBJUHY2IGludGVyZmFjZXMgKGR1YWwtc3RhY2sgd2hlcmUga2VybmVsIGhhcyBuZXQuaXB2Ni5jb25mLmFsbC5kaXNhYmxlX2lwdjY9MCkuCmxpc3Rlbl9hZGRyID0gIjo6IgoKIyBQb3J0IGZvciB0aGUgbWFuYWdlbWVudCBBUEkgYW5kIHJldmVyc2UgcHJveHkgKEhUVFAvSFRUUFMgdmlhIFRyYWVmaWspCmxpc3Rlbl9wb3J0ID0gMzAwMAoKIyBQb3J0IGZvciB0aGUgZm9yd2FyZCBwcm94eSAoQ09OTkVDVCBoYW5kbGVyIC8gVExTIGludGVyY2VwdGlvbikKIyBEZXByZWNhdGVkOiBwcmVmZXIgW2ZvcndhcmRfcHJveHldIHNlY3Rpb24gYmVsb3cuCmZvcndhcmRfcHJveHlfcG9ydCA9IDMwMDEKCiMgU291cmNlIGZvciB0aGUgS2V5IEVuY3J5cHRpb24gS2V5OiAiZW52IiBvciAidmF1bHQiCmtla19zb3VyY2UgPSAiZW52IgoKIyBUaGUgS0VLIHZhbHVlIHdoZW4ga2VrX3NvdXJjZSA9ICJlbnYiIChyZXF1aXJlZCwgbm8gZGVmYXVsdCDigJQgc2VydmVyIHJlZnVzZXMgdG8gc3RhcnQgaWYgdW5zZXQpCiMgTXVzdCBiZSBleGFjdGx5IDY0IGxvd2VyY2FzZSBoZXggY2hhcmFjdGVycyAoMzIgYnl0ZXMpLiBCYXNlNjQgaXMgTk9UIGFjY2VwdGVkLgojIEdlbmVyYXRlIHdpdGg6IG9wZW5zc2wgcmFuZCAtaGV4IDMyCiMga2VrX3ZhbHVlID0gIjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiCgojIEhNQUMtU0hBMjU2IHBlcHBlciBmb3IgcHJveHkga2V5IGhhc2hpbmcgYW5kIEhLREYgaW5wdXQgZm9yIGNyZWRlbnRpYWwgZXhwb3J0LgojIE1VU1QgYmUgaWRlbnRpY2FsIG9uIHNvdXJjZSBhbmQgZGVzdGluYXRpb24gc2VydmVycyBmb3IgY3JlZGVudGlhbCBtaWdyYXRpb24gdG8gd29yay4KIyBHZW5lcmF0ZSB3aXRoOiBvcGVuc3NsIHJhbmQgLWhleCAzMgojIFNldCB2aWEgUFJPWFlfUFJPWFlfS0VZX1BFUFBFUiBlbnZpcm9ubWVudCB2YXJpYWJsZS4KIyBwcm94eV9rZXlfcGVwcGVyID0gIiIgICMgU2V0IHZpYSBQUk9YWV9QUk9YWV9LRVlfUEVQUEVSIGVudiB2YXIKCiMgTG9nIGxldmVsIGZpbHRlcgojIEV4YW1wbGVzOiAiaW5mbyIsICJkZWJ1ZyIsICJ3YXJuIiwgImVycm9yIiwgIndhcm4scHJveHlfc2VydmVyPWRlYnVnIgpsb2dfbGV2ZWwgPSAiaW5mbyIKCiMgTG9nIGZvcm1hdDogInRleHQiIChodW1hbiByZWFkYWJsZSkgb3IgImpzb24iIChzdHJ1Y3R1cmVkLCBmb3IgcHJvZHVjdGlvbikKbG9nX2Zvcm1hdCA9ICJ0ZXh0IgoKIyBUTFMgY29uZmlndXJhdGlvbiDigJQgbWFuYWdlZCBieSBUcmFlZmlrIChzZWUgZG9jcy90bHMtc2V0dXAubWQpCiMgVG8gZW5hYmxlIGF1dG9tYXRlZCBUTFMsIHJ1biB0aGUgc3RhY2sgd2l0aCB0aGUgVExTIGNvbXBvc2Ugb3ZlcnJpZGU6CiMgICBkb2NrZXIgY29tcG9zZSAtZiBkb2NrZXIvZG9ja2VyLWNvbXBvc2UueW1sIC1mIGRvY2tlci9kb2NrZXItY29tcG9zZS50bHMueW1sIFwKIyAgICAgLS1lbnYtZmlsZSBkb2NrZXIvdGxzLmVudiB1cCAtZAojCiMgTm90ZSBvbiBlbnYgdmFyIG5hbWluZzogbmVzdGVkIHN0cnVjdCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3JzLgojICAgUFJPWFlfVExTX19FTkFCTEVEPXRydWUgICAgICAgICAgICAobm90IFBST1hZX1RMU19FTkFCTEVEIOKAlCB0aGF0IGlzIHNpbGVudGx5IGlnbm9yZWQpCiMgICBQUk9YWV9UTFNfX0RPTUFJTj1wcm94eS5leGFtcGxlLmNvbQojICAgUFJPWFlfVExTX19BQ01FX0VNQUlMPWFkbWluQGV4YW1wbGUuY29tClt0bHNdCiMgV2hldGhlciBhdXRvbWF0ZWQgVExTIChBQ01FL0xldCdzIEVuY3J5cHQgdmlhIEROUy0wMSkgaXMgYWN0aXZlLgojIFNldCB0byB0cnVlIHdoZW4gdXNpbmcgZG9ja2VyL2RvY2tlci1jb21wb3NlLnRscy55bWwuCiMgRW52OiBQUk9YWV9UTFNfX0VOQUJMRUQgKGRvdWJsZSB1bmRlcnNjb3JlKQplbmFibGVkID0gZmFsc2UKCiMgWW91ciBwdWJsaWMgaG9zdG5hbWUgKGUuZy4gcHJveHkuZXhhbXBsZS5jb20gb3IgKi5leGFtcGxlLmNvbSBmb3Igd2lsZGNhcmQpLgojIFVzZWQgaW4gLy53ZWxsLWtub3duL3Byb3h5LWluZm8uanNvbiBhbmQgZm9yIEhUVFBTIFVSTCBnZW5lcmF0aW9uLgojIE11c3QgYmUgYSBiYXJlIGhvc3RuYW1lIHdpdGhvdXQgc2NoZW1lIG9yIHBvcnQuCiMgRW52OiBQUk9YWV9UTFNfX0RPTUFJTiAoZG91YmxlIHVuZGVyc2NvcmUg4oCUIGZpZ21lbnQgbmVzdGVkIHN0cnVjdCBjb252ZW50aW9uKQojIGRvbWFpbiA9ICJwcm94eS5leGFtcGxlLmNvbSIKCiMgRW1haWwgYWRkcmVzcyBmb3IgTGV0J3MgRW5jcnlwdCBBQ01FIHJlZ2lzdHJhdGlvbi4KIyBSZXF1aXJlZCB3aGVuIGVuYWJsZWQgPSB0cnVlLiBBbHNvIGNvbnN1bWVkIGJ5IHRoZSBUcmFlZmlrIGNvbnRhaW5lciB2aWEKIyAtLWNlcnRpZmljYXRlc3Jlc29sdmVycy5jbG91ZGZsYXJlLmFjbWUuZW1haWw9JHtQUk9YWV9UTFNfX0FDTUVfRU1BSUx9LgojIE9uZSBlbnYgdmFyLCB0d28gY29uc3VtZXJzIChSdXN0IGNvbmZpZyArIFRyYWVmaWsgQ0xJKS4KIyBFbnY6IFBST1hZX1RMU19fQUNNRV9FTUFJTCAoZG91YmxlIHVuZGVyc2NvcmUpCiMgYWNtZV9lbWFpbCA9ICJhZG1pbkBleGFtcGxlLmNvbSIKCiMgQUNNRSBDQSBzZXJ2ZXIgVVJMLiBEZWZhdWx0cyB0byBMZXQncyBFbmNyeXB0IHByb2R1Y3Rpb24gd2hlbiBub3Qgc2V0LgojIEZvciB0ZXN0aW5nLCB1c2UgdGhlIHN0YWdpbmcgVVJMIHRvIGF2b2lkIHByb2R1Y3Rpb24gcmF0ZSBsaW1pdHM6CiMgICBodHRwczovL2FjbWUtc3RhZ2luZy12MDIuYXBpLmxldHNlbmNyeXB0Lm9yZy9kaXJlY3RvcnkKIyBUaGlzIHZhbHVlIGlzIHN1cmZhY2VkIGJ5IC9tYW5hZ2UvdjEvdGxzL3N0YXR1cyBzbyBvcGVyYXRvcnMgY2FuIHZlcmlmeQojIHdoaWNoIENBIGlzIGluIHVzZSB3aXRob3V0IGluc3BlY3RpbmcgVHJhZWZpayBsb2dzLgojIEVudjogUFJPWFlfVExTX19BQ01FX0NBIChkb3VibGUgdW5kZXJzY29yZSkKIyBhY21lX2NhID0gImh0dHBzOi8vYWNtZS12MDIuYXBpLmxldHNlbmNyeXB0Lm9yZy9kaXJlY3RvcnkiCgojIOKUgOKUgCBtRE5TIC8gRE5TLVNEIHNlcnZpY2UgZGlzY292ZXJ5IOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgVGhlIHByb3h5IGFkdmVydGlzZXMgaXRzZWxmIG9uIHRoZSBsb2NhbCBuZXR3b3JrIHZpYSBtdWx0aWNhc3QgRE5TIChtRE5TIC8KIyBETlMtU0QsIFJGQyA2NzYyIC8gUkZDIDY3NjMpIHNvIHRoYXQgb3BlcmF0b3IgdG9vbGluZyBhbmQgY2xpZW50cyBjYW4KIyBkaXNjb3ZlciBpdCBhdXRvbWF0aWNhbGx5IHdpdGhvdXQgbWFudWFsIEROUyBjb25maWd1cmF0aW9uLgojCiMgbUROUyBpcyBPTiBieSBkZWZhdWx0LiBUbyBkaXNhYmxlIGl0IHNldCBgZW5hYmxlZCA9IGZhbHNlYCBoZXJlIG9yOgojICAgUFJPWFlfTUROU19fRU5BQkxFRD1mYWxzZQojCiMgTm90ZSBvbiBhZHZlcnRpc2VkIHBvcnRzOiB0aGUgcG9ydHMgYW5ub3VuY2VkIGluIEROUy1TRCBUWFQvU1JWIHJlY29yZHMKIyBhcmUgdGFrZW4gZnJvbSBgbGlzdGVuX3BvcnRgIChkZWZhdWx0IDMwMDAsIHRoZSBtYW5hZ2VtZW50IEFQSSArIHJldmVyc2UKIyBwcm94eSkgYW5kIGBmb3J3YXJkX3Byb3h5X3BvcnRgIChkZWZhdWx0IDMwMDEsIHRoZSBDT05ORUNUIGhhbmRsZXIpLiAgV2hlbgojIHJ1bm5pbmcgd2l0aCBob3N0IG5ldHdvcmtpbmcgKGFzIHRoZSBEb2NrZXIgQ29tcG9zZSBzdGFjayBkb2VzKSB0aGVzZSBwb3J0cwojIGJpbmQgZGlyZWN0bHkgb24gdGhlIGhvc3QgaW50ZXJmYWNlLiAgSWYgMzAwMCBvciAzMDAxIGFyZSBhbHJlYWR5IGluIHVzZSBvbgojIHlvdXIgaG9zdCwgb3ZlcnJpZGUgdGhlbSB2aWE6CiMgICBQUk9YWV9MSVNURU5fUE9SVD08ZnJlZV9wb3J0PgojICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9QT1JUPTxmcmVlX3BvcnQ+CiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9NRE5TX19FTkFCTEVEPWZhbHNlICAgICAgICAgICAgICAgKG5vdCBQUk9YWV9NRE5TX0VOQUJMRUQg4oCUIHNpbGVudGx5IGlnbm9yZWQpCiMgICBQUk9YWV9NRE5TX19JTlNUQU5DRV9OQU1FPW15LXByb3h5CiMgICBQUk9YWV9NRE5TX19TRVJWSUNFX1RZUEU9X2xsbS1wcm94eS5fdGNwCiMgICBQUk9YWV9NRE5TX19SRUZSRVNIX0lOVEVSVkFMX1NFQ1M9MzAKW21kbnNdCiMgV2hldGhlciB0byBhZHZlcnRpc2UgdGhpcyBwcm94eSB2aWEgbUROUyBvbiB0aGUgbG9jYWwgbmV0d29yay4KIyBEZWZhdWx0cyB0byB0cnVlLiBTZXQgdG8gZmFsc2UgaW4gY2xvdWQgLyByZXN0cmljdGVkLW11bHRpY2FzdCBlbnZpcm9ubWVudHMuCiMgRW52OiBQUk9YWV9NRE5TX19FTkFCTEVEIChkb3VibGUgdW5kZXJzY29yZSkKZW5hYmxlZCA9IHRydWUKCiMgSHVtYW4tcmVhZGFibGUgaW5zdGFuY2UgbmFtZSBmb3IgRE5TLVNEIHJlY29yZHMuCiMgV2hlbiBlbXB0eSAodGhlIGRlZmF1bHQpIHRoZSBtRE5TIHNlcnZpY2UgbGF5ZXIgdXNlcyAie2hvc3RuYW1lfS17bGlzdGVuX3BvcnR9Ii4KIyBNdXN0IGJlIOKJpCA2MyBjaGFyYWN0ZXJzIGFuZCBjb250YWluIG9ubHkgbGV0dGVycywgZGlnaXRzLCBhbmQgaHlwaGVucyB3aGVuIHNldC4KIyBFbnY6IFBST1hZX01ETlNfX0lOU1RBTkNFX05BTUUgKGRvdWJsZSB1bmRlcnNjb3JlKQojIGluc3RhbmNlX25hbWUgPSAibXktbGxtLXByb3h5IgoKIyBETlMtU0Qgc2VydmljZSB0eXBlIFdJVEhPVVQgdGhlICIubG9jYWwuIiBzdWZmaXggKGFwcGVuZGVkIGJ5IHRoZSBzZXJ2aWNlIGxheWVyKS4KIyBEZWZhdWx0OiAiX2xsbS1wcm94eS5fdGNwIgojIE11c3QgbWF0Y2ggIl88bmFtZT4uX3RjcCIgb3IgIl88bmFtZT4uX3VkcCIgcGF0dGVybi4KIyBFbnY6IFBST1hZX01ETlNfX1NFUlZJQ0VfVFlQRSAoZG91YmxlIHVuZGVyc2NvcmUpCnNlcnZpY2VfdHlwZSA9ICJfbGxtLXByb3h5Ll90Y3AiCgojIEhvdyBvZnRlbiAoaW4gc2Vjb25kcykgdGhlIG1ETlMgc2VydmljZSByZS1hbm5vdW5jZXMgdGhlIHJlY29yZC4KIyBNdXN0IGJlID4gMC4gVmFsaWRhdGVkIGF0IHNlcnZpY2UtbGF5ZXIgc3RhcnR1cCwgbm90IGR1cmluZyBjb25maWcgcGFyc2luZy4KIyBFbnY6IFBST1hZX01ETlNfX1JFRlJFU0hfSU5URVJWQUxfU0VDUyAoZG91YmxlIHVuZGVyc2NvcmUpCnJlZnJlc2hfaW50ZXJ2YWxfc2VjcyA9IDMwCgojIOKUgOKUgCBGb3J3YXJkIHByb3h5IFRDUCBsaXN0ZW5lciDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIENvbnRyb2xzIHRoZSByYXcgVENQIGxpc3RlbmVyIGZvciBIVFRQIENPTk5FQ1QgdHVubmVsbGluZy4KIyBDbGllbnRzIHNldCBIVFRQU19QUk9YWT1odHRwOi8vaG9zdDozMDAxIHRvIHVzZSB0aGlzIG1vZGUuCiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9GT1JXQVJEX1BST1hZX19FTkFCTEVEPXRydWUKIyAgIFBST1hZX0ZPUldBUkRfUFJPWFlfX1BPUlQ9ODA4MAojICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9fUkVRVUlSRV9BVVRIPXRydWUKW2ZvcndhcmRfcHJveHldCiMgV2hldGhlciB0aGUgcmF3IFRDUCBDT05ORUNUIGxpc3RlbmVyIGlzIGFjdGl2ZS4gRGVmYXVsdDogdHJ1ZS4KIyBFbnY6IFBST1hZX0ZPUldBUkRfUFJPWFlfX0VOQUJMRUQgKGRvdWJsZSB1bmRlcnNjb3JlKQplbmFibGVkID0gdHJ1ZQoKIyBQb3J0IGZvciB0aGUgVENQIENPTk5FQ1QgbGlzdGVuZXIuIERlZmF1bHQ6IDMwMDEuCiMgRW52OiBQUk9YWV9GT1JXQVJEX1BST1hZX19QT1JUIChkb3VibGUgdW5kZXJzY29yZSkKcG9ydCA9IDMwMDEKCiMgV2hldGhlciBQcm94eS1BdXRob3JpemF0aW9uIGlzIHJlcXVpcmVkIG9uIGV2ZXJ5IENPTk5FQ1QgcmVxdWVzdC4KIyBXaGVuIGZhbHNlIChkZWZhdWx0KSwgdW5hdXRoZW50aWNhdGVkIHR1bm5lbHMgYXJlIHBlcm1pdHRlZC4KIyBDbGllbnRzIG11c3QgdGhlbiBpbmNsdWRlIEF1dGhvcml6YXRpb246IEJlYXJlciBwcngtLi4uIGluc2lkZSB0aGUgdHVubmVsLgojIEVudjogUFJPWFlfRk9SV0FSRF9QUk9YWV9fUkVRVUlSRV9BVVRIIChkb3VibGUgdW5kZXJzY29yZSkKcmVxdWlyZV9hdXRoID0gZmFsc2UKCiMgV2hldGhlciBUTFMgaW50ZXJjZXB0aW9uIChNSVRNIG1vZGUpIGlzIGFjdGl2ZS4gRGVmYXVsdDogdHJ1ZS4KIwojIFRoZSBwcm94eSBNSVRNcyBBTEwgdHJhZmZpYyAoSFRUUCwgSFRUUFMsIFdlYlNvY2tldHMpIGJ5IGRlZmF1bHQg4oCUIHRoaXMgaXMKIyB0aGUgaW50ZW5kZWQgb3BlcmF0aW5nIG1vZGUuIEluc3BlY3Rpb24gaXMgcmVxdWlyZWQgdG8gZW5mb3JjZSBwZXIta2V5IG1vZGVsCiMgcmVzdHJpY3Rpb25zLCByYXRlIGxpbWl0cywgdXNhZ2UgYWNjb3VudGluZywgYW5kIHJlcXVlc3QgbG9nZ2luZy4KIwojIFNldCB0byBmYWxzZSBvbmx5IHdoZW4gTUlUTSBpcyBleHBsaWNpdGx5IHVuZGVzaXJlZCAoZS5nLiBub24tTExNIHBhc3N0aHJvdWdoCiMgb3IgZW52aXJvbm1lbnRzIHRoYXQgcHJvaGliaXQgVExTIGludGVyY2VwdGlvbikuIFJlcXVpcmVzIGEgQ0EgY2VydGlmaWNhdGUKIyAoY2Ffc3RvcmFnZV9kaXIgb3IgY2FfY2VydF9wZW0gLyBjYV9rZXlfcGVtKSB3aGVuIHRydWUuCiMKIyBFbnY6IFBST1hZX0ZPUldBUkRfUFJPWFlfX1RMU19JTlRFUkNFUFQgKGRvdWJsZSB1bmRlcnNjb3JlKQp0bHNfaW50ZXJjZXB0ID0gdHJ1ZQoKIyDilIDilIAgVW5leHBlY3RlZCByZXF1ZXN0IHRyYXAg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiMKIyBUaGUgdHJhcCBzeXN0ZW0gZGV0ZWN0cyBhbmQgbG9ncyByZXF1ZXN0cyB0aGF0IGRvIG5vdCBtYXRjaCBhbnkga25vd24KIyBwcm92aWRlciByb3V0ZS4gIEl0IHNhbXBsZXMgdGhlc2UgInVuZXhwZWN0ZWQiIHJlcXVlc3RzLCBzdG9yZXMgbWV0YWRhdGEKIyBmb3IgZGVidWdnaW5nLCBhbmQgY2FuIG9wdGlvbmFsbHkgZmlsZSBHaXRIdWIgaXNzdWVzIGZvciBuZXcgcGF0dGVybnMuCiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9UUkFQX19FTkFCTEVEPXRydWUKIyAgIFBST1hZX1RSQVBfX1NBTVBMSU5HX1JBVEU9MC4wMQojICAgUFJPWFlfVFJBUF9fTUFYX1NBTVBMRVNfUEVSX1BBVFRFUk49MTAwCiMgICBQUk9YWV9UUkFQX19CT0RZX1NVTU1BUllfTUFYX0JZVEVTPTEwMjQKIyAgIFBST1hZX1RSQVBfX0dJVEhVQl9fREVGQVVMVF9SRVBPPW93bmVyL3JlcG8KIyAgIFBST1hZX1RSQVBfX0dJVEhVQl9fVE9LRU5fRU5WPVRSQVBfR0lUSFVCX1RPS0VOClt0cmFwXQojIE1hc3RlciBzd2l0Y2ggZm9yIHRyYXAgZGV0ZWN0aW9uLiBEZWZhdWx0OiB0cnVlLgojIEVudjogUFJPWFlfVFJBUF9fRU5BQkxFRCAoZG91YmxlIHVuZGVyc2NvcmUpCmVuYWJsZWQgPSB0cnVlCgojIFNhbXBsaW5nIHJhdGUgYWZ0ZXIgZmlyc3Qgb2NjdXJyZW5jZSAoMC4wLTEuMCkuCiMgRmlyc3Qgb2NjdXJyZW5jZSBpcyBhbHdheXMgY2FwdHVyZWQ7IHN1YnNlcXVlbnQgb25lcyBhcmUgc2FtcGxlZCBhdCB0aGlzIHJhdGUuCiMgRGVmYXVsdDogMC4wMSAoMSUpLiBTZXQgdG8gMS4wIHRvIGNhcHR1cmUgZXZlcnkgb2NjdXJyZW5jZS4KIyBFbnY6IFBST1hZX1RSQVBfX1NBTVBMSU5HX1JBVEUgKGRvdWJsZSB1bmRlcnNjb3JlKQpzYW1wbGluZ19yYXRlID0gMC4wMQoKIyBNYXhpbXVtIHNhbXBsZXMgc3RvcmVkIHBlciB1bmlxdWUgdHJhcCBwYXR0ZXJuLiBNdXN0IGJlID49IDEuCiMgRW52OiBQUk9YWV9UUkFQX19NQVhfU0FNUExFU19QRVJfUEFUVEVSTiAoZG91YmxlIHVuZGVyc2NvcmUpCm1heF9zYW1wbGVzX3Blcl9wYXR0ZXJuID0gMTAwCgojIE1heCBieXRlcyBvZiBib2R5IHN0cnVjdHVyZSBzdW1tYXJ5IHRvIHN0b3JlIHBlciBzYW1wbGUuIE11c3QgYmUgPj0gNjQuCiMgQm9keSBjb250ZW50IGlzIG5ldmVyIHN0b3JlZCB2ZXJiYXRpbSDigJQgb25seSBzdHJ1Y3R1cmFsIHN1bW1hcmllcy4KIyBFbnY6IFBST1hZX1RSQVBfX0JPRFlfU1VNTUFSWV9NQVhfQllURVMgKGRvdWJsZSB1bmRlcnNjb3JlKQpib2R5X3N1bW1hcnlfbWF4X2J5dGVzID0gMTAyNAoKIyBBZGRpdGlvbmFsIHJlZGFjdGlvbiBwYXR0ZXJucyBiZXlvbmQgYnVpbHQtaW4gZGVmYXVsdHMuCiMgQXBwbGllZCB0byByZXF1ZXN0IG1ldGFkYXRhIGJlZm9yZSBzdG9yYWdlLgojIHJlZGFjdGlvbl9wYXR0ZXJucyA9IFsiQmVhcmVyICIsICJwcngtIiwgInNrLWFudC0iXQoKW3RyYXAuZ2l0aHViXQojIERlZmF1bHQgR2l0SHViIHJlcG8gZm9yIGlzc3VlIGZpbGluZyAob3duZXIvcmVwbyBmb3JtYXQpLgojIExlYXZlIGVtcHR5IHRvIGRpc2FibGUgR2l0SHViIGlzc3VlIGZpbGluZy4KIyBFbnY6IFBST1hZX1RSQVBfX0dJVEhVQl9fREVGQVVMVF9SRVBPIChkb3VibGUgdW5kZXJzY29yZSkKIyBkZWZhdWx0X3JlcG8gPSAibXlvcmcvbXktcHJveHkiCgojIEVudmlyb25tZW50IHZhcmlhYmxlIG5hbWUgaG9sZGluZyB0aGUgR2l0SHViIFBBVC4KIyBUaGUgdG9rZW4gdmFsdWUgaXMgTkVWRVIgc3RvcmVkIGluIGNvbmZpZyDigJQgb25seSB0aGUgZW52IHZhciBuYW1lLgojIEVudjogUFJPWFlfVFJBUF9fR0lUSFVCX19UT0tFTl9FTlYgKGRvdWJsZSB1bmRlcnNjb3JlKQp0b2tlbl9lbnYgPSAiVFJBUF9HSVRIVUJfVE9LRU4iCgojIOKUgOKUgCBQcm92aWRlciBub3RlcyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIFByb3ZpZGVyIGFjY291bnRzIChBbnRocm9waWMsIE9wZW5BSSwgT3BlblJvdXRlciwgT2xsYW1hLCBldGMuKSBhcmUgY29uZmlndXJlZAojIHZpYSB0aGUgbWFuYWdlbWVudCBBUEkgb3Igd2ViIGRhc2hib2FyZCDigJQgbm90IGluIHRoaXMgY29uZmlnIGZpbGUuCiMgRWFjaCBwcm92aWRlciBhY2NvdW50IHN0b3JlcyBpdHMgY3JlZGVudGlhbCAoQVBJIGtleSBvciBPQXV0aCB0b2tlbikgZW5jcnlwdGVkCiMgaW4gdGhlIGRhdGFiYXNlIHVzaW5nIGVudmVsb3BlIGVuY3J5cHRpb24gKHNlZSBrZWtfc291cmNlIGFib3ZlKS4KIwojIE9wZW5Sb3V0ZXI6IHVzZXMgdGhlIHN0YW5kYXJkIGFwaV9rZXkgYXV0aCBwYXRoLiBObyBwcm92aWRlci1zcGVjaWZpYyBjb25maWcKIyBrZXlzIGFyZSByZXF1aXJlZC4gVGhlIG1vZGVsIGNhdGFsb2d1ZSBpcyBjYWNoZWQgcGVyLWFjY291bnQgaW4gdGhlCiMgb3BlbnJvdXRlcl9tb2RlbHMgdGFibGUgYW5kIHJlZnJlc2hhYmxlIHZpYSB0aGUgbWFuYWdlbWVudCBBUEkuCgojIOKUgOKUgCBGb3J3YXJkIHByb3h5IENBIGNlcnRpZmljYXRlIHBlcnNpc3RlbmNlIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgUGF0aCB0byBkaXJlY3RvcnkgZm9yIHBlcnNpc3RpbmcgdGhlIGZvcndhcmQgcHJveHkgQ0EgY2VydGlmaWNhdGUuCiMgT24gZmlyc3Qgc3RhcnR1cDogQ0EgY2VydCBhbmQga2V5IGFyZSBnZW5lcmF0ZWQgYW5kIHdyaXR0ZW4gaGVyZS4KIyBPbiBzdWJzZXF1ZW50IHN0YXJ0dXBzOiB0aGUgZXhpc3RpbmcgcGFpciBpcyBsb2FkZWQgZnJvbSB0aGlzIGRpcmVjdG9yeS4KIyBQYXJ0aWFsIHN0YXRlIChvbmUgZmlsZSB3aXRob3V0IHRoZSBvdGhlcikgY2F1c2VzIGEgc3RhcnR1cCBlcnJvci4KIyBFeHBpcmVkIENBIGNhdXNlcyBhIHN0YXJ0dXAgZXJyb3Ig4oCUIGRlbGV0ZSBib3RoIGZpbGVzIGFuZCByZXN0YXJ0IHRvIHJvdGF0ZS4KIyBXaGVuIHVuc2V0OiBlcGhlbWVyYWwgQ0EgaXMgZ2VuZXJhdGVkIG9uIGVhY2ggc3RhcnR1cCAoZGV2ZWxvcG1lbnQgb25seSkuCiMgSW4gcHJvZHVjdGlvbiwgc2V0IHRvIHRoZSBwcm94eV9jYV9kYXRhIHZvbHVtZSBtb3VudCBwYXRoICgvY2EpLgojIEVudjogUFJPWFlfQ0FfU1RPUkFHRV9ESVIKIyBjYV9zdG9yYWdlX2RpciA9ICIvY2EiCg=="
 EMBED_gpg_public_key="IyBQbGFjZWhvbGRlciDigJQgcmVwbGFjZSB3aXRoIGFjdHVhbCByZWxlYXNlIHNpZ25pbmcgcHVibGljIGtleQo="
-# SELF_CHECKSUM: e9c6904bbdae6ea06b2efd57696094208509038fc47f30768a4b230022e158ea
+# SELF_CHECKSUM: 921642e7e93c90fdf0287aa4b0d947c23c417e896807fa26adb94f71b29b0059
 # --- END EMBEDDED FILES ---
 
 main "$@"
