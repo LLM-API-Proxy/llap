@@ -50,6 +50,7 @@ services:
       - "-bootstrap-expect=1"
       - "-client=[::]"
       - "-data-dir=/consul/data"
+      - "-config-dir=/consul/config"
     environment:
       CONSUL_LOCAL_CONFIG: '{"acl":{"enabled":true,"default_policy":"deny"}}'
     tmpfs:
