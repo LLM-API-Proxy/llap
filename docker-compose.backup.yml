@@ -78,11 +78,14 @@ services:
       # consul CLI / client libraries within the backup container authenticate
       # automatically without any custom token-plumbing code.
       # BACKUP_CONSUL_HTTP_TOKEN is the source value from docker/.env.
-      CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN:?BACKUP_CONSUL_HTTP_TOKEN is required — see tls.env.example for provisioning instructions}
+      # Empty default allows `docker compose pull` to run before consul-init has
+      # written the token. The backup container will not start without a real token
+      # (consul-init populates BACKUP_CONSUL_HTTP_TOKEN in .env after ACL bootstrap).
+      CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN:-}
       # Expose the original variable name as well so that application code that
       # explicitly reads BACKUP_CONSUL_HTTP_TOKEN (e.g. for audit logging) can
       # find it without duplicating the value in the .env file.
-      BACKUP_CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN}
+      BACKUP_CONSUL_HTTP_TOKEN: ${BACKUP_CONSUL_HTTP_TOKEN:-}
       # Backup schedule (cron expression).
       # Written to the supercronic crontab at container start.
       BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
