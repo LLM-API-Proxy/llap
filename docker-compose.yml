@@ -2,7 +2,7 @@ services:
   timescaledb:
     image: timescale/timescaledb:latest-pg18
     environment:
-      POSTGRES_DB: llm_proxy
+      POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-proxy_dev_password}
     ports:
@@ -174,6 +174,9 @@ services:
     # publishes its port on the host via "ports: [::]:5432:5432", so the correct
     # address is localhost:5432 (not the Docker bridge hostname "timescaledb").
     network_mode: host
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Pass-through so operators can customise bind ports without editing compose.
       # Default 3000 — change if the port conflicts with another service on the host.
@@ -182,7 +185,7 @@ services:
       PROXY_FORWARD_PROXY_PORT: ${PROXY_FORWARD_PROXY_PORT:-3001}
       # With host networking, TimescaleDB is reachable at localhost:5432
       # (published via "ports: [::]:5432:5432" on the timescaledb service).
-      DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/llm_proxy
+      DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/${POSTGRES_DB:-llm_proxy}
       # Auth / encryption — populated by the installer in .env
       PROXY_JWT_SECRET: ${PROXY_JWT_SECRET:-}
       PROXY_KEK_VALUE: ${PROXY_KEK_VALUE:-}
