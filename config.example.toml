@@ -30,6 +30,12 @@ kek_source = "env"
 # Set via PROXY_PROXY_KEY_PEPPER environment variable.
 # proxy_key_pepper = ""  # Set via PROXY_PROXY_KEY_PEPPER env var
 
+# Public URL of this proxy instance, used when generating Codex direct-mode connection info.
+# Must include scheme and host (e.g. "https://proxy.example.com").
+# When not set, connection info falls back to the TLS domain setting.
+# Env: PROXY_PROXY_PUBLIC_URL
+# proxy_public_url = "https://proxy.example.com"
+
 # Log level filter
 # Examples: "info", "debug", "warn", "error", "warn,proxy_server=debug"
 log_level = "info"
@@ -203,6 +209,63 @@ body_summary_max_bytes = 1024
 # The token value is NEVER stored in config — only the env var name.
 # Env: PROXY_TRAP__GITHUB__TOKEN_ENV (double underscore)
 token_env = "TRAP_GITHUB_TOKEN"
+
+# ── GELF Logging ──────────────────────────────────────────────────────────────
+#
+# GELF (Graylog Extended Log Format) sends structured events to a compatible
+# log aggregation system (Graylog, Loki with GELF input, Logstash, etc.).
+#
+# Configuration set here is used at startup. Runtime config (via WebUI/TUI or
+# the management API at /manage/v1/settings/gelf) takes precedence once the
+# database is available.
+#
+# Note: nested fields require DOUBLE-UNDERSCORE env var separators.
+#   PROXY_GELF__HOST=graylog.example.com   (not PROXY_GELF_HOST)
+[gelf]
+# Whether GELF logging is enabled at startup.
+# Env: PROXY_GELF__ENABLED
+enabled = false
+
+# GELF server hostname or IP address.
+# Env: PROXY_GELF__HOST
+# host = "graylog.example.com"
+
+# GELF server port. Default: 12201.
+# Env: PROXY_GELF__PORT
+port = 12201
+
+# Transport protocol: "udp", "tcp", or "tcp_tls".
+# Env: PROXY_GELF__PROTOCOL
+protocol = "udp"
+
+# Path to a PEM-encoded CA certificate for TLS verification.
+# Required when protocol = "tcp_tls".
+# Env: PROXY_GELF__TLS_CA_CERT_PATH
+# tls_ca_cert_path = "/etc/ssl/certs/gelf-ca.pem"
+
+# Facility string included in every GELF message.
+# Env: PROXY_GELF__FACILITY
+facility = "llm-proxy"
+
+# Subscription usage threshold percentages (sorted, deduplicated, 0–100).
+# Env: PROXY_GELF__SUBSCRIPTION_THRESHOLDS (JSON array)
+subscription_thresholds = [75.0, 90.0, 95.0]
+
+# Minimum percentage delta before a subscription usage event fires again.
+# Env: PROXY_GELF__SUBSCRIPTION_DELTA_PCT
+# subscription_delta_pct = 5.0
+
+# Minimum USD cost delta before an API key cost event fires again.
+# Env: PROXY_GELF__APIKEY_DOLLAR_DELTA
+# apikey_dollar_delta = "1.00"
+
+# Event category toggles.
+emit_auth_events    = true
+emit_key_events     = true
+emit_account_events = true
+emit_health_events  = true
+emit_usage_events   = true
+emit_backup_events  = true
 
 # ── Provider notes ───────────────────────────────────────────────────────────
 #

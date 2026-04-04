@@ -74,6 +74,10 @@ services:
       - proxy_net
     environment:
       CONSUL_HTTP_ADDR: http://consul:8500
+      # CONSUL_HTTP_TOKEN must be the bootstrap token written to .env by the
+      # installer's ACL bootstrap step. Without it, all consul kv put calls
+      # fail with 403 (default_policy: deny) and Traefik has no TLS options.
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
     entrypoint:
       - /bin/sh
       - -c
@@ -110,6 +114,15 @@ services:
     # both Traefik and the proxy are on the host network stack so Traefik routes
     # to localhost:<port> directly — no Docker bridge network resolution needed.
     network_mode: host
+    # env_file passes .env variables INTO the Traefik container environment.
+    # Docker Compose --env-file / the .env file only feeds YAML variable
+    # substitution (${VAR}) — it does NOT pass variables into containers.
+    # Without env_file, CONSUL_HTTP_TOKEN is never set inside the Traefik
+    # process, so all Consul KV reads fail with 403 and strong-tls@consul
+    # TLS options are never loaded.
+    env_file:
+      - path: .env
+        required: false
     command:
       # Consul KV provider: TLS options are seeded into Consul by consul-init (#240).
       # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
