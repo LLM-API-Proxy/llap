@@ -104,12 +104,18 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for PostgreSQL backup}
+    # init: true inserts Docker's tini shim as PID 1 so supercronic is not PID 1.
+    # Without this, supercronic tries to reap dead processes via fork/exec which
+    # fails under cap_drop: ALL + no-new-privileges, causing a fatal crash at start.
+    init: true
     # Security hardening — backup agent does not need elevated privileges.
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
       # /etc/supercronic is written at container start (crontab generation).
-      - /etc/supercronic:size=4m,mode=0755
+      # mode=0777: container runs as user backup (uid=34), not root — the tmpfs
+      # directory must be world-writable so entrypoint.sh can create the crontab.
+      - /etc/supercronic:size=4m,mode=0777
     security_opt:
       - no-new-privileges:true
     cap_drop:
