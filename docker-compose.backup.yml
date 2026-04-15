@@ -68,6 +68,9 @@ services:
     volumes:
       # CA certificates volume (read-only: backup agent must not modify certs)
       - proxy_ca_data:/ca:ro
+      # Host config directory (read-only: .env file with KEK, pepper, secrets)
+      # Mounted so the backup agent can include it in restic snapshots.
+      - .:/host-config:ro
     environment:
       # Consul connectivity and ACL token.
       # The backup agent uses the standard CONSUL_HTTP_ADDR / CONSUL_HTTP_TOKEN
