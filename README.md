@@ -1,12 +1,12 @@
 # LLAP — The Tactical LLM API Proxy for Secure Orchestration
 
-[![Version](https://img.shields.io/badge/version-0.0.29-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.29)
+[![Version](https://img.shields.io/badge/version-0.0.31-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.31)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-llm--api--proxy.com-informational)](https://llm-api-proxy.com)
 
 **LLAP** is a multi-tenant LLM API proxy that centralises credential management, enforces RBAC, and provides observability across all LLM traffic — without touching your application code.
 
-> Release **v0.0.29** · 2026-04-19T02:20:46Z · `88f11fe`
+> Release **v0.0.31** · 2026-04-22T08:13:11Z · `d3f962a`
 
 ---
 
@@ -21,7 +21,7 @@ curl -fsSL https://llm-api-proxy.com/install.sh | bash
 GitHub-backed fallback (no CDN dependency):
 
 ```bash
-curl -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/install.sh | bash
+curl -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/install.sh | bash
 ```
 
 The installer detects your platform, pulls the correct container images, writes a `docker-compose.yml` and `config.toml`, and starts the stack.
@@ -48,16 +48,16 @@ Pre-built binaries are available for all supported platforms:
 
 | Platform | Download |
 |---|---|
-| Linux x86-64 | [llap-linux-x86_64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/llap-linux-x86_64) |
-| Linux ARM64 | [llap-linux-aarch64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/llap-linux-aarch64) |
-| macOS x86-64 | [llap-darwin-x86_64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/llap-darwin-x86_64) |
-| macOS ARM64 (Apple Silicon) | [llap-darwin-aarch64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/llap-darwin-aarch64) |
+| Linux x86-64 | [llap-linux-x86_64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/llap-linux-x86_64) |
+| Linux ARM64 | [llap-linux-aarch64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/llap-linux-aarch64) |
+| macOS x86-64 | [llap-darwin-x86_64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/llap-darwin-x86_64) |
+| macOS ARM64 (Apple Silicon) | [llap-darwin-aarch64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/llap-darwin-aarch64) |
 
 Verify the checksum after downloading:
 
 ```bash
 # Download the checksum file
-curl -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.29/llap-SHA256SUMS -o llap-SHA256SUMS
+curl -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.31/llap-SHA256SUMS -o llap-SHA256SUMS
 
 # Verify (Linux / macOS with sha256sum)
 sha256sum --check --ignore-missing llap-SHA256SUMS
@@ -81,23 +81,23 @@ All images are published to the GitHub Container Registry:
 
 | Image | Tag |
 |---|---|
-| `ghcr.io/llm-api-proxy/server:0.0.29` | Proxy server |
-| `ghcr.io/llm-api-proxy/cli:0.0.29` | Management CLI |
-| `ghcr.io/llm-api-proxy/backup:0.0.29` | Restic backup agent |
+| `ghcr.io/llm-api-proxy/server:0.0.31` | Proxy server |
+| `ghcr.io/llm-api-proxy/cli:0.0.31` | Management CLI |
+| `ghcr.io/llm-api-proxy/backup:0.0.31` | Restic backup agent |
 
 ### Tag Conventions
 
 | Tag | Meaning |
 |---|---|
 | `latest` | Most recent stable release |
-| `0.0.29` | Exact version (e.g. `1.2.3`) |
+| `0.0.31` | Exact version (e.g. `1.2.3`) |
 | `X.Y` | Latest patch for this minor (e.g. `1.2`) |
 | `X` | Latest minor for this major (e.g. `1`) |
 
 Pull a specific version to avoid unexpected upgrades:
 
 ```bash
-docker pull ghcr.io/llm-api-proxy/server:0.0.29
+docker pull ghcr.io/llm-api-proxy/server:0.0.31
 ```
 
 ---
@@ -149,6 +149,38 @@ $EDITOR config.toml
 - **`[providers]`** — LLM provider credentials and account stacking policy
 - **`[auth]`** — JWT secret, token TTLs, invite settings
 - **`[observability]`** — tracing, metrics export, log level
+
+---
+
+## Cache-Effectiveness Observability
+
+LLAP tracks prompt-cache efficiency for every key and model combination. Three
+circuit breakers detect when caching degrades — at the session level (Breaker A),
+when clients create sessions too rapidly (Breaker B), or fleet-wide across all
+keys for a model (Breaker C). Operators can inspect fleet state, acknowledge
+incidents, and tune thresholds without restarting the proxy:
+
+```bash
+# Fleet summary
+llap cache-health status
+
+# Investigate one key/model pair
+llap cache-health explain <key_id> <model>
+
+# Acknowledge a known-good regression
+llap cache-health ack <key_id> <model> --reason "prompt warm-up"
+
+# Force-reset after recovery
+llap cache-health force-reset <key_id> <model>
+
+# Tune thresholds per model or per key
+llap cache-health config set claude-opus-4-5 --fleet-open-hit-rate 0.15
+
+# All commands support --json for pipeline integration
+llap cache-health status --json | jq '.fleet_drift_breakers[] | select(.state == "open")'
+```
+
+Full operator workflow and threshold tuning guide: [`docs/reference/cache-effectiveness-runbook.md`](https://github.com/LLM-API-Proxy/core/blob/main/docs/reference/cache-effectiveness-runbook.md).
 
 ---
 
