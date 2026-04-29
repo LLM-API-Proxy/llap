@@ -11,7 +11,16 @@ global:
   external_labels:
     cluster: 'llm-api-proxy'
 
-rule_files: []
+rule_files:
+  - 'rules/llap-rate-limit.yml'
+
+# Alertmanager connection — only active when the monitoring overlay includes
+# the alertmanager service (docker-compose.monitoring.yml).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      timeout: 10s
 
 scrape_configs:
   - job_name: 'prometheus'

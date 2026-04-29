@@ -1,14 +1,43 @@
-# docker/docker-compose.monitoring.yml — Prometheus + Grafana monitoring overlay.
+# docker/docker-compose.monitoring.yml — Prometheus + Grafana + Alertmanager monitoring overlay.
 #
-# Adds Prometheus and Grafana on the proxy_net bridge network.
-# Both are served via Traefik subpath routing:
-#   /grafana    → Grafana (port 3000)
-#   /prometheus → Prometheus (port 9090)
+# Adds Prometheus, Grafana, and Alertmanager on the proxy_net bridge network.
+# Services are served via Traefik subpath routing:
+#   /grafana      → Grafana (port 3000)
+#   /prometheus   → Prometheus (port 9090)
+#   /alertmanager → Alertmanager (port 9093, internal only — not exposed via Traefik)
+#
+# Alertmanager config:
+#   Copy docker/alertmanager/alertmanager.yml to docker/alertmanager/alertmanager.local.yml
+#   and populate the placeholder webhook URLs and PagerDuty key before starting.
+#   The local override is mounted when present; the template is used otherwise
+#   (alerts will fire to dead-letter receivers until configured).
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 
 services:
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    networks:
+      - proxy_net
+    ports:
+      - "[::1]:${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      # alertmanager.yml is the committed template (alerts go to dead-letter receivers).
+      # To configure real routing, copy to alertmanager.local.yml (git-ignored),
+      # populate the placeholders, and override this mount in a local compose overlay.
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=http://alertmanager:9093"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
   prometheus:
     image: prom/prometheus:v3.4.0
     networks:
@@ -17,6 +46,7 @@ services:
       - "[::1]:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -26,6 +56,9 @@ services:
       - "--web.route-prefix=/prometheus"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      alertmanager:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9090/prometheus/-/healthy || exit 1"]
