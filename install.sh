@@ -16,7 +16,7 @@ set -euo pipefail
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.41"
+INSTALLER_VERSION="0.0.42"
 # shellcheck disable=SC2034  # Used by phase functions appended by build-installer.sh
 INSTALL_DIR_LINUX="/opt/llm-api-proxy"
 # shellcheck disable=SC2034
@@ -295,7 +295,7 @@ extract_file() {
         return 0
     fi
     $SUDO mkdir -p "$(dirname "$dest")"
-    if [[ -d "$dest" ]]; then
+    if $SUDO test -d "$dest"; then
         $SUDO rm -rf "$dest"
     fi
     echo "${!var_name}" | base64 -d | $SUDO tee "$dest" > /dev/null
