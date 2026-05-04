@@ -70,6 +70,7 @@ services:
       - "traefik.http.routers.prometheus.rule=PathPrefix(`/prometheus`)"
       - traefik.http.routers.prometheus.entrypoints=websecure
       - traefik.http.routers.prometheus.service=prometheus-backend
+      - traefik.http.routers.prometheus.middlewares=large-body@docker
       - "traefik.http.services.prometheus-backend.loadbalancer.server.url=http://[::1]:9090"
 
   grafana:
@@ -100,6 +101,7 @@ services:
       - "traefik.http.routers.grafana.rule=PathPrefix(`/grafana`)"
       - traefik.http.routers.grafana.entrypoints=websecure
       - traefik.http.routers.grafana.service=grafana-backend
+      - traefik.http.routers.grafana.middlewares=large-body@docker
       - "traefik.http.services.grafana-backend.loadbalancer.server.url=http://[::1]:3000"
 
 volumes:

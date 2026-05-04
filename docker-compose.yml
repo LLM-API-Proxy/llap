@@ -216,7 +216,7 @@ services:
       - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
       - traefik.http.routers.proxy-api.entrypoints=websecure
       - traefik.http.routers.proxy-api.service=proxy-backend
-      - traefik.http.routers.proxy-api.middlewares=hsts@docker
+      - traefik.http.routers.proxy-api.middlewares=hsts@docker,large-body@docker
       - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
       # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
       # active for this to take effect; falls back to default TLS options otherwise).
@@ -234,6 +234,13 @@ services:
       - traefik.http.middlewares.hsts.headers.stsIncludeSubdomains=true
       - "traefik.http.middlewares.hsts.headers.stsPreload=false"
       - traefik.http.middlewares.hsts.headers.forceSTSHeader=true
+      # Body size middleware — allows up to 1 GiB requests, no response limit (SSE safe).
+      # maxResponseBodyBytes=0 disables response buffering so SSE streaming works correctly.
+      # memRequestBodyBytes=1048576: request bodies ≤1 MiB stay in memory; larger spill to
+      # the container filesystem rather than exhausting the 512 MiB Traefik memory limit.
+      - "traefik.http.middlewares.large-body.buffering.maxRequestBodyBytes=1073741824"
+      - "traefik.http.middlewares.large-body.buffering.maxResponseBodyBytes=0"
+      - "traefik.http.middlewares.large-body.buffering.memRequestBodyBytes=1048576"
       # HTTP service — both Traefik and the proxy use network_mode: host, so both
       # are on the host network stack. Traefik reaches the proxy at localhost on
       # PROXY_LISTEN_PORT (default 3000). No Docker bridge network resolution needed.
