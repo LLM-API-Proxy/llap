@@ -236,9 +236,9 @@ services:
       # (debug) runtime bases.
       test: ["CMD", "/app/proxy-server", "healthcheck"]
       interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
     # Security hardening
     read_only: true
     tmpfs:
