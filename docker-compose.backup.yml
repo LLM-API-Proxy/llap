@@ -39,6 +39,10 @@
 #   - Tokens are stored in Consul's internal token store only — never in KV or files.
 #   - Secrets (RESTIC_PASSWORD, AWS credentials, POSTGRES_PASSWORD) are never
 #     logged or written to Consul KV.
+#   - The service runs as root (user: "0:0") so it can read the host bind-mount
+#     at /host-config (source: /opt/llm-api-proxy/docker, owned by root). This is
+#     safe because cap_drop: ALL and read_only: true prevent any privilege abuse —
+#     all Linux capabilities are dropped and the container filesystem is immutable.
 #
 # Consul KV IPC keys written by this service:
 #   proxy/backup/trigger    — consumed and deleted to trigger an immediate backup
@@ -107,6 +111,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for PostgreSQL backup}
+    # Run as root so entrypoint.sh can read the bind-mounted /host-config directory
+    # (source: /opt/llm-api-proxy/docker, owned by root on the production host).
+    # The non-root backup user in the Dockerfile image cannot read root-owned host
+    # directories. Security is preserved via cap_drop: ALL + read_only: true below.
+    user: "0:0"
     # init: true inserts Docker's tini shim as PID 1 so supercronic is not PID 1.
     # Without this, supercronic tries to reap dead processes via fork/exec which
     # fails under cap_drop: ALL + no-new-privileges, causing a fatal crash at start.
@@ -116,9 +125,7 @@ services:
     tmpfs:
       - /tmp:size=256m,mode=1777
       # /etc/supercronic is written at container start (crontab generation).
-      # mode=0777: container runs as user backup (uid=34), not root — the tmpfs
-      # directory must be world-writable so entrypoint.sh can create the crontab.
-      - /etc/supercronic:size=4m,mode=0777
+      - /etc/supercronic:size=4m,mode=0700
     security_opt:
       - no-new-privileges:true
     cap_drop:
