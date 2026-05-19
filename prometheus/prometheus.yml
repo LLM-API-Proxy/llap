@@ -13,6 +13,7 @@ global:
 
 rule_files:
   - 'rules/llap-rate-limit.yml'
+  - 'rules/llap-sse-health.yml'
 
 # Alertmanager connection — only active when the monitoring overlay includes
 # the alertmanager service (docker-compose.monitoring.yml).
