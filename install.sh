@@ -2105,6 +2105,27 @@ configure_install_mode() {
     fi
 }
 
+is_stable_semver() {
+    [[ "$1" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]
+}
+
+stable_semver_gt() {
+    local left="$1" right="$2"
+    is_stable_semver "$left" || return 1
+    is_stable_semver "$right" || return 1
+
+    local left_major left_minor left_patch
+    local right_major right_minor right_patch
+    IFS=. read -r left_major left_minor left_patch <<< "$left"
+    IFS=. read -r right_major right_minor right_patch <<< "$right"
+
+    if (( 10#$left_major > 10#$right_major )); then return 0; fi
+    if (( 10#$left_major < 10#$right_major )); then return 1; fi
+    if (( 10#$left_minor > 10#$right_minor )); then return 0; fi
+    if (( 10#$left_minor < 10#$right_minor )); then return 1; fi
+    (( 10#$left_patch > 10#$right_patch ))
+}
+
 configure_version() {
     if [[ -n "$OPT_VERSION" ]]; then
         info "Version: ${OPT_VERSION} (from CLI/env)"
@@ -2133,6 +2154,16 @@ configure_version() {
             latest=$(echo "$releases_json" \
                 | jq -r '[.[] | select(.prerelease==false and .draft==false) | .tag_name] | first' \
                 2>/dev/null | sed 's/^v//')
+            [[ "$latest" == "null" ]] && latest=""
+        fi
+    fi
+
+    if [[ "$OPT_DEBUG" != "true" ]] && is_stable_semver "$INSTALLER_VERSION"; then
+        if [[ -z "$latest" ]]; then
+            latest="$INSTALLER_VERSION"
+        elif stable_semver_gt "$INSTALLER_VERSION" "$latest"; then
+            warn "Public release API reports ${latest}, older than installer ${INSTALLER_VERSION}; using installer version."
+            latest="$INSTALLER_VERSION"
         fi
     fi
 

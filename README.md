@@ -6,7 +6,7 @@
 
 **LLAP** is a multi-tenant LLM API proxy that centralises credential management, enforces RBAC, and provides observability across all LLM traffic — without touching your application code.
 
-> Release **v0.0.74** · 2026-05-26T00:17:01Z · `aea27d2`
+> Release **v0.0.74** · 2026-05-26T01:32:31Z · `0eff00c`
 
 ---
 
