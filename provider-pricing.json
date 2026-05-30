@@ -439,6 +439,46 @@
       "notes": "legacy Babbage base model"
     },
     {
+      "provider_type": "openai",
+      "model": "gpt-5.3-codex-spark",
+      "effective_from": "2026-05-29T00:00:00Z",
+      "input_per_million_usd": "4.000000",
+      "output_per_million_usd": "15.000000",
+      "cache_read_per_million_usd": "1.000000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "gpt-5.3-codex spark variant; same tier as gpt-5.3-codex, no cache creation charge"
+    },
+    {
+      "provider_type": "openai",
+      "model": "text-embedding-3-small",
+      "effective_from": "2026-05-29T00:00:00Z",
+      "input_per_million_usd": "0.020000",
+      "output_per_million_usd": "0.000000",
+      "cache_read_per_million_usd": "0.000000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI embedding model; input-only token pricing, no completion tokens or caching"
+    },
+    {
+      "provider_type": "openai",
+      "model": "text-embedding-3-large",
+      "effective_from": "2026-05-29T00:00:00Z",
+      "input_per_million_usd": "0.130000",
+      "output_per_million_usd": "0.000000",
+      "cache_read_per_million_usd": "0.000000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI embedding model; input-only token pricing, no completion tokens or caching"
+    },
+    {
+      "provider_type": "openai",
+      "model": "text-embedding-ada-002",
+      "effective_from": "2026-05-29T00:00:00Z",
+      "input_per_million_usd": "0.100000",
+      "output_per_million_usd": "0.000000",
+      "cache_read_per_million_usd": "0.000000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI embedding model; input-only token pricing, no completion tokens or caching"
+    },
+    {
       "provider_type": "openai_codex",
       "model": "gpt-5.5",
       "effective_from": "2026-05-19T00:00:00Z",
@@ -487,6 +527,16 @@
       "cache_read_per_million_usd": "2.500000",
       "cache_create_per_million_usd": "0.000000",
       "notes": "OpenAI Codex — no cache creation charge"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.3-codex-spark",
+      "effective_from": "2026-05-29T00:00:00Z",
+      "input_per_million_usd": "4.000000",
+      "output_per_million_usd": "15.000000",
+      "cache_read_per_million_usd": "1.000000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.3-codex spark variant; same tier as gpt-5.3-codex, no cache creation charge"
     }
   ]
 }
