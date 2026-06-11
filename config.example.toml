@@ -126,6 +126,25 @@ service_type = "_llm-proxy._tcp"
 # Env: PROXY_MDNS__REFRESH_INTERVAL_SECS (double underscore)
 refresh_interval_secs = 30
 
+# ── Model discovery (cache + background refresh) ──────────────────────────────
+#
+# Controls the freshness of the DB-persisted model->account index that backs
+# both model listing and model-dominant routing. Both knobs default to 3600
+# seconds (1 hour).
+#
+# Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
+#   PROXY_MODEL_DISCOVERY__TTL_SECS=3600
+#   PROXY_MODEL_DISCOVERY__REFRESH_INTERVAL_SECS=3600
+[model_discovery]
+# Cache freshness (seconds) for the model listing/index. Default: 3600 (1 hour).
+# Env: PROXY_MODEL_DISCOVERY__TTL_SECS (double underscore)
+ttl_secs = 3600
+
+# Background refresh cadence (seconds) for per-account catalogues.
+# Default: 3600 (1 hour).
+# Env: PROXY_MODEL_DISCOVERY__REFRESH_INTERVAL_SECS (double underscore)
+refresh_interval_secs = 3600
+
 # ── Forward proxy TCP listener ────────────────────────────────────────────────
 #
 # Controls the raw TCP listener for HTTP CONNECT tunnelling.
