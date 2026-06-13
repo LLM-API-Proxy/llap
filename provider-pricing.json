@@ -1,7 +1,17 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-29T00:00:00Z",
+  "generated_at": "2026-06-09T00:00:00Z",
   "entries": [
+    {
+      "provider_type": "anthropic",
+      "model": "claude-fable-5",
+      "effective_from": "2026-06-09T00:00:00Z",
+      "input_per_million_usd": "10.000000",
+      "output_per_million_usd": "50.000000",
+      "cache_read_per_million_usd": "1.000000",
+      "cache_create_per_million_usd": "12.500000",
+      "notes": "claude-fable-5 (Claude Fable 5, 2.1.173); 5-minute cache write price used for cache_create"
+    },
     {
       "provider_type": "anthropic",
       "model": "claude-opus-4-8",
