@@ -145,6 +145,49 @@ ttl_secs = 3600
 # Env: PROXY_MODEL_DISCOVERY__REFRESH_INTERVAL_SECS (double underscore)
 refresh_interval_secs = 3600
 
+# ── Anthropic provider configuration ──────────────────────────────────────────
+#
+# Outbound model substitution (issues #1270, #1277). When an Anthropic primary
+# model is export-disabled (e.g. claude-fable-5 / claude-mythos-5, US directive
+# 2026-06-12), LLAP rewrites it to a safe replacement BEFORE the pre-send
+# chokepoint so real Claude Code 2.1.173 traffic never depends on Anthropic's
+# server-side fallback. It ALSO strips every export-disabled model from the
+# top-level fallbacks[] array unconditionally (even when the primary is a safe
+# verified model), so a disabled model can never be reached via server-side
+# fallback. This is cch-safe (model + fallbacks are excluded from the billing
+# signature) and runs before the verified-surface token-burn guard.
+#
+# Defaults (applied when this block is omitted entirely):
+#   claude-fable-5  -> claude-opus-4-8
+#   claude-mythos-5 -> claude-opus-4-8
+#
+# REVERT (config-only, no code change): when Anthropic restores the models, set
+# the kill switch (a scalar override config layers always honour):
+#   [anthropic]
+#   model_substitutions_enabled = false
+# Or via env (double-underscore separator):
+#   PROXY_ANTHROPIC__MODEL_SUBSTITUTIONS_ENABLED=false
+# Config is loaded once at startup (there is no SIGHUP / hot-reload), so after
+# changing this you must RESTART THE PROCESS for it to take effect.
+#
+# TOKEN-BURN WARNING: while claude-fable-5 / claude-mythos-5 remain verified
+# Anthropic surfaces, this substitution is the ONLY thing keeping them off a real
+# account. Disabling it (model_substitutions_enabled = false) lets a request
+# carrying one of these (as primary or inside fallbacks[]) reach Anthropic and
+# permanently burn the account token. Only disable once Anthropic has confirmed
+# the models are restored — startup logs a loud warning if you disable it while a
+# disabled model is still verified.
+#
+# To change a single mapping instead of disabling everything, override the pair
+# in this TOML block (per-pair env overrides are not supported — model ids
+# contain hyphens, which are not valid POSIX shell variable names):
+#   [anthropic.model_substitutions]
+#   claude-fable-5 = "claude-opus-4-8"
+#   claude-mythos-5 = "claude-opus-4-8"
+#
+# [anthropic]
+# model_substitutions_enabled = true
+
 # ── Forward proxy TCP listener ────────────────────────────────────────────────
 #
 # Controls the raw TCP listener for HTTP CONNECT tunnelling.
