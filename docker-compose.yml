@@ -1,6 +1,21 @@
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg18
+    # ── Connection budget (issue #1288) ───────────────────────────────────────
+    # Raise max_connections to 100 so the proxy's connection budget (control
+    # pool + data pool = 25 by default) plus headroom for migrations, psql, and
+    # background tooling never saturates the server. The previous deployment ran
+    # the Postgres default of 25, which the app pool alone could exhaust during
+    # the post-deploy background write storm, starving the request path and
+    # producing a brief HTTP 500 burst on every deploy.
+    #
+    # Relationship to the app pool (see config.example.toml [database]):
+    #   max_connections (100)  >>  control_pool_size (5) + data_pool_size (20)
+    # Adjust PROXY_DATABASE__CONTROL_POOL_SIZE / __DATA_POOL_SIZE together with
+    # this value if you tune the app pool; keep their sum well below it.
+    command:
+      - "-c"
+      - "max_connections=100"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}

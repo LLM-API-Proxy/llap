@@ -145,6 +145,55 @@ ttl_secs = 3600
 # Env: PROXY_MODEL_DISCOVERY__REFRESH_INTERVAL_SECS (double underscore)
 refresh_interval_secs = 3600
 
+# ── Database connection pool & background-writer budget (issue #1288) ──────────
+#
+# Sizes the two connection pools, bounds how long a caller waits for a free
+# connection, and caps how many background workers may hold a connection at once.
+# These defaults reproduce the previous steady-state pool sizing; the additive
+# protections (a short acquire timeout and the background-writer cap) prevent the
+# post-deploy startup write storm — model discovery, pricing reconcile, Codex
+# credential self-repair, rate-limit polling all firing at once — from exhausting
+# the connection budget and starving the request path (the cause of the brief
+# HTTP 500 burst seen on every deploy).
+#
+# INVARIANTS (validated at startup):
+#   * control_pool_size + data_pool_size  MUST be well below the Postgres server
+#     max_connections (the in-repo compose files set max_connections = 100).
+#   * background_writer_max_concurrency  MUST be strictly less than
+#     control_pool_size, so at least
+#     (control_pool_size - background_writer_max_concurrency) connections are
+#     always reserved for the hot request path during the boot write storm.
+#
+# Env vars use the DOUBLE-UNDERSCORE separator.
+[database]
+# Control-plane pool: management API + the hot request-path proxy-key lookup +
+# background control-plane writers. Default: 5.
+# Env: PROXY_DATABASE__CONTROL_POOL_SIZE
+control_pool_size = 5
+
+# Data-plane pool: high-throughput request logging. Default: 20.
+# Env: PROXY_DATABASE__DATA_POOL_SIZE
+data_pool_size = 20
+
+# How long (seconds) a caller waits for a free connection before failing fast.
+# Default: 5 (deliberately replaces sqlx's 30 s default so a transient storm
+# stall degrades to a quick retryable error rather than a 30 s hang / HTTP 500).
+# Env: PROXY_DATABASE__ACQUIRE_TIMEOUT_SECS
+acquire_timeout_secs = 5
+
+# Max background workers that may hold a control-plane connection for a write at
+# once. Default: 3 (with control_pool_size = 5 this reserves >= 2 connections
+# for the request path no matter how busy the background writers are).
+# Env: PROXY_DATABASE__BACKGROUND_WRITER_MAX_CONCURRENCY
+background_writer_max_concurrency = 3
+
+# Upper bound (ms) on the random startup delay applied to each background worker
+# so they do not all hammer the database simultaneously on boot. Default: 2000.
+# Only staggers background work; never delays listener bind, readiness, or the
+# request path. Set to 0 to disable jitter.
+# Env: PROXY_DATABASE__BACKGROUND_STARTUP_JITTER_MS
+background_startup_jitter_ms = 2000
+
 # ── Anthropic provider configuration ──────────────────────────────────────────
 #
 # Outbound model substitution (issues #1270, #1277). When an Anthropic primary
