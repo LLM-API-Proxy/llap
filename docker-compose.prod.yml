@@ -17,7 +17,9 @@ services:
 
   # ─── TimescaleDB ─────────────────────────────────────────────────────────────
   timescaledb:
-    image: timescale/timescaledb:latest-pg18
+    # PINNED (#1325): concrete tag + digest, not the floating `latest-pg18`, so
+    # the data-volume migration path stays reproducible. Bump deliberately.
+    image: timescale/timescaledb:2.27.2-pg18@sha256:4051ec6e2c6c5b31fe789cf2cd87991ee1490b312b77fe02efaf51bec84b89b7
     restart: unless-stopped
     # ── Connection budget (issue #1288) ───────────────────────────────────────
     # Raise max_connections to 100 so the proxy's connection budget (control
@@ -29,15 +31,42 @@ services:
     #
     # Keep PROXY_DATABASE__CONTROL_POOL_SIZE + PROXY_DATABASE__DATA_POOL_SIZE
     # well below this value if you tune the app pool.
-    command:
-      - "-c"
-      - "max_connections=100"
+    #
+    # ── Optional Postgres RAM tuning (issue #1305) ────────────────────────────
+    # Shell (string) form on purpose: the conditional ${VAR:+...} tokens word-
+    # split into separate args and vanish cleanly when unset, so the rendered
+    # command defaults to exactly "postgres -c max_connections=100" (byte-
+    # identical to prior releases). An empty `-c shared_buffers=` value is FATAL
+    # to Postgres, so the flags must be omitted entirely (not defaulted to an
+    # empty string) when unset. shared_preload_libraries=timescaledb (set by the
+    # entrypoint in postgresql.conf) is untouched by these flags. Opt in via .env:
+    #   TIMESCALEDB_SHARED_BUFFERS=4GB  TIMESCALEDB_EFFECTIVE_CACHE_SIZE=8GB  TIMESCALEDB_WORK_MEM=64MB
+    command: -c max_connections=100 ${TIMESCALEDB_SHARED_BUFFERS:+-c shared_buffers=${TIMESCALEDB_SHARED_BUFFERS}} ${TIMESCALEDB_EFFECTIVE_CACHE_SIZE:+-c effective_cache_size=${TIMESCALEDB_EFFECTIVE_CACHE_SIZE}} ${TIMESCALEDB_WORK_MEM:+-c work_mem=${TIMESCALEDB_WORK_MEM}}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     volumes:
-      - timescaledb_data:/var/lib/postgresql/data
+      # ── DB data dir mount (issue #1305) ───────────────────────────────────────
+      # DEFAULT (TIMESCALEDB_DATA_PATH unset): named volume timescaledb_data at
+      # the SAME target path this file has always used — byte-identical to prior
+      # releases so a prod.yml-standalone deployment finds its data in the exact
+      # same place on upgrade (zero data-loss risk). The default target is NOT
+      # changed here: silently relocating an existing deployment's mount could
+      # mount an empty volume over live ephemeral data and lose it.
+      #
+      # KNOWN INCONSISTENCY (not changed by default): the pg18 image's real PGDATA
+      # is /var/lib/postgresql/18/docker (as used by the base docker-compose.yml /
+      # installer stack), whereas this file historically mounts the volume at
+      # /var/lib/postgresql/data. The installer stack (base+hardened) — which is
+      # what live production runs — is already on the correct path. A standalone
+      # prod.yml deployment that wants the corrected path must migrate data
+      # deliberately (see docs/operations/database-tuning.md); it is not forced as
+      # a default here to avoid any data-loss path on upgrade.
+      #
+      # OPT-IN (TIMESCALEDB_DATA_PATH=/mnt/ssd/pgdata): bind mount to that host
+      # path instead. Switching does NOT migrate data — copy/restore it first.
+      - ${TIMESCALEDB_DATA_PATH:-timescaledb_data}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxy} -d ${POSTGRES_DB:-llm_proxy}"]
       interval: 10s
@@ -49,8 +78,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
-          memory: 1g
+          cpus: "${TIMESCALEDB_CPU_LIMIT:-1.0}"
+          # Configurable DB memory limit (issue #1305). DEFAULT 1g preserves this
+          # file's prior behaviour; raise via .env (e.g. TIMESCALEDB_MEMORY_LIMIT=8g)
+          # alongside the TIMESCALEDB_SHARED_BUFFERS / _EFFECTIVE_CACHE_SIZE tuning
+          # flags above so an existing volume actually uses the extra RAM.
+          memory: ${TIMESCALEDB_MEMORY_LIMIT:-1g}
         reservations:
           cpus: "0.25"
           memory: 256m

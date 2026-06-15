@@ -22,8 +22,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 2g
+          cpus: "${TIMESCALEDB_CPU_LIMIT:-2.0}"
+          # ── Configurable DB memory limit (issue #1305) ──────────────────────
+          # DEFAULT 2g — byte-identical to prior releases, so existing installs
+          # are unchanged on upgrade. Raise via docker/.env (e.g.
+          # TIMESCALEDB_MEMORY_LIMIT=8g) to give the DB more RAM; pair it with
+          # the TIMESCALEDB_SHARED_BUFFERS / _EFFECTIVE_CACHE_SIZE tuning flags
+          # in the base compose so an EXISTING volume actually uses the RAM
+          # (timescaledb-tune only retunes on first init).
+          memory: ${TIMESCALEDB_MEMORY_LIMIT:-2g}
         reservations:
           cpus: "0.25"
           memory: 256m

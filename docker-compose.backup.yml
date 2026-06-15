@@ -39,10 +39,13 @@
 #   - Tokens are stored in Consul's internal token store only — never in KV or files.
 #   - Secrets (RESTIC_PASSWORD, AWS credentials, POSTGRES_PASSWORD) are never
 #     logged or written to Consul KV.
-#   - The service runs as root (user: "0:0") so it can read the host bind-mount
-#     at /host-config (source: /opt/llm-api-proxy/docker, owned by root). This is
-#     safe because cap_drop: ALL and read_only: true prevent any privilege abuse —
-#     all Linux capabilities are dropped and the container filesystem is immutable.
+#   - The backup is PostgreSQL-only (#1326): no secrets are written to R2. The
+#     .env/KEK is exported via the /platform/export-keys key-ring feature, and
+#     consul ACL tokens and TLS private keys regenerate on restore — so the host
+#     .env (/host-config) and CA volume (proxy_ca_data) are no longer mounted.
+#   - The service runs as root (user: "0:0") only so the entrypoint can write the
+#     crontab into the root-owned /etc/supercronic tmpfs. This is safe because
+#     cap_drop: ALL + read_only: true + no-new-privileges prevent privilege abuse.
 #
 # Consul KV IPC keys written by this service:
 #   proxy/backup/trigger    — consumed and deleted to trigger an immediate backup
@@ -69,12 +72,6 @@ services:
         condition: service_healthy
     networks:
       - proxy_net
-    volumes:
-      # CA certificates volume (read-only: backup agent must not modify certs)
-      - proxy_ca_data:/ca:ro
-      # Host config directory (read-only: .env file with KEK, pepper, secrets)
-      # Mounted so the backup agent can include it in restic snapshots.
-      - .:/host-config:ro
     environment:
       # Consul connectivity and ACL token.
       # The backup agent uses the standard CONSUL_HTTP_ADDR / CONSUL_HTTP_TOKEN
@@ -111,10 +108,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for PostgreSQL backup}
-    # Run as root so entrypoint.sh can read the bind-mounted /host-config directory
-    # (source: /opt/llm-api-proxy/docker, owned by root on the production host).
-    # The non-root backup user in the Dockerfile image cannot read root-owned host
-    # directories. Security is preserved via cap_drop: ALL + read_only: true below.
+    # Run as root (user: "0:0") so entrypoint.sh can write the crontab into the
+    # root-owned /etc/supercronic tmpfs (mode=0700) at startup. The backup is
+    # PostgreSQL-only (#1326), so no host bind-mounts are needed; security is
+    # preserved by cap_drop: ALL + read_only: true + no-new-privileges below.
     user: "0:0"
     # init: true inserts Docker's tini shim as PID 1 so supercronic is not PID 1.
     # Without this, supercronic tries to reap dead processes via fork/exec which
@@ -138,10 +135,3 @@ services:
         reservations:
           cpus: "0.1"
           memory: 64m
-
-# ─── Volumes ──────────────────────────────────────────────────────────────────
-# proxy_ca_data is declared as external because it is created and owned by the
-# main docker-compose.prod.yml stack.  This overlay only mounts it read-only.
-volumes:
-  proxy_ca_data:
-    external: true

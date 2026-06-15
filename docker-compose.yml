@@ -1,6 +1,11 @@
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg18
+    # PINNED (#1325): a concrete TimescaleDB+pg18 tag with its digest, not the
+    # floating `latest-pg18`. A floating tag means two installs days apart can
+    # land on different Postgres builds, and an `upgrade` that preserves the data
+    # volume can pull an image incompatible with the on-disk data directory.
+    # Bump deliberately (and verify data-volume compatibility) when updating.
+    image: timescale/timescaledb:2.27.2-pg18@sha256:4051ec6e2c6c5b31fe789cf2cd87991ee1490b312b77fe02efaf51bec84b89b7
     # ── Connection budget (issue #1288) ───────────────────────────────────────
     # Raise max_connections to 100 so the proxy's connection budget (control
     # pool + data pool = 25 by default) plus headroom for migrations, psql, and
@@ -13,20 +18,61 @@ services:
     #   max_connections (100)  >>  control_pool_size (5) + data_pool_size (20)
     # Adjust PROXY_DATABASE__CONTROL_POOL_SIZE / __DATA_POOL_SIZE together with
     # this value if you tune the app pool; keep their sum well below it.
-    command:
-      - "-c"
-      - "max_connections=100"
+    #
+    # ── Optional Postgres RAM tuning (issue #1305) ────────────────────────────
+    # timescaledb-tune runs ONCE on first init and writes shared_buffers /
+    # effective_cache_size into the data volume's postgresql.conf. Raising the
+    # container memory limit alone does NOT retune an existing volume, so these
+    # `-c` flags let an operator override the stored values for an EXISTING DB.
+    #
+    # SAFETY — defaults preserve current behaviour EXACTLY:
+    #   When TIMESCALEDB_SHARED_BUFFERS / _EFFECTIVE_CACHE_SIZE / _WORK_MEM are
+    #   unset, the `${VAR:+...}` substitutions collapse to nothing and the
+    #   rendered command is byte-identical to "postgres -c max_connections=100".
+    #   No `-c shared_buffers=...` flag is emitted, so the values stored in the
+    #   existing volume's postgresql.conf (e.g. timescaledb-tune's) are untouched.
+    #   An empty `-c shared_buffers=` value is FATAL to Postgres, which is why the
+    #   flag must be omitted entirely (not defaulted to an empty string) when unset.
+    #
+    # IMPORTANT: this is the SHELL (string) form of `command:` on purpose — it
+    # lets the conditional `${VAR:+...}` tokens word-split into separate args and
+    # vanish cleanly when unset. Keep it a single line. The image's
+    # shared_preload_libraries=timescaledb (set by the entrypoint in
+    # postgresql.conf) is NOT touched by these flags and remains active.
+    #
+    # Example (operator opts in via docker/.env):
+    #   TIMESCALEDB_SHARED_BUFFERS=4GB
+    #   TIMESCALEDB_EFFECTIVE_CACHE_SIZE=8GB
+    #   TIMESCALEDB_WORK_MEM=64MB
+    command: -c max_connections=100 ${TIMESCALEDB_SHARED_BUFFERS:+-c shared_buffers=${TIMESCALEDB_SHARED_BUFFERS}} ${TIMESCALEDB_EFFECTIVE_CACHE_SIZE:+-c effective_cache_size=${TIMESCALEDB_EFFECTIVE_CACHE_SIZE}} ${TIMESCALEDB_WORK_MEM:+-c work_mem=${TIMESCALEDB_WORK_MEM}}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-proxy_dev_password}
     ports:
-      # IPv6-only: [::] binds all IPv6 interfaces on the host.
-      # On dual-stack hosts (net.ipv6.conf.all.disable_ipv6=0) IPv4-mapped
-      # connections are also accepted via the kernel's IPv6 socket.
-      - "[::]:5432:5432"
+      # LOOPBACK-ONLY: publish on [::1] so Postgres is reachable by the
+      # host-networked proxy at localhost:5432 but NOT on any public interface.
+      #
+      # SECURITY (#1324): Docker publishes ports via a DNAT rule that BYPASSES
+      # the host nftables/iptables INPUT chain, so a `[::]` / `0.0.0.0` bind
+      # would expose Postgres to the internet on a box with a public IP,
+      # regardless of the firewall the installer configures. Binding [::1] keeps
+      # the DB private. Inter-container traffic uses the proxy_net docker network
+      # (service name `timescaledb`), not this published port, so this is safe.
+      - "[::1]:5432:5432"
     volumes:
-      - timescaledb_data:/var/lib/postgresql/18/docker
+      # ── Optional SSD bind-mount for the DB data dir (issue #1305) ──────────────
+      # DEFAULT (TIMESCALEDB_DATA_PATH unset): the named volume timescaledb_data
+      # mounted at the pg18 image's PGDATA — byte-identical to prior releases, so
+      # an `upgrade` (which overwrites compose but preserves docker/.env) finds the
+      # existing data in the exact same place. Zero data-loss risk.
+      #
+      # OPT-IN (TIMESCALEDB_DATA_PATH=/mnt/ssd/pgdata): compose renders a bind
+      # mount to that host path instead. This does NOT migrate existing data — it
+      # only points the container at the path. Moving to SSD requires the operator
+      # to copy/restore the data into the new path FIRST (see docker/tls.env.example).
+      # The target path /var/lib/postgresql/18/docker is unchanged in both modes.
+      - ${TIMESCALEDB_DATA_PATH:-timescaledb_data}:/var/lib/postgresql/18/docker
     networks:
       - proxy_net
     healthcheck:
@@ -42,9 +88,10 @@ services:
     # routing failure on any Consul restart — all KV data (including TLS options
     # seeded by consul-init) was lost, and Traefik's proxy-api router failed with
     # "unknown TLS options: strong-tls@consul". See issue #335.
-    # -client=[::] binds the HTTP API to all IPv6 interfaces (IPv6-first convention).
+    # -client=[::] binds the agent's HTTP API to all IPv6 interfaces INSIDE the
+    # container; the published host port below is what controls external reach.
     # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
-    # published host port below.
+    # loopback-only published host port below.
     command:
       - "consul"
       - "agent"
@@ -53,9 +100,15 @@ services:
       - "-client=[::]"
       - "-data-dir=/consul/data"
     ports:
-      # Publish on [::] so Traefik (network_mode: host) can reach the HTTP API
-      # at [::1]:8500 on the host network stack.
-      - "[::]:8500:8500"
+      # LOOPBACK-ONLY: publish on [::1] so host-networked Traefik can reach the
+      # HTTP API at [::1]:8500 but the Consul API is NOT exposed publicly.
+      #
+      # SECURITY (#1324): Docker's `-p` DNAT bypasses the host firewall INPUT
+      # chain, so a `[::]` / `0.0.0.0` bind would expose the Consul KV/API
+      # (which carries Traefik TLS config) to the internet on a public box.
+      # consul-init reaches Consul over the proxy_net docker network, so this
+      # loopback bind does not affect inter-container init.
+      - "[::1]:8500:8500"
     volumes:
       - consul_data:/consul/data
     networks:
@@ -199,8 +252,9 @@ services:
     #
     # ── DATABASE_URL with host networking ────────────────────────────────────────
     # With network_mode: host, the proxy is on the host network stack. TimescaleDB
-    # publishes its port on the host via "ports: [::]:5432:5432", so the correct
-    # address is localhost:5432 (not the Docker bridge hostname "timescaledb").
+    # publishes its port on the host loopback via "ports: [::1]:5432:5432", so the
+    # correct address is localhost:5432 (not the Docker bridge hostname
+    # "timescaledb"). The host-networked proxy reaches it over loopback.
     network_mode: host
     env_file:
       - path: .env
@@ -212,7 +266,7 @@ services:
       # Default 3001 — change if the port conflicts with another service on the host.
       PROXY_FORWARD_PROXY_PORT: ${PROXY_FORWARD_PROXY_PORT:-3001}
       # With host networking, TimescaleDB is reachable at localhost:5432
-      # (published via "ports: [::]:5432:5432" on the timescaledb service).
+      # (published via "ports: [::1]:5432:5432" on the timescaledb service).
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/${POSTGRES_DB:-llm_proxy}
       # Auth / encryption — populated by the installer in .env
       PROXY_JWT_SECRET: ${PROXY_JWT_SECRET:-}
