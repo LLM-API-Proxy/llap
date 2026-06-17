@@ -1,0 +1,36 @@
+# example-redirect.yml.example — Traefik operator drop-in template (issue #1340)
+#
+# This is an EXAMPLE. Traefik's file provider only loads files ending in
+# .yml / .yaml / .toml, so this `.example` file is IGNORED and a clean install
+# stays a no-op. To activate it:
+#
+#   cp docker/traefik-dynamic/example-redirect.yml.example \
+#      docker/traefik-dynamic/my-redirect.yml
+#   # edit the hostnames, then save — Traefik hot-reloads it (watch mode).
+#
+# It defines a custom router + middleware that permanently (308) redirects an old
+# hostname to a new one — the kind of site-specific config that must NOT be baked
+# into the product templates. Drop it here instead. Coexists with the product
+# consul + docker providers.
+http:
+  middlewares:
+    old-host-to-new:
+      redirectRegex:
+        regex: "^https?://old.example.com/(.*)"
+        replacement: "https://new.example.com/${1}"
+        permanent: true # 308 Permanent Redirect
+
+  routers:
+    old-host-redirect:
+      rule: "Host(`old.example.com`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - old-host-to-new
+      # noop@internal is a Traefik built-in service; the request never reaches it
+      # because the middleware issues the redirect first.
+      service: noop@internal
+      tls:
+        # Reuse the product ACME resolver so the redirect host gets a cert too.
+        # Only applies to TLS deployments (docker-compose.tls.yml / prod).
+        certResolver: cloudflare

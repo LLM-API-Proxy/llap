@@ -44,6 +44,16 @@ services:
       - "[::]:8443:8443"
       - "[::]:80:80"
 
+  consul-init:
+    # Under no-mdns, Traefik runs on the proxy_net bridge (not host networking),
+    # so it reaches the backend-unavailable responder by Docker DNS rather than at
+    # the host loopback [::1]:8081 used in the base (host-networking) compose.
+    # Override the seeded responder URL accordingly (issue #1334). consul-init's KV
+    # writes are idempotent and run once with the merged env, so this value is what
+    # gets stored when base+no-mdns come up together.
+    environment:
+      TRAEFIK_UNAVAILABLE_BACKEND_URL: ${TRAEFIK_UNAVAILABLE_BACKEND_URL:-http://backend-unavailable:80}
+
   proxy:
     # Clear network_mode: host set in the base compose.
     # An empty string in Docker Compose merge semantics removes the inherited value,

@@ -83,6 +83,14 @@ services:
       # Docker provider: discovers routing config from container labels
       - "--providers.docker=true"
       - "--providers.docker.exposedByDefault=false"
+      # File provider: operator drop-in directory (issue #1340).
+      # This overlay replaces the base command list wholesale (Compose does not
+      # merge sequences), so the file-provider flags are repeated here to keep
+      # the operator drop-in available when the TLS overlay is active. Watched,
+      # read-only, EMPTY by default — coexists with consul + docker providers.
+      # See docs/tls-setup.md ("Operator Traefik drop-in").
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
       # Entrypoints — IPv6-only; dual-stack where kernel has ipv6 enabled
       - "--entrypoints.web.address=[::]:80"
       - "--entrypoints.websecure.address=[::]:443"
@@ -133,6 +141,12 @@ services:
       # Docker socket for label-based service discovery (inherited from base compose;
       # listed here explicitly to ensure it remains present in TLS overlay merges)
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Operator drop-in directory for custom Traefik dynamic config (issue #1340).
+      # The TLS overlay replaces the base volumes list wholesale, so the drop-in
+      # mount is repeated here. Read-only, relative to this compose file, so it
+      # resolves to <install-dir>/docker/traefik-dynamic/. Created empty by
+      # install.sh and preserved (never wiped) on upgrade.
+      - ./traefik-dynamic:/etc/traefik/dynamic:ro
       # ACME certificate storage — writable named volume at /acme.
       # /acme is a separate, clean mount point kept distinct from any config files.
       - acme_data:/acme

@@ -51,7 +51,10 @@ services:
   # Traefik uses host networking and reaches the sidecar at [::1]:8180.
   proxy:
     labels:
-      - traefik.http.routers.proxy-api.middlewares=modsecurity-waf@docker,hsts@docker
+      # service-unavailable@consul (issue #1334) MUST stay first so a downed
+      # backend still yields the retryable 503 envelope under the WAF overlay.
+      # Compose replaces the whole middlewares label, so it is repeated here.
+      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,modsecurity-waf@docker,hsts@docker
       - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.modSecurityUrl=http://[::1]:8180"
       - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.maxBodySize=52428800"
 

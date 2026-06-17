@@ -158,6 +158,9 @@ services:
       # Leave empty in ACL-disabled environments (e.g. dev compose which uses
       # Consul dev mode without ACL).
       CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+      # backend-unavailable responder URL (issue #1334). In prod, Traefik and the
+      # responder share the proxy-net bridge, so Traefik reaches it by Docker DNS.
+      TRAEFIK_UNAVAILABLE_BACKEND_URL: ${TRAEFIK_UNAVAILABLE_BACKEND_URL:-http://backend-unavailable:80}
     entrypoint:
       - /bin/sh
       - -c
@@ -176,6 +179,39 @@ services:
           consul kv put traefik/tls/options/strong-tls/cipherSuites/3 TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
           consul kv put traefik/tls/options/strong-tls/cipherSuites/4 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
           consul kv put traefik/tls/options/strong-tls/cipherSuites/5 TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+
+        # ── backend-unavailable 503 fallback (issue #1334) ─────────────────────
+        # Lifecycle-independent Consul KV routing that returns a RETRYABLE 503
+        # (Retry-After + Anthropic overloaded_error envelope) instead of a 404
+        # when the proxy backend is offline. Living in Consul KV (not Docker
+        # labels) means it survives the proxy-server container disappearing.
+        # Idempotent: only writes keys that do not already exist.
+        #
+        # $${TRAEFIK_UNAVAILABLE_BACKEND_URL} is escaped so Compose passes a
+        # literal $VAR to the shell; the value comes from the container ENV above.
+        #
+        # 1. Static responder service. Write the URL EVERY run: it is
+        #    infrastructure-derived (tracks the networking mode), not an operator
+        #    preference, so self-healing topology drift is correct. The
+        #    middleware/router blocks below keep write-if-absent so operator
+        #    overrides survive.
+        consul kv put traefik/http/services/backend-unavailable/loadBalancer/servers/0/url "$${TRAEFIK_UNAVAILABLE_BACKEND_URL}"
+        # 2. errors middleware for a dead-but-present backend (502/503/504).
+        consul kv get traefik/http/middlewares/service-unavailable/errors/status/0 > /dev/null 2>&1 || {
+          consul kv put traefik/http/middlewares/service-unavailable/errors/status/0 502
+          consul kv put traefik/http/middlewares/service-unavailable/errors/status/1 503
+          consul kv put traefik/http/middlewares/service-unavailable/errors/status/2 504
+          consul kv put traefik/http/middlewares/service-unavailable/errors/service backend-unavailable@consul
+          consul kv put traefik/http/middlewares/service-unavailable/errors/query /
+        }
+        # 3. Lowest-priority catch-all router for the no-matching-router 404 case.
+        consul kv get traefik/http/routers/backend-unavailable/rule > /dev/null 2>&1 || {
+          consul kv put traefik/http/routers/backend-unavailable/rule 'PathPrefix(`/`)'
+          consul kv put traefik/http/routers/backend-unavailable/entryPoints/0 websecure
+          consul kv put traefik/http/routers/backend-unavailable/priority 1
+          consul kv put traefik/http/routers/backend-unavailable/service backend-unavailable@consul
+          consul kv put traefik/http/routers/backend-unavailable/tls/options strong-tls
         }
 
         # ── Backup ACL policies ────────────────────────────────────────────────
@@ -313,7 +349,11 @@ services:
       - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
       - traefik.http.routers.proxy-api.entrypoints=websecure
       - traefik.http.routers.proxy-api.service=proxy-backend
-      - traefik.http.routers.proxy-api.middlewares=hsts@docker,large-body@docker
+      # service-unavailable@consul is the errors middleware seeded into Consul KV
+      # by consul-init (issue #1334). It catches a dead-but-present backend
+      # (502/503/504) and serves the retryable backend-unavailable 503 envelope so
+      # Claude CLI retries instead of treating the blip as a model-access error.
+      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,hsts@docker,large-body@docker
       # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
       # active for this to take effect; falls back to default TLS options otherwise).
       # Uses @consul suffix (migrated from @file provider in issue #241).
@@ -350,6 +390,61 @@ services:
       # The prod compose does not override this, so 3001 is the correct port.
       - traefik.tcp.services.proxy-forward.loadbalancer.server.address=proxy-server:3001
 
+  # ─── backend-unavailable responder (issue #1334) ─────────────────────────────
+  # Always-up static sidecar that answers EVERY request with a retryable HTTP 503
+  # (Retry-After header + Anthropic overloaded_error envelope). Traefik routes
+  # here — via the Consul KV catch-all router and the service-unavailable errors
+  # middleware seeded by consul-init above — whenever the proxy backend is offline,
+  # so Claude Code/CLI retries the blip instead of reading a 404 as "model not
+  # found / no access". Reached by Docker DNS at backend-unavailable:80 (prod uses
+  # bridge networking, so no published host port is needed). TLS terminates at
+  # Traefik, so the responder speaks plain HTTP.
+  backend-unavailable:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./backend-unavailable/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # Security hardening — the stock nginx:alpine image writes its pid and temp
+    # paths under /var; a read-only rootfs plus tmpfs for those paths keeps the
+    # container locked down while serving a static 503.
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m,mode=1777
+      - /var/run:size=1m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # nginx writes its pid and switches worker uid/gid (CHOWN/SETGID/SETUID) and
+      # binds the privileged port 80 (NET_BIND_SERVICE). Without NET_BIND_SERVICE,
+      # binding :80 fails on runtimes that do not allow unprivileged low ports.
+      - CHOWN
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+    networks:
+      - proxy-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 32m
+        reservations:
+          cpus: "0.05"
+          memory: 16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # ─── Traefik (TLS termination) ────────────────────────────────────────────────
   traefik:
     image: traefik:v3
@@ -368,6 +463,15 @@ services:
       # Docker provider: discovers routing config from container labels
       - "--providers.docker=true"
       - "--providers.docker.exposedByDefault=false"
+      # File provider: operator drop-in directory (issue #1340).
+      # A watched, read-only directory where operators may drop site-specific
+      # Traefik dynamic config (*.yml/*.toml) — custom routers, middlewares,
+      # redirects, headers — WITHOUT modifying the product templates. EMPTY by
+      # default: a clean install loads nothing here, so behaviour is unchanged
+      # until an operator drops a file. Coexists with the consul + docker
+      # providers above. See docs/tls-setup.md ("Operator Traefik drop-in").
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
       # Entrypoints
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.forward-proxy.address=:8443"
@@ -388,6 +492,11 @@ services:
     volumes:
       # Docker socket for label-based service discovery
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Operator drop-in directory for custom Traefik dynamic config (issue #1340).
+      # Read-only: Traefik only watches/reads it, never writes. Relative to this
+      # compose file, so it resolves to <install-dir>/docker/traefik-dynamic/.
+      # Created empty by install.sh and preserved (never wiped) on upgrade.
+      - ./traefik-dynamic:/etc/traefik/dynamic:ro
     environment:
       # ACL token for Traefik (traefik-read policy: read on traefik/* KV prefix).
       # Traefik reads this via the standard CONSUL_HTTP_TOKEN env var when communicating
@@ -401,6 +510,10 @@ services:
         condition: service_healthy
       consul-init:
         condition: service_completed_successfully
+      # backend-unavailable must be up so the 503 fallback responder is reachable
+      # the moment Traefik starts routing (issue #1334).
+      backend-unavailable:
+        condition: service_started
     networks:
       - proxy-net
     deploy:
