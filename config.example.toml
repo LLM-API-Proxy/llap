@@ -381,14 +381,33 @@ emit_backup_events  = true
 
 # ── Provider notes ───────────────────────────────────────────────────────────
 #
-# Provider accounts (Anthropic, OpenAI, OpenRouter, Ollama, etc.) are configured
-# via the management API or web dashboard — not in this config file.
+# Provider accounts (Anthropic, z.ai, OpenAI, OpenRouter, Ollama, etc.) are
+# configured via the management API or web dashboard — not in this config file.
 # Each provider account stores its credential (API key or OAuth token) encrypted
 # in the database using envelope encryption (see kek_source above).
 #
+# Anthropic: Full OAuth lifecycle support (background refresh, token rotation),
+# along with the 4-tier header policy for safe credential handling.
+#
+# z.ai: z.ai (https://api.z.ai/api/anthropic) is an Anthropic-compatible
+# endpoint. The proxy sends z.ai requests through the Anthropic-compatible
+# provider path with bearer-token auth (API key only; OAuth is not supported),
+# applies the #1243 verified-surface guard for token-burn safety, and sources
+# model entitlement from z.ai's own `/v1/models` catalogue (cached in
+# provider_models; background refresher polls on a TTL). Configuration: on the
+# API or web/TUI dashboards, create a provider account, select "z.ai" as the
+# provider type, choose "API key" auth method, and paste your z.ai API key.
+# Save the account and confirm the background model discovery populated the
+# provider_models table (visible in the account details or management API). Then
+# add the z.ai account to a proxy key's routing policy. z.ai traffic is presented
+# to the upstream service as valid Claude Code client traffic (User-Agent,
+# anthropic-version header, request shape identical to Anthropic) — the only
+# differences are the base URL (https://api.z.ai/api/anthropic) and the bearer
+# token (your z.ai key).
+#
 # OpenRouter: uses the standard api_key auth path. No provider-specific config
 # keys are required. The model catalogue is cached per-account in the
-# openrouter_models table and refreshable via the management API.
+# provider_models table and refreshable via the management API.
 
 # ── Forward proxy CA certificate persistence ──────────────────────────────────
 #
