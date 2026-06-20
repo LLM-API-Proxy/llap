@@ -389,21 +389,28 @@ emit_backup_events  = true
 # Anthropic: Full OAuth lifecycle support (background refresh, token rotation),
 # along with the 4-tier header policy for safe credential handling.
 #
-# z.ai: z.ai (https://api.z.ai/api/anthropic) is an Anthropic-compatible
-# endpoint. The proxy sends z.ai requests through the Anthropic-compatible
-# provider path with bearer-token auth (API key only; OAuth is not supported),
-# applies the #1243 verified-surface guard for token-burn safety, and sources
-# model entitlement from z.ai's own `/v1/models` catalogue (cached in
-# provider_models; background refresher polls on a TTL). Configuration: on the
+# z.ai: z.ai is DUAL-ENDPOINT — the proxy routes by the INBOUND consumer
+# protocol to the matching z.ai NATIVE endpoint, with no cross-protocol
+# translation in either direction:
+#   * Anthropic inbound (POST /v1/messages, e.g. Claude Code) -> z.ai's
+#     Anthropic Messages endpoint https://api.z.ai/api/anthropic (full 4-tier
+#     Claude Code header policy, request shape identical to Anthropic).
+#   * OpenAI inbound (POST /v1/chat/completions) -> z.ai's OpenAI-compatible
+#     endpoint https://api.z.ai/api/paas/v4/chat/completions (plain OpenAI-style
+#     Bearer headers, native passthrough; the /v4 base means the inbound /v1 path
+#     is rewritten to the bare /chat/completions suffix). The Coding-Plan OpenAI
+#     base (/api/coding/paas/v4) is out of scope.
+# Both surfaces use bearer-token auth (API key only; OAuth is not supported),
+# apply the verified-surface guard (#1243/#1421) for token-burn safety on EACH
+# endpoint, and source model entitlement from z.ai's own `/v1/models` catalogue
+# (cached in provider_models; background refresher polls on a TTL). z.ai accepts
+# BARE GLM ids only (glm-5.2, glm-4.6, glm-5.2[1m]); an OpenRouter-style `z-ai/`
+# prefix is stripped before the request leaves for z.ai. Configuration: on the
 # API or web/TUI dashboards, create a provider account, select "z.ai" as the
 # provider type, choose "API key" auth method, and paste your z.ai API key.
 # Save the account and confirm the background model discovery populated the
 # provider_models table (visible in the account details or management API). Then
-# add the z.ai account to a proxy key's routing policy. z.ai traffic is presented
-# to the upstream service as valid Claude Code client traffic (User-Agent,
-# anthropic-version header, request shape identical to Anthropic) — the only
-# differences are the base URL (https://api.z.ai/api/anthropic) and the bearer
-# token (your z.ai key).
+# add the z.ai account to a proxy key's routing policy.
 #
 # OpenRouter: uses the standard api_key auth path. No provider-specific config
 # keys are required. The model catalogue is cached per-account in the
