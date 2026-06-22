@@ -388,7 +388,18 @@ services:
       # by consul-init (issue #1334). It catches a dead-but-present backend
       # (502/503/504) and serves the retryable backend-unavailable 503 envelope so
       # Claude CLI retries instead of treating the blip as a model-access error.
-      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,hsts@docker,large-body@docker
+      # NO large-body@docker here (issue #1474): Traefik's `buffering` middleware
+      # reads the ENTIRE response into memory before forwarding it — there is NO
+      # "buffering off" toggle, and `maxResponseBodyBytes=0` only disables the
+      # response SIZE LIMIT, not the buffering itself. Attaching it to this router
+      # therefore breaks SSE streaming: the client receives the whole stream as one
+      # burst at the end (measured: time_starttransfer == time_total). The proxy
+      # streams live on its own (verified direct-to-backend: TTFB << total), so the
+      # data plane must NOT be wrapped in a response-buffering middleware. Request
+      # body-size limits are enforced by the proxy itself (reject_request_bytes), so
+      # dropping Traefik's request cap here is safe. (large-body remains available
+      # for non-streaming routes like grafana/prometheus — see docker-compose.monitoring.yml.)
+      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,hsts@docker
       - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
       # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
       # active for this to take effect; falls back to default TLS options otherwise).
@@ -406,8 +417,17 @@ services:
       - traefik.http.middlewares.hsts.headers.stsIncludeSubdomains=true
       - "traefik.http.middlewares.hsts.headers.stsPreload=false"
       - traefik.http.middlewares.hsts.headers.forceSTSHeader=true
-      # Body size middleware — allows up to 1 GiB requests, no response limit (SSE safe).
-      # maxResponseBodyBytes=0 disables response buffering so SSE streaming works correctly.
+      # Body size middleware — allows up to 1 GiB requests.
+      # WARNING (issue #1474): a Traefik `buffering` middleware ALWAYS buffers the
+      # full RESPONSE body before forwarding it — `maxResponseBodyBytes=0` only
+      # disables the response size LIMIT (no 500 on a large response), it does NOT
+      # turn response buffering off (there is no such toggle). NEVER attach this
+      # middleware to a streaming/SSE route (the proxy-api router above) or the
+      # client gets the whole stream in one terminal burst. It is defined here (on
+      # the proxy container, the canonical owner of shared middlewares) and used
+      # ONLY by the non-streaming grafana/prometheus routers in
+      # docker-compose.monitoring.yml. The proxy enforces its own request-body cap
+      # (reject_request_bytes), so the data plane needs no Traefik request limit.
       # memRequestBodyBytes=1048576: request bodies ≤1 MiB stay in memory; larger spill to
       # the container filesystem rather than exhausting the 512 MiB Traefik memory limit.
       - "traefik.http.middlewares.large-body.buffering.maxRequestBodyBytes=1073741824"

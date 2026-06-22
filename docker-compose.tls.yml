@@ -95,7 +95,9 @@ services:
       - "--entrypoints.web.address=[::]:80"
       - "--entrypoints.websecure.address=[::]:443"
       - "--entrypoints.forward-proxy.address=[::]:8443"
-      # Disable response buffering for SSE streaming
+      # Unbounded read/write timeouts so long-lived SSE streams are not cut mid-flight
+      # (these govern TIMEOUTS, not buffering — response buffering is caused by
+      # attaching a `buffering` middleware to a route; see issue #1474).
       - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
       - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
       - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
