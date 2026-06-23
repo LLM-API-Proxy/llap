@@ -416,6 +416,42 @@ emit_backup_events  = true
 # provider_models table (visible in the account details or management API). Then
 # add the z.ai account to a proxy key's routing policy.
 #
+# Sakana: Sakana AI is OPENAI-NATIVE and SUBSCRIPTION-ONLY. The proxy serves
+# every inbound dialect against Sakana's OpenAI-compatible base
+# https://api.sakana.ai/v1 (bearer-token auth; API key only — OAuth is not
+# supported):
+#   * OpenAI Chat Completions inbound (POST /v1/chat/completions) and OpenAI
+#     Responses inbound (POST /v1/responses) are passthrough — no body
+#     translation. The Responses API is the dominant `fugu-ultra` path.
+#   * Anthropic inbound (POST /v1/messages, e.g. Claude Code) is translated to
+#     OpenAI Chat Completions INTERNALLY by the Sakana provider and routed to
+#     /v1/chat/completions; the response is translated back to the Anthropic
+#     shape for the client.
+# Routing cost: a Sakana account is a $0 SUBSCRIPTION. The router cost-ranks it
+# at $0 (handler `compute_account_costs` short-circuits BEFORE any pricing
+# lookup), so a Sakana account always wins on cost against a metered competitor
+# offering the same model — Sakana is never table-priced for ROUTING.
+# Pricing rows are REFERENCE-ONLY (observability): migration 0087 seeds the
+# equivalent PAYG list price for `fugu` and `fugu-ultra` so each request RECORDS
+# its equivalent cost in request_log (cost_usd), surfacing the subscription's
+# value. These rows MUST NOT affect routing — routing stays $0.
+# Reasoning effort: Sakana accepts only `high`, `xhigh`, and `max`
+# (`xhigh` == `max`). `low`/`medium` are clamped UP to `high` (never silently
+# downgraded); `high`/`xhigh`/`max` pass through unchanged. On the Anthropic
+# inbound path the shared Anthropic->OpenAI translation would clamp `xhigh`/`max`
+# down to `high`, so the Sakana provider captures the client's ORIGINAL effort
+# and re-injects the top tier afterward — `xhigh`/`max` SURVIVE end-to-end.
+# Models: `fugu` (the variable-rate router) and `fugu-ultra` (the flagship,
+# multi-agent; reports orchestration tokens under usage.token_details, which the
+# proxy sums into the recorded totals). Model entitlement is sourced from
+# Sakana's own /v1/models catalogue (cached in provider_models; background
+# refresher polls on a TTL). Configuration: on the API or web/TUI dashboards,
+# create a provider account, select "Sakana" as the provider type, choose
+# "API key" auth method, and paste your Sakana API key. Save the account and
+# confirm background model discovery populated provider_models, then add the
+# Sakana account to a proxy key's routing policy. The base URL
+# (https://api.sakana.ai/v1) is the fixed default and needs no configuration.
+#
 # OpenRouter: uses the standard api_key auth path. No provider-specific config
 # keys are required. The model catalogue is cached per-account in the
 # provider_models table and refreshable via the management API.
