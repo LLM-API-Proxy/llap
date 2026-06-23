@@ -8,8 +8,10 @@ services:
     image: timescale/timescaledb:2.27.2-pg18@sha256:4051ec6e2c6c5b31fe789cf2cd87991ee1490b312b77fe02efaf51bec84b89b7
     # ── Connection budget (issue #1288) ───────────────────────────────────────
     # Raise max_connections to 100 so the proxy's connection budget (control
-    # pool + data pool = 25 by default) plus headroom for migrations, psql, and
-    # background tooling never saturates the server. The previous deployment ran
+    # pool + data pool) plus headroom for migrations, psql, and background
+    # tooling never saturates the server. install.sh auto-sizes the two pools
+    # from the host CPU count (#1416), clamped so their sum stays well below this
+    # ceiling (worst case 32 + 56 = 88, leaving 12 free). The previous deployment ran
     # the Postgres default of 25, which the app pool alone could exhaust during
     # the post-deploy background write storm, starving the request path and
     # producing a brief HTTP 500 burst on every deploy.

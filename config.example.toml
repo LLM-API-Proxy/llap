@@ -255,11 +255,15 @@ enabled = true
 # Env: PROXY_FORWARD_PROXY__PORT (double underscore)
 port = 3001
 
-# Whether Proxy-Authorization is required on every CONNECT request.
-# When false (default), unauthenticated tunnels are permitted.
-# Clients must then include Authorization: Bearer prx-... inside the tunnel.
+# Whether a valid Proxy-Authorization is required on every CONNECT request.
+# Default: true (default-secure). When true, every CONNECT must carry a valid
+# Proxy-Authorization: Basic base64(prx-key:) header or it is rejected with 407.
+# Set to false ONLY in development/testing environments where the forward proxy
+# is not reachable from untrusted networks: that permits anonymous (unauthen-
+# ticated) CONNECT tunnels and emits a startup warning. A credential that IS
+# presented is always validated (fail-closed) regardless of this flag.
 # Env: PROXY_FORWARD_PROXY__REQUIRE_AUTH (double underscore)
-require_auth = false
+require_auth = true
 
 # Whether TLS interception (MITM mode) is active. Default: true.
 #
@@ -427,3 +431,12 @@ emit_backup_events  = true
 # In production, set to the proxy_ca_data volume mount path (/ca).
 # Env: PROXY_CA_STORAGE_DIR
 # ca_storage_dir = "/ca"
+#
+# Alternative to ca_storage_dir: supply the CA cert and key directly as PEM
+# strings. Both MUST be set together (setting only one is a startup error).
+# When both are set they take precedence over ca_storage_dir. Use this when the
+# CA material is managed externally (Vault, KMS, a mounted secret). The startup
+# precedence is: (1) ca_cert_pem + ca_key_pem, (2) ca_storage_dir, (3) ephemeral.
+# Env: PROXY_CA_CERT_PEM / PROXY_CA_KEY_PEM
+# ca_cert_pem = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+# ca_key_pem  = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
