@@ -456,6 +456,74 @@ emit_backup_events  = true
 # keys are required. The model catalogue is cached per-account in the
 # provider_models table and refreshable via the management API.
 
+# ── Streaming liveness & per-provider declared timeouts ──────────────────────
+#
+# (issue #1504 / spec docs/superpowers/specs/2026-06-24-streaming-liveness-and-
+#  provider-timeouts-design.md)
+#
+# The proxy distinguishes TRANSPORT liveness (the upstream socket is alive: TCP
+# up, TLS up, peer present) from APPLICATION progress (the model is actually
+# emitting headers / SSE frames / content tokens). These are owned by different
+# timeouts and MUST NOT be conflated:
+#
+#   * TRANSPORT liveness is owned exclusively by the shared upstream client
+#     (connect ~8s, per-read idle ~240s, TCP keepalive ~30s). A real socket
+#     death always surfaces as an upstream error and fails over fast. These
+#     are not configurable here (they are transport ceilings, not deadlines).
+#   * APPLICATION progress is bounded by a per-provider DECLARED TIMEOUT: the
+#     maximum wall-clock the proxy will wait for a request to make progress
+#     before returning a clean timeout to the consumer. Wire-silence on a LIVE
+#     socket is NOT a failure — a reasoning model (e.g. Sakana fugu/fugu-ultra)
+#     can think for minutes-to-hours and is healthy; the proxy commits 200 +
+#     SSE keepalive and holds the request until the model speaks, the socket
+#     dies, or the declared timeout elapses.
+#
+# Each ProviderType has a DEFAULT declared timeout matching its latency
+# profile, resolved per request as:
+#     declared = clamp(consumer_supplied_timeout.unwrap_or(provider_default),
+#                      lower = MIN_DECLARED_TIMEOUT,   # floor
+#                      upper = HARD_CEILING)           # absolute maximum
+# A consumer-supplied timeout overrides the provider default DOWNWARD (a client
+# may ask for less); a request for MORE is honoured only up to HARD_CEILING.
+#
+# Provider defaults (PLACEHOLDER values — the exact per-provider table is being
+# finalised by a separate research pass; the model + the Sakana anchor are
+# fixed). These keys are NOT yet read by the server; this block documents the
+# intended shape and reserves the names. Durations accept a humantime string
+# (e.g. "2h", "15m", "45s").
+#
+# [reverse_proxy.declared_timeouts]
+# # Slow multi-agent reasoning provider — matches Sakana's published
+# # stream_idle_timeout_ms. ANCHOR value, do not lower below this.
+# sakana       = "2h"
+# # Typical chat/completions providers — placeholder, pending research.
+# anthropic    = "15m"
+# openai       = "15m"
+# openai_codex = "15m"
+# openrouter   = "15m"
+# zai          = "15m"
+# # Fast/local providers may be shorter.
+# ollama       = "10m"
+# local_llm    = "10m"
+# # Fallback for any provider without an explicit entry above.
+# default      = "15m"
+# # Absolute bounds applied to every resolved timeout (provider default AND any
+# # consumer override). HARD_CEILING is the last line of the anti-hang
+# # guarantee: even a misconfigured 2h request cannot wait forever.
+# floor        = "8s"
+# hard_ceiling = "2h"
+#
+# Operator / test escape hatch: the legacy fleet-wide overload budget retains
+# its env override, layered UNDER the per-provider default (an explicit env
+# override still wins, for deterministic test wall-clocks):
+#   Env: LLAP_SERVICE_OVERLOAD_TOTAL_BUDGET_SECS   (default 50; replaced by the
+#                                                   per-provider declared timeout
+#                                                   for the selected ProviderType)
+#   Env: LLAP_SSE_EARLY_FLUSH_DEADLINE_SECS        (content-deadline before
+#                                                   commit-200 + keepalive; default 15)
+#   Env: LLAP_SSE_CLIENT_KEEPALIVE_SECS            (client-facing SSE keepalive
+#                                                   cadence; default 10)
+
 # ── Forward proxy CA certificate persistence ──────────────────────────────────
 #
 # Path to directory for persisting the forward proxy CA certificate.
