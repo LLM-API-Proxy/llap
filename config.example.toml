@@ -44,6 +44,26 @@ log_level = "info"
 # Log format: "text" (human readable) or "json" (structured, for production)
 log_format = "text"
 
+# ── Window-reset ping worker (issue #1538) ────────────────────────────────────
+#
+# Subscription provider windows anchor on first traffic after a reset, so the
+# next Anthropic OAuth 5-hour session begins when the first request lands. This
+# worker fires ONE minimal inference the instant a 5h window exits exhaustion,
+# anchoring the next session to "now" and maximising the access the subscription
+# already paid for. Only Anthropic OAuth accounts on the 5h window are pinged
+# (default on per-org via the `reset_ping_enabled` org setting). Token burn is
+# bounded by a durable per-window dedupe, the cooldown floor below, max_tokens=1,
+# and a verified-model gate. The whole worker can also be killed at runtime via
+# the LLAP_RESET_PING_ENABLED env var (default enabled).
+#
+# Worker tick (seconds). Default: 30. Set to 0 to disable the worker entirely.
+# Env: PROXY_RESET_PING_TICK_SECS
+reset_ping_tick_secs = 30
+#
+# Cooldown floor (seconds) between pings for one account. Default: 14400 (4h).
+# Env: PROXY_RESET_PING_COOLDOWN_SECS
+reset_ping_cooldown_secs = 14400
+
 # TLS configuration — managed by Traefik (see docs/tls-setup.md)
 # To enable automated TLS, run the stack with the TLS compose override:
 #   docker compose -f docker/docker-compose.yml -f docker/docker-compose.tls.yml \
