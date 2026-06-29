@@ -25,7 +25,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.109"
+INSTALLER_VERSION="0.0.110"
 # shellcheck disable=SC2034  # Used by phase functions appended by build-installer.sh
 INSTALL_DIR_LINUX="/opt/llm-api-proxy"
 # shellcheck disable=SC2034
@@ -2265,15 +2265,25 @@ firewall_service_ports() {
 }
 
 # generate_hardened_nftables_config — print a clean, reboot-safe, docker-aware
-# `inet filter`-only nftables ruleset to stdout.
+# nftables ruleset to stdout.
 #
-# This is the authoritative, install/template-managed firewall (issue #1336).
-# It deliberately contains ONLY a single `inet filter` table — it never dumps
-# Docker's runtime `ip/ip6 nat|filter|raw` tables (whose `xt target "DNAT"`/
-# `"MASQUERADE"` compat expressions make `nft -f` fail atomically at boot and
-# leave INPUT wide open). Docker manages its own NAT/filter tables at runtime;
-# this config only sets host INPUT/FORWARD policy and lets bridge traffic
-# through via the rename-proof `br-*` wildcard.
+# This is the authoritative, install/template-managed firewall (issues #1336,
+# #1546). The installer owns THREE tables and nothing else:
+#   - `inet filter` — host INPUT/FORWARD/OUTPUT policy. It lets bridge traffic
+#     through via the rename-proof `br-*` wildcard.
+#   - `ip llap-nat`  — SNAT (masquerade) for the Docker bridge IPv4 subnets so
+#     containers can reach the internet.
+#   - `ip6 llap-nat` — NAT66 (masquerade) for the Docker bridge IPv6 ULA so the
+#     IPv6-first stack has egress too.
+#
+# The installer NAT tables are deliberately NOT named `ip nat`/`ip6 nat`: those
+# are Docker's runtime tables. We never dump Docker's `ip/ip6 nat|filter|raw`
+# tables (whose `xt target "DNAT"`/`"MASQUERADE"` compat expressions make
+# `nft -f` fail atomically at boot and leave INPUT wide open). Docker manages
+# its own NAT/filter tables at runtime; our dedicated `llap-nat` tables guarantee
+# bridge egress deterministically regardless of Docker's lazy NAT-creation
+# timing (issue #1546 — a host-side `flush ruleset` wiped Docker's `ip nat`,
+# which does not return until `systemctl restart docker`, black-holing backups).
 #
 # Pure function: writes only to stdout (no logging / no $SUDO), so it is
 # trivially testable and safe to capture into a temp file for `nft -c -f`.
@@ -2282,13 +2292,15 @@ firewall_service_ports() {
 #   persist (default) — the on-disk /etc/nftables.conf for boot. Begins with
 #                       `flush ruleset`, which is safe at boot because dockerd
 #                       starts AFTER nftables.service, so there are no Docker
-#                       tables to wipe yet.
+#                       tables to wipe yet. Emits the NAT tables as plain
+#                       definitions (the leading flush already cleared state).
 #   live              — for an `nft -f` reload while the system is RUNNING (and
 #                       Docker / fail2ban tables already exist). Replaces ONLY
-#                       the installer-owned `table inet filter` via the
-#                       create-empty / delete / recreate idiom, so Docker's
-#                       runtime ip/ip6 nat|filter|raw tables and fail2ban's
-#                       chains are left untouched. NEVER `flush ruleset`.
+#                       the installer-owned `inet filter`, `ip llap-nat` and
+#                       `ip6 llap-nat` tables via the create-empty / delete /
+#                       recreate idiom, so Docker's runtime ip/ip6 nat|filter|raw
+#                       tables and fail2ban's chains are left untouched. NEVER
+#                       `flush ruleset`.
 generate_hardened_nftables_config() {
     local mode="${1:-persist}"
     local ssh_port=22
@@ -2298,7 +2310,8 @@ generate_hardened_nftables_config() {
 #!/usr/sbin/nft -f
 ${NFT_TEMPLATE_MARKER}
 #
-# Live reload — replaces ONLY \`table inet filter\` so Docker's runtime
+# Live reload — replaces ONLY the installer-owned \`inet filter\`,
+# \`ip llap-nat\` and \`ip6 llap-nat\` tables so Docker's runtime
 # ip/ip6 nat|filter|raw tables and fail2ban's chains survive untouched.
 
 table inet filter {}
@@ -2312,8 +2325,10 @@ EOF
 ${NFT_TEMPLATE_MARKER}
 #
 # Hardened, reboot-safe, docker-aware firewall for the public box.
-# Single \`inet filter\` table only — Docker manages its own ip/ip6 nat|filter
-# tables at runtime; dumping those here breaks the atomic boot-time \`nft -f\`.
+# Installer-owned tables: \`inet filter\` (host policy) plus \`ip llap-nat\` and
+# \`ip6 llap-nat\` (Docker bridge SNAT/NAT66). Docker manages its own
+# ip/ip6 nat|filter tables at runtime; dumping those here breaks the atomic
+# boot-time \`nft -f\`, so we never emit them.
 
 flush ruleset
 
@@ -2381,6 +2396,67 @@ EOF
 	}
 }
 EOF
+
+    # Installer-owned NAT tables for Docker bridge egress (issue #1546). They are
+    # named \`llap-nat\` (NOT \`ip nat\`/\`ip6 nat\`) so they never collide with —
+    # or get mistaken for — Docker's runtime tables, and so the existing
+    # substring guards (\`table ip nat\`, \`xt target\`) stay valid. Masquerade is
+    # matched by SOURCE CIDR + non-loopback egress, never by a \`br-<hash>\` name
+    # (Docker auto-assigns and renames bridge subnets — the #1336 stale-name
+    # hazard). 172.16.0.0/12 + 10.0.0.0/8 cover Docker's default IPv4 pools;
+    # fd00::/8 covers the pinned ULA + the daemon fixed-cidr-v6.
+    if [[ "$mode" == "live" ]]; then
+        # Live reload: atomically replace each named table via the
+        # create-empty / delete / recreate idiom — no \`flush ruleset\`, so
+        # Docker's own ip/ip6 nat tables and fail2ban chains are untouched.
+        # Re-running cannot accumulate duplicate masquerade rules.
+        cat <<EOF
+
+table ip llap-nat {}
+delete table ip llap-nat
+table ip llap-nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 172.16.0.0/12 oifname != "lo" masquerade
+		ip saddr 10.0.0.0/8 oifname != "lo" masquerade
+	}
+}
+
+table ip6 llap-nat {}
+delete table ip6 llap-nat
+table ip6 llap-nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip6 saddr fd00::/8 oifname != "lo" masquerade
+	}
+}
+EOF
+    else
+        # Persist/boot form: the leading \`flush ruleset\` already cleared prior
+        # state, so just define the tables.
+        cat <<EOF
+
+table ip llap-nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		# SNAT Docker bridge egress so containers reach the internet. Match by
+		# RFC1918 source + non-loopback egress (rename/renumber-proof; the IPv4
+		# bridge subnet is Docker-auto-assigned, never hardcode br-<hash>).
+		ip saddr 172.16.0.0/12 oifname != "lo" masquerade
+		ip saddr 10.0.0.0/8 oifname != "lo" masquerade
+	}
+}
+
+table ip6 llap-nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		# NAT66 for the pinned ULA bridge subnet (fc00::/7 is non-routable);
+		# REQUIRED for IPv6 egress from the bridge.
+		ip6 saddr fd00::/8 oifname != "lo" masquerade
+	}
+}
+EOF
+    fi
     return 0
 }
 
@@ -2391,7 +2467,9 @@ EOF
 #   - is missing or empty, OR
 #   - is a full-ruleset DUMP (contains Docker's `xt target` compat lines), OR
 #   - contains a hardcoded br-<hash> forward whitelist (12 hex chars), OR
-#   - is not already the installer template (missing the template marker).
+#   - is not already the installer template (missing the template marker), OR
+#   - is a pre-#1546 template that lacks the `ip llap-nat` bridge SNAT table
+#     (so upgrading an already-marked-but-NAT-less box rewrites the boot file).
 # Returns 1 when the file is already the clean template (no-op).
 nftables_config_needs_convergence() {
     local path="$1"
@@ -2408,6 +2486,10 @@ nftables_config_needs_convergence() {
 
     # Anything that is not our marked template gets replaced.
     grep -qF "$NFT_TEMPLATE_MARKER" "$path" || return 0
+
+    # Pre-#1546 marked template without the bridge SNAT table — rewrite so the
+    # boot config gains `ip llap-nat`/`ip6 llap-nat` and survives a reboot.
+    grep -q 'table ip llap-nat' "$path" || return 0
 
     return 1
 }
@@ -2494,7 +2576,7 @@ install_hardened_nftables() {
             info "nftables: backed up prior config to ${staged}"
         fi
         $SUDO install -m 0644 "$persistfile" "$target" >> "$LOG_FILE" 2>&1
-        info "nftables: installed hardened ${target} (inet filter only, br-* wildcard)"
+        info "nftables: installed hardened ${target} (inet filter + ip/ip6 llap-nat bridge SNAT, br-* wildcard)"
     else
         # Already the template — refresh in place so port/TLS changes apply.
         $SUDO install -m 0644 "$persistfile" "$target" >> "$LOG_FILE" 2>&1
@@ -2505,7 +2587,7 @@ install_hardened_nftables() {
     # and fail2ban's chains are not wiped if this runs while the system is up.
     if command -v nft &>/dev/null; then
         if $SUDO nft -f "$livefile" >> "$LOG_FILE" 2>&1; then
-            info "nftables: hardened inet filter table loaded (Docker/fail2ban tables preserved)"
+            info "nftables: hardened inet filter + ip/ip6 llap-nat bridge SNAT loaded (Docker/fail2ban tables preserved)"
             # Re-arm fail2ban's nft hooks in case its chains predated this load.
             if command -v systemctl &>/dev/null \
                 && $SUDO systemctl is-active fail2ban &>/dev/null; then
@@ -2549,11 +2631,58 @@ configure_fail2ban() {
     fi
 }
 
-# prepare_firewall — configure the host firewall (issue #1336).
+# enable_ip_forwarding — persist + apply IPv4/IPv6 forwarding (issue #1546).
+#
+# Host-side SNAT/NAT66 for the Docker bridge (the `ip/ip6 llap-nat` tables) only
+# routes packets if the kernel forwards them. Docker usually enables
+# net.ipv4.ip_forward, but the host must own forwarding deterministically for
+# both families — otherwise masquerade exists but bridge egress still
+# black-holes. We write an idempotent sysctl drop-in (reboot-safe) and apply it
+# live (best-effort).
+#
+# SYSCTL_FORWARD_PATH overrides the drop-in location (tests only); it defaults
+# to the real /etc/sysctl.d/99-llm-api-proxy-forward.conf.
+enable_ip_forwarding() {
+    local conf="${SYSCTL_FORWARD_PATH:-/etc/sysctl.d/99-llm-api-proxy-forward.conf}"
+    local tmp
+    tmp=$(mktemp "${BATS_TMPDIR:-/tmp}/llap-forward-XXXXXX.conf")
+    cat > "$tmp" <<EOF
+${NFT_TEMPLATE_MARKER}
+# IP forwarding for Docker bridge SNAT/NAT66 (issue #1546).
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+    # Persist the drop-in (idempotent overwrite — re-running yields byte-identical
+    # content). The durable write is the reboot-safe half of the fix, so a failure
+    # here must NOT be swallowed: warn and bail (without aborting the installer —
+    # the caller does not gate on our return). Ensure the target dir exists first.
+    $SUDO mkdir -p "$(dirname "$conf")" >> "$LOG_FILE" 2>&1 || true
+    if ! $SUDO install -m 0644 "$tmp" "$conf" >> "$LOG_FILE" 2>&1; then
+        rm -f "$tmp"
+        warn "sysctl: failed to write IP-forwarding drop-in ${conf} — bridge egress may break after reboot"
+        return 1
+    fi
+    rm -f "$tmp"
+
+    # Apply live (best-effort): prefer reloading the drop-in we just wrote so the
+    # values match the persisted file; fall back to setting them directly. Live
+    # application failing is non-fatal (Docker also sets ip_forward at runtime).
+    if command -v sysctl &>/dev/null; then
+        if ! $SUDO sysctl --system >> "$LOG_FILE" 2>&1; then
+            $SUDO sysctl -w net.ipv4.ip_forward=1 >> "$LOG_FILE" 2>&1 || true
+            $SUDO sysctl -w net.ipv6.conf.all.forwarding=1 >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+    info "sysctl: IPv4/IPv6 forwarding enabled for Docker bridge egress (${conf})"
+    return 0
+}
+
+# prepare_firewall — configure the host firewall (issues #1336, #1546).
 #
 # Default-on hardening for public/TLS boxes: when nftables is the firewall
-# manager (or can be installed), the installer writes the clean, reboot-safe,
-# docker-aware `inet filter`-only template and integrates fail2ban. On hosts
+# manager (or can be installed), the installer enables IP forwarding, then
+# writes the clean, reboot-safe, docker-aware template (inet filter + the
+# `ip/ip6 llap-nat` bridge SNAT/NAT66 tables) and integrates fail2ban. On hosts
 # managed by ufw or firewalld we defer to that manager and only open the
 # required service ports (we do not fight an admin-chosen firewall). The
 # `--skip-firewall` flag remains the full escape hatch.
@@ -2601,6 +2730,9 @@ prepare_firewall() {
             esac
         fi
         if command -v nft &>/dev/null || command -v systemctl &>/dev/null; then
+            # Forwarding must be on for the host-side bridge SNAT/NAT66 tables in
+            # install_hardened_nftables to actually route bridge egress (#1546).
+            enable_ip_forwarding
             install_hardened_nftables
             configure_fail2ban
         else
