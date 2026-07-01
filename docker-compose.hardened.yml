@@ -98,6 +98,28 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Runtime KV-drift detector (#1550 / #1551) — tiny idle sidecar; cap it and
+  # bound its logs like the rest of the hardened stack. Needs no capabilities
+  # (runs the consul CLI + sleep only).
+  consul-kv-watchdog:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64m
+        reservations:
+          cpus: "0.05"
+          memory: 16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   traefik:
     security_opt:
       - no-new-privileges:true

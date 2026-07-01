@@ -75,6 +75,14 @@ services:
       - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
       - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
       - "--api=false"
+      # Liveness ping entrypoint (#1550 / #1551). This overlay replaces the base
+      # command wholesale, so the ping flags MUST be repeated here — otherwise the
+      # base traefik healthcheck (inherited) would probe a ping entrypoint that
+      # does not exist and mark a healthy WAF Traefik unhealthy. Uses 127.0.0.1:8083
+      # (NOT the metrics :8082 below) so the two loopback entrypoints never collide.
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entrypoints.ping.address=127.0.0.1:8083"
       - "--log.level=INFO"
       - "--accesslog=true"
       # Traefik metrics endpoint for Prometheus scraping

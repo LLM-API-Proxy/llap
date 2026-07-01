@@ -157,6 +157,33 @@ services:
       - -c
       - |
         set -e
+        # ── Fail-loud ACL write gate (#1550 / #1551) ─────────────────────────
+        # ALWAYS probe that we can WRITE the traefik/ KV prefix before seeding.
+        # The WRITE RESULT is the discriminator, NOT token presence:
+        #   * ACLs off (base/dev — anonymous writes allowed) → probe succeeds → continue.
+        #   * ACLs on with an empty/invalid token (the #1550 incident) → 403 → FATAL.
+        # A token-presence guard cannot tell these apart — the incident token was
+        # ALSO empty — so the probe must run unconditionally. Hard-failing here makes
+        # the `depends_on: consul-init: service_completed_successfully` gate block
+        # Traefik and `compose up` return non-zero, instead of Traefik coming up "Up"
+        # and serving 404 for everything (strong-tls@consul unresolved). The bounded
+        # retry absorbs a consul leader-election / ACL-init race on a cold boot.
+        # ($$VAR is escaped so Compose passes it through literally to the shell.)
+        _probe_ok=0
+        _try=1
+        while [ "$$_try" -le 3 ]; do
+          if consul kv put traefik/.consul-init-writecheck ok > /dev/null 2>&1; then
+            _probe_ok=1
+            break
+          fi
+          sleep 2
+          _try=$$((_try + 1))
+        done
+        if [ "$$_probe_ok" -ne 1 ]; then
+          echo "FATAL(consul-init): cannot write traefik/ KV — CONSUL_HTTP_TOKEN is empty or lacks key:write (403 under default_policy=deny). Traefik strong-tls@consul would be unresolved -> ingress 404. Aborting (#1550)." >&2
+          exit 1
+        fi
+        consul kv delete traefik/.consul-init-writecheck > /dev/null 2>&1 || true
         # Idempotent: only write each key if it does not already exist.
         # This makes re-deploys safe — no data is overwritten.
         consul kv get traefik/tls/options/strong-tls/minVersion > /dev/null 2>&1 || \
@@ -306,6 +333,15 @@ services:
       - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
       # Dashboard and API disabled
       - "--api=false"
+      # Liveness ping entrypoint (#1550 / #1551). Backs the container healthcheck
+      # below so a Traefik process that cannot serve is visibly UNHEALTHY instead
+      # of sitting "Up" while the ingress 404s. network_mode: host means
+      # 127.0.0.1:8083 binds host loopback only — unpublished and unreachable
+      # off-host (it appears in no `ports:` list). This is LIVENESS only; KV/route
+      # health (strong-tls@consul resolvable) is covered by consul-kv-watchdog.
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entrypoints.ping.address=127.0.0.1:8083"
       - "--log.level=INFO"
       - "--accesslog=true"
     volumes:
@@ -316,6 +352,17 @@ services:
       # compose file, so it resolves to <install-dir>/docker/traefik-dynamic/.
       # Created empty by install.sh and preserved (never wiped) on upgrade.
       - ./traefik-dynamic:/etc/traefik/dynamic:ro
+    healthcheck:
+      # Liveness (#1550 / #1551): proves the Traefik process is up and its ping
+      # entrypoint responds. traefik:v3 is distroless (no curl/wget), so use the
+      # built-in `traefik healthcheck` subcommand. It runs as a SEPARATE process
+      # that does NOT inherit the main command's CLI flags, so the ping config is
+      # repeated here so it resolves 127.0.0.1:8083/ping regardless of config source.
+      test: ["CMD", "traefik", "healthcheck", "--ping", "--ping.entrypoint=ping", "--entrypoints.ping.address=127.0.0.1:8083"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
       # consul-init must complete before Traefik starts — ensures TLS options KV
       # entries are present before Traefik reads its Consul KV provider config.
@@ -327,6 +374,43 @@ services:
       # the moment Traefik starts routing (issue #1334).
       backend-unavailable:
         condition: service_started
+
+  # ─── consul-kv-watchdog (#1550 / #1551) ──────────────────────────────────────
+  # Runtime KV-drift detector: a tiny sidecar (reuses the consul image — no new
+  # image) whose healthcheck READS the strong-tls TLS option that Traefik's consul
+  # provider depends on. If the token is revoked/expires or the KV is wiped, the
+  # read fails and this container goes UNHEALTHY — turning a silent ingress 404
+  # into a visible signal that monitoring / `docker compose ps` catches.
+  #
+  # LIMITATION (documented — do NOT over-trust a green watchdog): in the installer
+  # base stack Traefik is network_mode: host and reaches Consul at [::1]:8500,
+  # while this sidecar reaches it over the bridge at consul:8500. It therefore
+  # detects ACL/token/KV drift but NOT host-loopback/NAT networking drift on
+  # Traefik's own path (a class this repo has hit before — installer bridge-NAT #1546).
+  consul-kv-watchdog:
+    image: hashicorp/consul:1.22
+    restart: unless-stopped
+    depends_on:
+      consul-init:
+        condition: service_completed_successfully
+    networks:
+      - proxy_net
+    environment:
+      CONSUL_HTTP_ADDR: http://consul:8500
+      # Same token as consul-init/Traefik (consul-init-rw: key_prefix "traefik/"
+      # write ⇒ read allowed). Standard container-env injection, not a render-time
+      # command substitution — no secret reaches the rendered compose/command.
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
+    # Idle forever; all the signal is in the healthcheck.
+    entrypoint: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+    healthcheck:
+      # Read the exact KV Traefik's consul provider needs. A 403 (revoked token)
+      # or a missing key makes `consul kv get` exit non-zero → unhealthy.
+      test: ["CMD-SHELL", "consul kv get traefik/tls/options/strong-tls/minVersion >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   proxy:
     image: ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-edge}

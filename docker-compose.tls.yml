@@ -124,6 +124,15 @@ services:
       - "--entrypoints.websecure.http.tls.domains[0].main=${PROXY_TLS__DOMAIN}"
       # Dashboard and API disabled
       - "--api=false"
+      # Liveness ping entrypoint (#1550 / #1551). This overlay replaces the base
+      # command list wholesale (Compose does not merge sequences), so the ping
+      # flags are repeated here to keep the healthcheck (defined on the base
+      # traefik service) working when the TLS overlay is active. Host-loopback
+      # only (network_mode: host) — unpublished. Liveness only; KV/route health
+      # is covered by consul-kv-watchdog.
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entrypoints.ping.address=127.0.0.1:8083"
       - "--log.level=INFO"
       - "--accesslog=true"
     environment:
