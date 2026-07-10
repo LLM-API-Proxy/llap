@@ -25,7 +25,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.121"
+INSTALLER_VERSION="0.0.122"
 # shellcheck disable=SC2034  # Used by phase functions appended by build-installer.sh
 INSTALL_DIR_LINUX="/opt/llm-api-proxy"
 # shellcheck disable=SC2034
