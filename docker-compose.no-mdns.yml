@@ -63,10 +63,10 @@ services:
       - proxy_net
     ports:
       # Publish on [::] (all IPv6 interfaces) — accepts IPv4-mapped connections on
-      # dual-stack hosts. Change PROXY_LISTEN_PORT / PROXY_FORWARD_PROXY_PORT in
+      # dual-stack hosts. Change PROXY_LISTEN_PORT / PROXY_FORWARD_PROXY__PORT in
       # docker/.env if these ports conflict with another service on the host.
       - "[::]:${PROXY_LISTEN_PORT:-7080}:${PROXY_LISTEN_PORT:-7080}"
-      - "[::]:${PROXY_FORWARD_PROXY_PORT:-7443}:${PROXY_FORWARD_PROXY_PORT:-7443}"
+      - "[::]:${PROXY_FORWARD_PROXY__PORT:-7443}:${PROXY_FORWARD_PROXY__PORT:-7443}"
     environment:
       # Disable mDNS — multicast does not cross Docker bridge networks and the
       # proxy would fail silently or log errors if mDNS were left enabled here.

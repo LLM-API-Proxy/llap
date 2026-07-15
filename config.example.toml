@@ -12,10 +12,6 @@ listen_addr = "::"
 # Port for the management API and reverse proxy (HTTP/HTTPS via Traefik)
 listen_port = 3000
 
-# Port for the forward proxy (CONNECT handler / TLS interception)
-# Deprecated: prefer [forward_proxy] section below.
-forward_proxy_port = 3001
-
 # Source for the Key Encryption Key: "env" or "vault"
 kek_source = "env"
 
@@ -111,12 +107,12 @@ enabled = false
 #
 # Note on advertised ports: the ports announced in DNS-SD TXT/SRV records
 # are taken from `listen_port` (default 3000, the management API + reverse
-# proxy) and `forward_proxy_port` (default 3001, the CONNECT handler).  When
+# proxy) and `forward_proxy.port` (default 3001, the CONNECT handler).  When
 # running with host networking (as the Docker Compose stack does) these ports
 # bind directly on the host interface.  If 3000 or 3001 are already in use on
 # your host, override them via:
 #   PROXY_LISTEN_PORT=<free_port>
-#   PROXY_FORWARD_PROXY_PORT=<free_port>
+#   PROXY_FORWARD_PROXY__PORT=<free_port>
 #
 # Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
 #   PROXY_MDNS__ENABLED=false               (not PROXY_MDNS_ENABLED — silently ignored)
@@ -543,6 +539,10 @@ emit_backup_events  = true
 #                                                   commit-200 + keepalive; default 15)
 #   Env: LLAP_SSE_CLIENT_KEEPALIVE_SECS            (client-facing SSE keepalive
 #                                                   cadence; default 10)
+#   Env: LLAP_CODEX_STREAM_IDLE_DEADLINE_SECS       (Codex application-event idle
+#                                                   boundary after handoff; positive
+#                                                   values up to default 240 only;
+#                                                   Ping/Pong do not reset it)
 
 # ── Forward proxy CA certificate persistence ──────────────────────────────────
 #

@@ -289,9 +289,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:?}@timescaledb:5432/${POSTGRES_DB:-llm_proxy}
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
-      KEK_HEX: ${KEK_HEX:?KEK_HEX must be set}
-      LISTEN_ADDR: "::"
-      LISTEN_PORT: "8080"
+      PROXY_KEK_VALUE: ${PROXY_KEK_VALUE:?PROXY_KEK_VALUE must be set}
+      PROXY_LISTEN_ADDR: "::"
+      PROXY_LISTEN_PORT: ${PROXY_LISTEN_PORT:-8080}
+      PROXY_FORWARD_PROXY__PORT: ${PROXY_FORWARD_PROXY__PORT:-3001}
       # Forward proxy CA storage directory — persisted via the proxy_ca_data named volume.
       # The ca_storage_dir config field (added in #243) reads this env var on startup.
       PROXY_CA_STORAGE_DIR: "/ca"
@@ -306,7 +307,7 @@ services:
       # explicitly mounted named volumes remain writable and survive container restarts.
       - proxy_ca_data:/ca
     ports:
-      - "${PROXY_PORT:-8080}:8080"
+      - "${PROXY_PORT:-8080}:${PROXY_LISTEN_PORT:-8080}"
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -345,7 +346,7 @@ services:
       # Network topology note: in this prod compose both Traefik and proxy-server
       # use the default Docker bridge network (not host networking). Traefik resolves
       # the proxy-server backend by Docker hostname. Backend URL uses the service name
-      # and port 8080 (the LISTEN_PORT above), NOT [::1]:3000 which is the dev default.
+      # and the PROXY_LISTEN_PORT above, NOT [::1]:3000 which is the dev default.
       - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
       - traefik.http.routers.proxy-api.entrypoints=websecure
       - traefik.http.routers.proxy-api.service=proxy-backend
@@ -398,17 +399,15 @@ services:
       # HTTP service — backend URL uses Docker hostname resolution.
       # proxy-server listens on [::]:8080 in the prod compose network.
       # Using http:// because TLS terminates at Traefik.
-      - traefik.http.services.proxy-backend.loadbalancer.server.url=http://proxy-server:8080
+      - "traefik.http.services.proxy-backend.loadbalancer.server.url=http://proxy-server:${PROXY_LISTEN_PORT:-8080}"
       # Disable buffering for SSE streaming support
       - traefik.http.services.proxy-backend.loadbalancer.responseForwarding.flushInterval=1ms
       # TCP router — passthrough for the forward proxy (CONNECT mode / TLS interception).
       - "traefik.tcp.routers.forward-proxy.rule=HostSNI(`*`)"
       - traefik.tcp.routers.forward-proxy.entrypoints=forward-proxy
       - traefik.tcp.routers.forward-proxy.service=proxy-forward
-      # TCP service — the forward-proxy (CONNECT mode) listens on port 3001 by default
-      # (PROXY_FORWARD_PROXY_PORT env var, default 3001 — see proxy-core/src/config.rs).
-      # The prod compose does not override this, so 3001 is the correct port.
-      - traefik.tcp.services.proxy-forward.loadbalancer.server.address=proxy-server:3001
+      # TCP service — use the same canonical typed port supplied to the listener.
+      - "traefik.tcp.services.proxy-forward.loadbalancer.server.address=proxy-server:${PROXY_FORWARD_PROXY__PORT:-3001}"
 
   # ─── backend-unavailable responder (issue #1334) ─────────────────────────────
   # Always-up static sidecar that answers EVERY request with a retryable HTTP 503

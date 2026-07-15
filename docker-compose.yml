@@ -432,7 +432,7 @@ services:
     # Ports 3000 and 3001 are commonly used — if they conflict with other services
     # on your host, change them via environment variables BEFORE starting the stack:
     #   PROXY_LISTEN_PORT=3000        (reverse proxy + management API, default 3000)
-    #   PROXY_FORWARD_PROXY_PORT=3001 (forward proxy / CONNECT mode, default 3001)
+    #   PROXY_FORWARD_PROXY__PORT=3001 (forward proxy / CONNECT mode, default 3001)
     # Set these in docker/.env or export them in your shell before running compose.
     #
     # ── DATABASE_URL with host networking ────────────────────────────────────────
@@ -449,7 +449,7 @@ services:
       # Default 3000 — change if the port conflicts with another service on the host.
       PROXY_LISTEN_PORT: ${PROXY_LISTEN_PORT:-3000}
       # Default 3001 — change if the port conflicts with another service on the host.
-      PROXY_FORWARD_PROXY_PORT: ${PROXY_FORWARD_PROXY_PORT:-3001}
+      PROXY_FORWARD_PROXY__PORT: ${PROXY_FORWARD_PROXY__PORT:-3001}
       # With host networking, TimescaleDB is reachable at localhost:5432
       # (published via "ports: [::1]:5432:5432" on the timescaledb service).
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/${POSTGRES_DB:-llm_proxy}
@@ -532,8 +532,8 @@ services:
       - traefik.tcp.routers.forward-proxy.entrypoints=forward-proxy
       - traefik.tcp.routers.forward-proxy.service=proxy-forward
       # TCP service — Traefik in host mode reaches the proxy via localhost.
-      # Default port 3001; change PROXY_FORWARD_PROXY_PORT env var if it conflicts.
-      - "traefik.tcp.services.proxy-forward.loadbalancer.server.port=${PROXY_FORWARD_PROXY_PORT:-3001}"
+      # Default port 3001; change PROXY_FORWARD_PROXY__PORT if it conflicts.
+      - "traefik.tcp.services.proxy-forward.loadbalancer.server.port=${PROXY_FORWARD_PROXY__PORT:-3001}"
 
 networks:
   proxy_net:
