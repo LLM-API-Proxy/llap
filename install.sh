@@ -25,7 +25,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.128"
+INSTALLER_VERSION="0.0.129"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -4072,6 +4072,182 @@ deploy_upgrade_debug_state() {
 
 # ── Deploy phase: compose command, stack start, Consul ACL ───────────────────
 
+# Return success when an address is a syntactically valid, container-routable
+# DNS server literal. Loopback and link-local addresses are deliberately
+# rejected: they can work in the host network namespace but are not reachable
+# from bridge-networked services such as the backup agent.
+container_dns_server_is_usable() {
+    local address="${1,,}"
+
+    if [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local first second third fourth extra octet
+        IFS=. read -r first second third fourth extra <<< "$address"
+        [[ -z "${extra:-}" ]] || return 1
+        for octet in "$first" "$second" "$third" "$fourth"; do
+            (( 10#$octet <= 255 )) || return 1
+        done
+        (( 10#$first != 0 && 10#$first != 127 && 10#$first < 224 )) || return 1
+        (( 10#$first != 169 || 10#$second != 254 )) || return 1
+        return 0
+    fi
+
+    [[ "$address" == *:* ]] || return 1
+    [[ "$address" =~ ^[0-9a-f:]+$ ]] || return 1
+    [[ "$address" != *:::* ]] || return 1
+    if [[ "$address" == *::* ]]; then
+        [[ "${address#*::}" != *::* ]] || return 1
+        local left="${address%%::*}" right="${address#*::}"
+        local -a left_parts=() right_parts=()
+        [[ -z "$left" ]] || IFS=: read -r -a left_parts <<< "$left"
+        [[ -z "$right" ]] || IFS=: read -r -a right_parts <<< "$right"
+        (( ${#left_parts[@]} + ${#right_parts[@]} < 8 )) || return 1
+        local part
+        for part in "${left_parts[@]}" "${right_parts[@]}"; do
+            [[ "$part" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+        done
+    else
+        local -a parts=()
+        IFS=: read -r -a parts <<< "$address"
+        (( ${#parts[@]} == 8 )) || return 1
+        local part
+        for part in "${parts[@]}"; do
+            [[ "$part" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+        done
+    fi
+
+    local hex_digits="${address//:/}"
+    local nonzero_digits="${hex_digits//0/}"
+    [[ -n "$nonzero_digits" ]] || return 1
+    local last_hextet="${address##*:}"
+    if [[ "$nonzero_digits" == "1" && "$last_hextet" =~ ^0*1$ ]]; then
+        return 1
+    fi
+    [[ ! "$address" =~ ^fe[89ab] ]] || return 1
+    [[ ! "$address" =~ ^ff ]] || return 1
+    return 0
+}
+
+# Print the unique interfaces carrying a default IPv6 or IPv4 route. Resolver
+# discovery is intentionally scoped to these links so a stale global
+# systemd-resolved DNS list cannot override the working uplink configuration.
+container_dns_default_route_interfaces() {
+    {
+        ip -o -6 route show default 2>/dev/null || true
+        ip -o -4 route show default 2>/dev/null || true
+    } | awk '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i == "dev" && !seen[$(i + 1)]++) {
+                    print $(i + 1)
+                    break
+                }
+            }
+        }
+    '
+}
+
+container_systemd_resolved_is_active() {
+    command -v resolvectl >/dev/null 2>&1 || return 1
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        return 0
+    fi
+    local resolved_socket="${CONTAINER_DNS_RESOLVED_SOCKET_PATH:-/run/systemd/resolve/io.systemd.Resolve}"
+    [[ -S "$resolved_socket" ]]
+}
+
+# Emit at most three validated upstream literals, one per line. Three matches
+# libc's portable MAXNS limit. systemd-resolved hosts use DNS from the active
+# default-route links; other hosts fall back to their resolver file.
+discover_container_dns_servers() {
+    local -a candidates=()
+    local candidate interface line
+
+    if container_systemd_resolved_is_active; then
+        while IFS= read -r interface; do
+            [[ -n "$interface" ]] || continue
+            while IFS= read -r line; do
+                line="${line#*:}"
+                for candidate in $line; do
+                    candidates+=("$candidate")
+                done
+            done < <(resolvectl dns "$interface" 2>/dev/null || true)
+        done < <(container_dns_default_route_interfaces)
+    else
+        local resolv_conf="${CONTAINER_DNS_RESOLV_CONF_PATH:-/etc/resolv.conf}"
+        if [[ -r "$resolv_conf" ]]; then
+            while read -r _ candidate _; do
+                candidates+=("$candidate")
+            done < <(awk '$1 == "nameserver" && NF >= 2 { print $1, $2 }' "$resolv_conf")
+        fi
+    fi
+
+    local emitted=0
+    local seen=$'\n'
+    for candidate in "${candidates[@]}"; do
+        container_dns_server_is_usable "$candidate" || continue
+        [[ "$seen" != *$'\n'"$candidate"$'\n'* ]] || continue
+        printf '%s\n' "$candidate"
+        seen+="$candidate"$'\n'
+        emitted=$((emitted + 1))
+        (( emitted < 3 )) || break
+    done
+
+    (( emitted > 0 ))
+}
+
+# Generate a Linux-only Compose override that gives outbound services direct,
+# container-reachable DNS upstreams. The file is replaced atomically on every
+# install/upgrade and is included before any Compose mutation occurs.
+deploy_write_container_dns_overlay() {
+    local overlay_file="${INSTALL_DIR}/docker/docker-compose.dns.yml"
+
+    if [[ "$IS_MACOS" == "true" ]]; then
+        $SUDO rm -f "$overlay_file"
+        return 0
+    fi
+
+    step "  Discovering container DNS upstreams..."
+    local discovered
+    if ! discovered=$(discover_container_dns_servers); then
+        die "Container DNS preflight failed: no container-reachable DNS upstreams were discovered"
+    fi
+
+    local -a servers=()
+    mapfile -t servers <<< "$discovered"
+    (( ${#servers[@]} > 0 )) \
+        || die "Container DNS preflight failed: no container-reachable DNS upstreams were discovered"
+
+    local tmpfile
+    tmpfile=$($SUDO mktemp "${INSTALL_DIR}/docker/.docker-compose.dns.yml.XXXXXX")
+    CLEANUP_FILES+=("$tmpfile")
+    {
+        echo "# docker-compose.dns.yml — generated by install.sh"
+        echo "# DO NOT EDIT — regenerated on each install/upgrade"
+        echo "services:"
+        echo "  proxy:"
+        echo "    dns:"
+        local server
+        for server in "${servers[@]}"; do
+            printf '      - "%s"\n' "$server"
+        done
+        if [[ "$OPT_BACKUP" == "true" ]]; then
+            echo "  backup:"
+            echo "    dns:"
+            for server in "${servers[@]}"; do
+                printf '      - "%s"\n' "$server"
+            done
+        fi
+    } | $SUDO tee "$tmpfile" > /dev/null
+
+    $SUDO chmod 0640 "$tmpfile"
+    if [[ "$IS_MACOS" != "true" ]]; then
+        $SUDO chown "root:${SERVICE_USER}" "$tmpfile" 2>/dev/null || true
+    fi
+    $SUDO mv "$tmpfile" "$overlay_file"
+    info "Container DNS overlay written with ${#servers[@]} upstream(s)"
+}
+
 deploy_write_compose_command() {
     step "  Generating compose-command.sh..."
     local cmd_file="${INSTALL_DIR}/compose-command.sh"
@@ -4081,6 +4257,8 @@ deploy_write_compose_command() {
     [[ "$OPT_TLS" == "true" ]] && overlays+=("docker-compose.tls.yml")
     [[ "$OPT_MONITORING" == "true" ]] && overlays+=("docker-compose.monitoring.yml")
     [[ "$OPT_BACKUP" == "true" ]] && overlays+=("docker-compose.backup.yml")
+    $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.dns.yml" \
+        && overlays+=("docker-compose.dns.yml")
     if [[ "$IS_MACOS" == "true" ]] && [[ "$MACOS_HOST_NETWORKING" == "true" ]]; then
         # Host networking available — no bridge overlay needed.
         # mDNS disabled via PROXY_MDNS__ENABLED=false in .env
@@ -4207,6 +4385,8 @@ collect_active_bind_mount_sources() {
     [[ "$OPT_TLS" == "true" ]] && overlays+=("docker-compose.tls.yml")
     [[ "$OPT_MONITORING" == "true" ]] && overlays+=("docker-compose.monitoring.yml")
     [[ "$OPT_BACKUP" == "true" ]] && overlays+=("docker-compose.backup.yml")
+    $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.dns.yml" \
+        && overlays+=("docker-compose.dns.yml")
     if [[ "$IS_MACOS" == "true" ]] && [[ "$MACOS_HOST_NETWORKING" == "true" ]]; then
         :
     elif [[ "$IS_MACOS" == "true" ]] || [[ "$OPT_MDNS" != "true" ]]; then
@@ -4675,6 +4855,7 @@ run_deploy() {
         deploy_write_env
     fi
 
+    deploy_write_container_dns_overlay
     deploy_write_compose_command
     # Fail BEFORE touching the running stack if any bind-mount source is missing
     # or the wrong type (#1390) — never let `compose up` auto-create a directory
