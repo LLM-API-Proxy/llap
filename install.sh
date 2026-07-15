@@ -25,7 +25,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.127"
+INSTALLER_VERSION="0.0.128"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
