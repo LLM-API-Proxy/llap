@@ -25,7 +25,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.129"
+INSTALLER_VERSION="0.0.130"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -56,6 +56,9 @@ umask 077
 
 # ── Signal traps ─────────────────────────────────────────────────────────────
 cleanup() {
+    if declare -F database_abort_rollback >/dev/null 2>&1; then
+        database_abort_rollback || true
+    fi
     local file
     for file in "${CLEANUP_FILES[@]}"; do
         rm -rf -- "$file" 2>/dev/null || true
@@ -332,6 +335,25 @@ OPT_SKIP_FIREWALL="false"
 OPT_SKIP_SECURITY_UPDATES="false"
 OPT_SKIP_CHECKSUM="false"
 OPT_VERIFY_SELF_CHECKSUM="false"
+OPT_ROLLBACK_BACKUP_ID=""
+
+# Installer-managed database recovery state. These flags let the EXIT/INT/TERM
+# cleanup path restore the active database name and resume the prior proxy when
+# a rollback is interrupted before the recovered release is healthy.
+CREATED_DATABASE_BACKUP_ID=""
+VALIDATED_DATABASE_BACKUP_DUMP=""
+VALIDATED_DATABASE_BACKUP_MIGRATION=""
+DATABASE_ROLLBACK_PROXY_STOPPED="false"
+DATABASE_ROLLBACK_SWAP_ACTIVE="false"
+DATABASE_ROLLBACK_ACTIVE_DATABASE=""
+DATABASE_ROLLBACK_SAFETY_DATABASE=""
+DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+DATABASE_ROLLBACK_SOURCE_VERSION=""
+DATABASE_ROLLBACK_SOURCE_METADATA_PATH=""
+DATABASE_ROLLBACK_DEPLOY_SNAPSHOT=""
+DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="false"
+DATABASE_ROLLBACK_RECOVERY_PHASE=""
+DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
 
 # Feature toggles
 # WAF defaults to off — the Traefik modsecurity plugin requires command-line
@@ -429,6 +451,8 @@ General:
   --help                  Show this usage information and exit
   --installer-version     Show installer version and exit
   --verify-self-checksum  Verify the embedded installer payload and exit
+  --rollback-backup=ID    Restore the named installer-created database backup
+                          when targeting an older stable version
 
 Authentication:
   --github-token=TOKEN    GitHub PAT for authenticated GHCR access
@@ -536,6 +560,7 @@ parse_args() {
                 echo "install.sh version ${INSTALLER_VERSION}"; exit 0 ;;
             --verify-self-checksum)
                 OPT_VERIFY_SELF_CHECKSUM="true" ;;
+            --rollback-backup=*) OPT_ROLLBACK_BACKUP_ID="${1#*=}" ;;
             --version=*)          OPT_VERSION="${1#*=}"; OPT_VERSION="${OPT_VERSION#v}" ;;
             --install-dir=*)      OPT_INSTALL_DIR="${1#*=}" ;;
             --non-interactive)    OPT_NON_INTERACTIVE="true" ;;
@@ -1941,8 +1966,36 @@ preflight_image_pullable() {
     fi
 }
 
+# Verify the installer and the host privilege boundary before inspecting any
+# target release. Durable source recovery is allowed only from this verified
+# installer, but must not depend on target registry or image availability.
+run_installer_verification() {
+    step "Verifying installer and host access..."
+    PREFLIGHT_PASS=()
+    PREFLIGHT_WARN=()
+    PREFLIGHT_FAIL=()
+    PREFLIGHT_INFO=()
+
+    # Verification needs curl, while later target preflight also needs jq.
+    # Preserve the existing best-effort bootstrap before either use.
+    ensure_preflight_tools \
+        || warn "curl/jq unavailable — remote verification may fail closed"
+
+    verify_self_checksum
+    verify_remote_checksum
+    verify_gpg_signature
+    check_root
+
+    if [[ ${#PREFLIGHT_FAIL[@]} -gt 0 ]]; then
+        draw_box "Installer Verification Results" "${PREFLIGHT_FAIL[@]}"
+        fail "Verified installer recovery requires root or non-interactive sudo access."
+        return 1
+    fi
+    info "Installer verification and host access passed"
+}
+
 run_preflight() {
-    step "[1/5] Running preflight checks..."
+    step "[1/5] Running target preflight checks..."
     PREFLIGHT_PASS=()
     PREFLIGHT_WARN=()
     PREFLIGHT_FAIL=()
@@ -1950,17 +2003,8 @@ run_preflight() {
     # shellcheck disable=SC2034  # EXISTING_INSTALL used by phase functions appended by build-installer.sh
     EXISTING_INSTALL=""
 
-    # Ensure curl AND jq exist before any remote fetch below (remote-checksum,
-    # GHCR image probe). On a minimal host these are otherwise only installed in
-    # the later prepare phase, silently degrading these checks (#1325).
-    ensure_preflight_tools || warn "curl/jq unavailable — remote preflight checks will be skipped"
-
     preflight_debug_registry
     preflight_image_pullable
-
-    verify_self_checksum
-    verify_remote_checksum
-    verify_gpg_signature
 
     PREFLIGHT_INFO+=("OS: ${OS_ID} ${OS_VERSION} (${ARCH})")
     check_root
@@ -3037,6 +3081,40 @@ stable_semver_gt() {
     (( 10#$left_patch > 10#$right_patch ))
 }
 
+existing_install_version() {
+    [[ -n "${EXISTING_INSTALL:-}" ]] || return 1
+    $SUDO jq -er '.version | strings | select(test("^[0-9]+[.][0-9]+[.][0-9]+$"))' \
+        "$EXISTING_INSTALL" 2>/dev/null
+}
+
+database_backup_id_is_safe() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+configure_database_recovery_contract() {
+    local installed_version=""
+    installed_version=$(existing_install_version 2>/dev/null || true)
+
+    if [[ -n "$OPT_ROLLBACK_BACKUP_ID" ]]; then
+        [[ "$COMMAND" == "upgrade" ]] \
+            || die "--rollback-backup is valid only with the upgrade command."
+        database_backup_id_is_safe "$OPT_ROLLBACK_BACKUP_ID" \
+            || die "--rollback-backup must be an installer-issued backup ID, not a path."
+        [[ -n "$installed_version" ]] \
+            || die "--rollback-backup requires an existing stable-version installation."
+        is_stable_semver "$OPT_VERSION" \
+            || die "--rollback-backup requires an older stable version target."
+        stable_semver_gt "$installed_version" "$OPT_VERSION" \
+            || die "--rollback-backup is accepted only when targeting an older stable version."
+        return 0
+    fi
+
+    if [[ "$COMMAND" == "upgrade" ]] \
+        && stable_semver_gt "$installed_version" "$OPT_VERSION"; then
+        die "Downgrading from ${installed_version} to ${OPT_VERSION} requires --rollback-backup=ID from the installer-created pre-upgrade backup."
+    fi
+}
+
 configure_version() {
     if [[ -n "$OPT_VERSION" ]]; then
         info "Version: ${OPT_VERSION} (from CLI/env)"
@@ -3491,6 +3569,7 @@ run_configure() {
     step "[4/5] Collecting configuration..."
     configure_install_mode
     configure_version
+    configure_database_recovery_contract
     configure_features
     configure_debug_profile
     configure_core
@@ -4093,6 +4172,12 @@ container_dns_server_is_usable() {
 
     [[ "$address" == *:* ]] || return 1
     [[ "$address" =~ ^[0-9a-f:]+$ ]] || return 1
+    if [[ "$address" == :* && "$address" != ::* ]]; then
+        return 1
+    fi
+    if [[ "$address" == *: && "$address" != *:: ]]; then
+        return 1
+    fi
     [[ "$address" != *:::* ]] || return 1
     if [[ "$address" == *::* ]]; then
         [[ "${address#*::}" != *::* ]] || return 1
@@ -4351,6 +4436,1093 @@ deploy_pull_images() {
         exit 1
     }
     info "Docker images pulled"
+}
+
+database_recovery_journal_path() {
+    printf '%s/database-rollback/recovery-journal.json\n' "$METADATA_DIR"
+}
+
+database_recovery_identifier_is_safe() {
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]
+}
+
+# Persist every identity needed to reverse a non-transactional database-name
+# swap after SIGKILL or host restart. The journal is replaced atomically and is
+# private to root; it remains until either source recovery or target health is
+# complete.
+database_write_recovery_journal() {
+    local phase="$1"
+    local rollback_root journal payload journal_staging
+    case "$phase" in
+        deploy-mutating|staging|swap-active|forward-target-healthy|target-healthy) ;;
+        *) return 1 ;;
+    esac
+    is_stable_semver "$DATABASE_ROLLBACK_SOURCE_VERSION" || return 1
+    database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_ACTIVE_DATABASE" || return 1
+    if [[ "$phase" == "staging" || "$phase" == "swap-active" ]]; then
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE" || return 1
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" || return 1
+    elif [[ "$phase" == "forward-target-healthy" ]]; then
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE" || return 1
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" || return 1
+    elif [[ "$phase" == "target-healthy" \
+        && ( -n "$DATABASE_ROLLBACK_SAFETY_DATABASE" \
+            || -n "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" ) ]]; then
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE" || return 1
+        database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" || return 1
+    fi
+    rollback_root="${METADATA_DIR}/database-rollback"
+    [[ "$(dirname -- "$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT")" == "$rollback_root" ]] || return 1
+    [[ "$(basename -- "$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT")" == .source-deploy-* ]] || return 1
+    [[ "$(dirname -- "$DATABASE_ROLLBACK_SOURCE_METADATA_PATH")" == "$METADATA_DIR" ]] || return 1
+    [[ "$(basename -- "$DATABASE_ROLLBACK_SOURCE_METADATA_PATH")" == "install.json" ]] || return 1
+
+    payload=$(mktemp) || return 1
+    CLEANUP_FILES+=("$payload")
+    if ! jq -n \
+        --arg phase "$phase" \
+        --arg source_version "$DATABASE_ROLLBACK_SOURCE_VERSION" \
+        --arg metadata_path "$DATABASE_ROLLBACK_SOURCE_METADATA_PATH" \
+        --arg snapshot_path "$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT" \
+        --arg active_database "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
+        --arg safety_database "$DATABASE_ROLLBACK_SAFETY_DATABASE" \
+        --arg replacement_database "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
+        '{format_version: 1, phase: $phase, source_version: $source_version,
+          metadata_path: $metadata_path,
+          snapshot_path: $snapshot_path, active_database: $active_database,
+          safety_database: $safety_database,
+          replacement_database: $replacement_database}' > "$payload"; then
+        return 1
+    fi
+    journal=$(database_recovery_journal_path)
+    journal_staging="${rollback_root}/.recovery-journal-$$"
+    if $SUDO test -e "$journal_staging"; then
+        return 1
+    fi
+    if ! $SUDO install -d -m 0700 "$rollback_root" \
+        || ! $SUDO install -m 0600 "$payload" "$journal_staging" \
+        || ! $SUDO mv "$journal_staging" "$journal"; then
+        $SUDO rm -f "$journal_staging" 2>/dev/null || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_RECOVERY_PHASE="$phase"
+}
+
+database_load_recovery_journal() {
+    local rollback_root journal payload phase source_version metadata_path snapshot_path
+    local active_database safety_database replacement_database
+    rollback_root="${METADATA_DIR}/database-rollback"
+    journal=$(database_recovery_journal_path)
+    if ! $SUDO test -f "$journal" || $SUDO test -L "$journal"; then
+        return 1
+    fi
+    payload=$(mktemp) || return 1
+    CLEANUP_FILES+=("$payload")
+    if ! $SUDO cat "$journal" > "$payload" \
+        || ! jq -e '
+            .format_version == 1 and
+            (.phase == "deploy-mutating" or .phase == "staging" or
+             .phase == "swap-active" or .phase == "forward-target-healthy" or
+             .phase == "target-healthy") and
+            (.source_version | type == "string" and test("^[0-9]+[.][0-9]+[.][0-9]+$")) and
+            (.metadata_path | type == "string") and
+            (.snapshot_path | type == "string") and
+            (.active_database | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+            (.safety_database | type == "string") and
+            (.replacement_database | type == "string") and
+            (if .phase == "deploy-mutating" then
+                .safety_database == "" and .replacement_database == ""
+             elif .phase == "forward-target-healthy" then
+                (.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))
+             elif .phase == "target-healthy" then
+                ((.safety_database == "" and .replacement_database == "") or
+                 ((.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                  (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))))
+             else
+                (.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))
+             end)' "$payload" >/dev/null; then
+        fail "Pending database recovery journal is malformed; refusing deployment."
+        return 1
+    fi
+    phase=$(jq -r '.phase' "$payload")
+    source_version=$(jq -r '.source_version' "$payload")
+    metadata_path=$(jq -r '.metadata_path' "$payload")
+    snapshot_path=$(jq -r '.snapshot_path' "$payload")
+    active_database=$(jq -r '.active_database' "$payload")
+    safety_database=$(jq -r '.safety_database' "$payload")
+    replacement_database=$(jq -r '.replacement_database' "$payload")
+    if [[ "$(dirname -- "$snapshot_path")" != "$rollback_root" ]] \
+        || [[ "$(basename -- "$snapshot_path")" != .source-deploy-* ]]; then
+        fail "Pending database recovery journal references an unsafe source snapshot."
+        return 1
+    fi
+    if [[ "$(dirname -- "$metadata_path")" != "$METADATA_DIR" ]] \
+        || [[ "$(basename -- "$metadata_path")" != "install.json" ]]; then
+        fail "Pending database recovery journal references unsafe install metadata."
+        return 1
+    fi
+
+    DATABASE_ROLLBACK_RECOVERY_PHASE="$phase"
+    DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
+    DATABASE_ROLLBACK_SOURCE_METADATA_PATH="$metadata_path"
+    DATABASE_ROLLBACK_DEPLOY_SNAPSHOT="$snapshot_path"
+    DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="true"
+    DATABASE_ROLLBACK_ACTIVE_DATABASE="$active_database"
+    DATABASE_ROLLBACK_SAFETY_DATABASE="$safety_database"
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE="$replacement_database"
+    if [[ "$phase" == "swap-active" ]]; then
+        DATABASE_ROLLBACK_SWAP_ACTIVE="true"
+    else
+        DATABASE_ROLLBACK_SWAP_ACTIVE="false"
+    fi
+    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+}
+
+database_clear_recovery_journal() {
+    local journal
+    journal=$(database_recovery_journal_path)
+    if ! $SUDO rm -f "$journal"; then
+        return 1
+    fi
+    DATABASE_ROLLBACK_RECOVERY_PHASE=""
+}
+
+# Preserve the exact source deploy tree before a rollback rewrites embedded
+# Compose/configuration files. The root-only archive is kept until the recovered
+# target proves healthy, so every earlier failure can restore reboot-safe state.
+database_snapshot_source_deploy_state() {
+    [[ "$DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED" != "true" ]] || return 0
+    local rollback_root snapshot_dir temp_archive checksum source_version active_database
+    local metadata_path metadata_archive metadata_checksum checksums_file
+    local -a entries=("docker")
+
+    [[ -d "${INSTALL_DIR}/docker" ]] || {
+        fail "Cannot snapshot source deploy state: docker directory is missing."
+        return 1
+    }
+    [[ -f "${INSTALL_DIR}/compose-command.sh" \
+        && ! -L "${INSTALL_DIR}/compose-command.sh" \
+        && -x "${INSTALL_DIR}/compose-command.sh" ]] || {
+        fail "Cannot snapshot source deploy state: compose command is missing or unsafe."
+        return 1
+    }
+    entries+=("compose-command.sh")
+    [[ -f "${INSTALL_DIR}/.version" ]] && entries+=(".version")
+    source_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$source_version" || {
+        fail "Cannot snapshot source deploy state: installed source version is invalid."
+        return 1
+    }
+    metadata_path="${EXISTING_INSTALL:-${METADATA_DIR}/install.json}"
+    [[ -f "$metadata_path" && ! -L "$metadata_path" \
+        && "$(dirname -- "$metadata_path")" == "$METADATA_DIR" \
+        && "$(basename -- "$metadata_path")" == "install.json" ]] || {
+        fail "Cannot snapshot source deploy state: install metadata is missing or unsafe."
+        return 1
+    }
+    active_database=$(database_install_identifier) || return 1
+
+    rollback_root="${METADATA_DIR}/database-rollback"
+    snapshot_dir="${rollback_root}/.source-deploy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    temp_archive=$(mktemp) || {
+        fail "Could not allocate temporary storage for the source deploy snapshot."
+        return 1
+    }
+    metadata_archive=$(mktemp) || return 1
+    checksums_file=$(mktemp) || return 1
+    CLEANUP_FILES+=("$temp_archive" "$metadata_archive" "$checksums_file")
+
+    if ! $SUDO tar -C "$INSTALL_DIR" -cpf "$temp_archive" "${entries[@]}" \
+        || ! $SUDO tar -C "$METADATA_DIR" -cpf "$metadata_archive" "install.json"; then
+        fail "Could not archive the source deploy state before rollback."
+        return 1
+    fi
+    if ! checksum=$(sha256_file "$temp_archive") \
+        || ! metadata_checksum=$(sha256_file "$metadata_archive") \
+        || ! printf '%s  source-deploy.tar\n%s  source-metadata.tar\n' \
+            "$checksum" "$metadata_checksum" > "$checksums_file"; then
+        fail "Could not checksum the source deploy snapshot."
+        return 1
+    fi
+    if $SUDO test -e "$snapshot_dir"; then
+        fail "Source deploy snapshot collision: ${snapshot_dir}"
+        return 1
+    fi
+    if ! $SUDO install -d -m 0700 "$rollback_root" "$snapshot_dir" \
+        || ! $SUDO install -m 0600 "$temp_archive" "${snapshot_dir}/source-deploy.tar" \
+        || ! $SUDO install -m 0600 "$metadata_archive" "${snapshot_dir}/source-metadata.tar" \
+        || ! $SUDO install -m 0600 "$checksums_file" "${snapshot_dir}/SHA256SUMS"; then
+        fail "Could not publish the private source deploy snapshot."
+        $SUDO rm -rf "$snapshot_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    DATABASE_ROLLBACK_DEPLOY_SNAPSHOT="$snapshot_dir"
+    DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="true"
+    DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
+    DATABASE_ROLLBACK_SOURCE_METADATA_PATH="$metadata_path"
+    DATABASE_ROLLBACK_ACTIVE_DATABASE="$active_database"
+    DATABASE_ROLLBACK_SAFETY_DATABASE=""
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+    if ! database_write_recovery_journal "deploy-mutating"; then
+        fail "Could not persist the rollback recovery journal before deploy mutation."
+        $SUDO rm -rf "$snapshot_dir"
+        DATABASE_ROLLBACK_DEPLOY_SNAPSHOT=""
+        DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="false"
+        return 1
+    fi
+    info "Source deploy state snapshotted for rollback failure recovery"
+}
+
+database_restore_failed_deploy_staging() {
+    local failed_dir="$1"
+    local metadata_path="${DATABASE_ROLLBACK_SOURCE_METADATA_PATH:-}"
+    if $SUDO test -d "${failed_dir}/docker"; then
+        $SUDO rm -rf "${INSTALL_DIR}/docker"
+        $SUDO mv "${failed_dir}/docker" "${INSTALL_DIR}/docker"
+    fi
+    if $SUDO test -f "${failed_dir}/compose-command.sh"; then
+        $SUDO rm -f "${INSTALL_DIR}/compose-command.sh"
+        $SUDO mv "${failed_dir}/compose-command.sh" "${INSTALL_DIR}/compose-command.sh"
+    fi
+    if $SUDO test -f "${failed_dir}/.version"; then
+        $SUDO rm -f "${INSTALL_DIR}/.version"
+        $SUDO mv "${failed_dir}/.version" "${INSTALL_DIR}/.version"
+    fi
+    if [[ -n "$metadata_path" ]] && $SUDO test -f "${failed_dir}/install.json"; then
+        $SUDO rm -f "$metadata_path"
+        $SUDO mv "${failed_dir}/install.json" "$metadata_path"
+    fi
+    if ! $SUDO rm -rf "$failed_dir"; then
+        warn "Exact source files were restored, but rollback staging could not be removed."
+        return 1
+    fi
+}
+
+database_restore_source_deploy_state() {
+    [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]] || return 0
+    local snapshot_dir archive metadata_archive expected metadata_expected actual metadata_actual
+    local temp_archive temp_metadata_archive temp_dir metadata_temp_dir failed_dir metadata_path
+    snapshot_dir="$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT"
+    archive="${snapshot_dir}/source-deploy.tar"
+    metadata_archive="${snapshot_dir}/source-metadata.tar"
+    metadata_path="$DATABASE_ROLLBACK_SOURCE_METADATA_PATH"
+
+    if ! $SUDO test -d "$snapshot_dir" || ! $SUDO test -s "$archive" \
+        || ! $SUDO test -s "$metadata_archive" \
+        || ! $SUDO test -s "${snapshot_dir}/SHA256SUMS" \
+        || $SUDO test -L "$snapshot_dir" || $SUDO test -L "$archive" \
+        || $SUDO test -L "$metadata_archive"; then
+        warn "Source deploy snapshot is absent or unsafe; refusing partial file recovery."
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Awk fields are intentionally single-quoted.
+    expected=$($SUDO awk '$2 == "source-deploy.tar" {print $1}' \
+        "${snapshot_dir}/SHA256SUMS")
+    # shellcheck disable=SC2016  # Awk fields are intentionally single-quoted.
+    metadata_expected=$($SUDO awk '$2 == "source-metadata.tar" {print $1}' \
+        "${snapshot_dir}/SHA256SUMS")
+    [[ "$expected" =~ ^[0-9a-f]{64}$ \
+        && "$metadata_expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+    temp_archive=$(mktemp) || return 1
+    temp_metadata_archive=$(mktemp) || return 1
+    CLEANUP_FILES+=("$temp_archive" "$temp_metadata_archive")
+    if ! $SUDO cat "$archive" > "$temp_archive" \
+        || ! $SUDO cat "$metadata_archive" > "$temp_metadata_archive" \
+        || ! actual=$(sha256_file "$temp_archive") \
+        || ! metadata_actual=$(sha256_file "$temp_metadata_archive"); then
+        warn "Source deploy snapshot could not be read and checksummed."
+        return 1
+    fi
+    if [[ "$actual" != "$expected" || "$metadata_actual" != "$metadata_expected" ]]; then
+        warn "Source deploy snapshot checksum mismatch; refusing partial file recovery."
+        return 1
+    fi
+
+    temp_dir=$(mktemp -d) || return 1
+    metadata_temp_dir=$(mktemp -d) || return 1
+    CLEANUP_FILES+=("$temp_dir" "$metadata_temp_dir")
+    if ! $SUDO tar -xpf "$temp_archive" -C "$temp_dir" \
+        || ! $SUDO tar -xpf "$temp_metadata_archive" -C "$metadata_temp_dir" \
+        || ! $SUDO test -d "${temp_dir}/docker" \
+        || ! $SUDO test -f "${temp_dir}/compose-command.sh" \
+        || $SUDO test -L "${temp_dir}/compose-command.sh" \
+        || ! $SUDO test -x "${temp_dir}/compose-command.sh" \
+        || ! $SUDO test -f "${metadata_temp_dir}/install.json" \
+        || $SUDO test -L "${metadata_temp_dir}/install.json"; then
+        warn "Source deploy snapshot extraction failed."
+        return 1
+    fi
+
+    # Stop through the still-current command before replacing its files. A
+    # partially written target deploy may not have a usable command; recovery
+    # still proceeds from the archived source copy in that case.
+    if $SUDO test -x "${INSTALL_DIR}/compose-command.sh"; then
+        $SUDO "${INSTALL_DIR}/compose-command.sh" stop proxy >> "$LOG_FILE" 2>&1 || true
+    fi
+    DATABASE_ROLLBACK_PROXY_STOPPED="true"
+    failed_dir="${INSTALL_DIR}/.rollback-failed-deploy-$$"
+    if $SUDO test -e "$failed_dir"; then
+        warn "Rollback deploy recovery staging path already exists."
+        return 1
+    fi
+    if ! $SUDO install -d -m 0700 "$failed_dir"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if $SUDO test -e "${INSTALL_DIR}/docker" \
+        && ! $SUDO mv "${INSTALL_DIR}/docker" "${failed_dir}/docker"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if $SUDO test -e "${INSTALL_DIR}/compose-command.sh" \
+        && ! $SUDO mv "${INSTALL_DIR}/compose-command.sh" \
+            "${failed_dir}/compose-command.sh"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if $SUDO test -f "${INSTALL_DIR}/.version" \
+        && ! $SUDO mv "${INSTALL_DIR}/.version" "${failed_dir}/.version"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if $SUDO test -e "$metadata_path" \
+        && ! $SUDO mv "$metadata_path" "${failed_dir}/install.json"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if ! $SUDO mv "${temp_dir}/docker" "${INSTALL_DIR}/docker" \
+        || ! $SUDO mv "${temp_dir}/compose-command.sh" \
+            "${INSTALL_DIR}/compose-command.sh"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if $SUDO test -f "${temp_dir}/.version"; then
+        if ! $SUDO mv "${temp_dir}/.version" "${INSTALL_DIR}/.version"; then
+            database_restore_failed_deploy_staging "$failed_dir" || true
+            return 1
+        fi
+    else
+        if ! $SUDO rm -f "${INSTALL_DIR}/.version"; then
+            database_restore_failed_deploy_staging "$failed_dir" || true
+            return 1
+        fi
+    fi
+    if ! $SUDO mv "${metadata_temp_dir}/install.json" "$metadata_path"; then
+        database_restore_failed_deploy_staging "$failed_dir" || true
+        return 1
+    fi
+    if ! $SUDO rm -rf "$failed_dir"; then
+        warn "Exact source files were restored, but rollback staging could not be removed."
+        return 1
+    fi
+
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" up -d >> "$LOG_FILE" 2>&1; then
+        warn "Exact source deploy state was restored, but its full stack did not restart."
+        return 1
+    fi
+    DATABASE_ROLLBACK_PROXY_STOPPED="false"
+    if ! database_wait_for_source_stack_healthy; then
+        warn "Exact source deploy stack restarted but did not become healthy; durable recovery state is retained."
+        return 1
+    fi
+    if ! database_discard_source_deploy_snapshot; then
+        warn "Exact source recovery completed, but its durable snapshot cleanup did not finish."
+        return 1
+    fi
+    info "Exact source deploy state restored after rollback failure"
+}
+
+database_discard_source_deploy_snapshot() {
+    [[ -n "${DATABASE_ROLLBACK_DEPLOY_SNAPSHOT:-}" ]] || return 0
+    # Persist the no-reversal boundary before deleting the only source
+    # snapshot. A process loss after this phase can finish cleanup
+    # idempotently; it must never interpret an absent snapshot as a reason to
+    # reverse an already healthy target.
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" != "target-healthy" ]] \
+        && ! database_write_recovery_journal "target-healthy"; then
+        return 1
+    fi
+    if $SUDO test -e "$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT" \
+        && ! $SUDO rm -rf "$DATABASE_ROLLBACK_DEPLOY_SNAPSHOT"; then
+        return 1
+    fi
+    if ! database_clear_recovery_journal; then
+        return 1
+    fi
+    DATABASE_ROLLBACK_DEPLOY_SNAPSHOT=""
+    DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="false"
+    DATABASE_ROLLBACK_SOURCE_METADATA_PATH=""
+    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+}
+
+# Read and validate the database identifier from the installer-managed .env.
+# Identifiers are deliberately restricted before they can reach psql variables.
+database_install_identifier() {
+    local value
+    value=$(existing_env_value "POSTGRES_DB")
+    value="${value:-llm_proxy}"
+    [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] \
+        || die "POSTGRES_DB is not a safe PostgreSQL identifier for installer-managed recovery."
+    printf '%s\n' "$value"
+}
+
+database_query_migration_version() {
+    local database="$1"
+    local version
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    version=$($SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname="$1" --no-align --tuples-only --set=ON_ERROR_STOP=1 --command="SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations"' \
+        sh "$database" 2>> "$LOG_FILE") || return 1
+    version=$(printf '%s' "$version" | tr -d '[:space:]')
+    [[ "$version" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+database_quiesce_proxy() {
+    [[ "$DATABASE_ROLLBACK_PROXY_STOPPED" != "true" ]] || return 0
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" stop proxy >> "$LOG_FILE" 2>&1; then
+        fail "Could not stop the proxy before the database recovery snapshot."
+        return 1
+    fi
+    DATABASE_ROLLBACK_PROXY_STOPPED="true"
+    info "Proxy quiesced for a consistent database recovery point"
+}
+
+database_resume_proxy() {
+    if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]]; then
+        warn "Refusing to start a target deploy while exact source-state recovery is incomplete."
+        return 1
+    fi
+    [[ "${DATABASE_ROLLBACK_PROXY_STOPPED:-false}" == "true" ]] || return 0
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" start proxy >> "$LOG_FILE" 2>&1; then
+        warn "Could not resume the quiesced proxy; rerun the verified installer."
+        return 1
+    fi
+    DATABASE_ROLLBACK_PROXY_STOPPED="false"
+    info "Prior proxy resumed"
+}
+
+database_remove_quiesced_proxy_container() {
+    [[ "${DATABASE_ROLLBACK_PROXY_STOPPED:-false}" == "true" ]] || return 1
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" rm -f -s proxy \
+        >> "$LOG_FILE" 2>&1; then
+        fail "Could not remove the quiesced source proxy before database rollback."
+        return 1
+    fi
+    info "Quiesced source proxy container removed before database swap"
+}
+
+database_create_version_backup() {
+    local source_version="$1"
+    local target_version="$2"
+    local purpose="$3"
+    local database timestamp backup_id rollback_root final_dir staging_dir
+    local temp_dir dump_file manifest_file migration_version checksum
+
+    if ! is_stable_semver "$source_version" \
+        || ! is_stable_semver "$target_version" \
+        || [[ "$purpose" != "pre-upgrade" && "$purpose" != "pre-rollback" ]]; then
+        database_abort_rollback || true
+        return 1
+    fi
+
+    if ! database=$(database_install_identifier); then
+        database_abort_rollback || true
+        return 1
+    fi
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup_id="${purpose}-${source_version}-to-${target_version}-${timestamp}"
+    database_backup_id_is_safe "$backup_id" || return 1
+
+    temp_dir=$(mktemp -d) || {
+        database_abort_rollback || true
+        return 1
+    }
+    CLEANUP_FILES+=("$temp_dir")
+    dump_file="$temp_dir/database.dump"
+    manifest_file="$temp_dir/manifest.json"
+
+    if ! database_quiesce_proxy; then
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! migration_version=$(database_query_migration_version "$database"); then
+        fail "Could not read the current migration version before database backup."
+        database_abort_rollback || true
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec pg_dump --format=custom --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+        > "$dump_file" 2>> "$LOG_FILE"; then
+        fail "PostgreSQL recovery dump failed; the active database was not changed."
+        database_abort_rollback || true
+        return 1
+    fi
+    if [[ ! -s "$dump_file" ]]; then
+        fail "PostgreSQL recovery dump is empty; the active database was not changed."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec pg_restore --list' < "$dump_file" >> "$LOG_FILE" 2>&1; then
+        fail "PostgreSQL recovery dump failed archive validation."
+        database_abort_rollback || true
+        return 1
+    fi
+
+    checksum=$(sha256_file "$dump_file") || {
+        database_abort_rollback || true
+        return 1
+    }
+    jq -n \
+        --arg backup_id "$backup_id" \
+        --arg source_version "$source_version" \
+        --arg target_version "$target_version" \
+        --arg database "$database" \
+        --arg migration_version "$migration_version" \
+        --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg sha256 "$checksum" \
+        '{format_version: 1, backup_id: $backup_id,
+          source_version: $source_version, target_version: $target_version,
+          database: $database, migration_version: $migration_version,
+          created_at: $created_at, dump_file: "database.dump", sha256: $sha256}' \
+        > "$manifest_file" || {
+            database_abort_rollback || true
+            return 1
+        }
+
+    rollback_root="${METADATA_DIR}/database-rollback"
+    final_dir="${rollback_root}/${backup_id}"
+    staging_dir="${rollback_root}/.partial-${backup_id}-$$"
+    if $SUDO test -e "$final_dir" || $SUDO test -e "$staging_dir"; then
+        fail "Database recovery backup ID collision: ${backup_id}"
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! $SUDO install -d -m 0700 "$rollback_root" "$staging_dir" \
+        || ! $SUDO install -m 0600 "$dump_file" "${staging_dir}/database.dump" \
+        || ! $SUDO install -m 0600 "$manifest_file" "${staging_dir}/manifest.json" \
+        || ! $SUDO mv "$staging_dir" "$final_dir"; then
+        fail "Could not publish the private database recovery backup."
+        $SUDO rm -rf "$staging_dir" 2>/dev/null || true
+        database_abort_rollback || true
+        return 1
+    fi
+
+    CREATED_DATABASE_BACKUP_ID="$backup_id"
+    info "Database recovery backup created: ${backup_id}"
+}
+
+database_validate_rollback_backup() {
+    local backup_id="$1"
+    local requested_version="$2"
+    local installed_version="$3"
+    local backup_dir manifest dump expected_checksum actual_checksum temp_dump
+
+    if ! database_backup_id_is_safe "$backup_id"; then
+        fail "Rollback backup ID is invalid."
+        return 1
+    fi
+    backup_dir="${METADATA_DIR}/database-rollback/${backup_id}"
+    manifest="${backup_dir}/manifest.json"
+    dump="${backup_dir}/database.dump"
+    if ! $SUDO test -d "$backup_dir" || ! $SUDO test -s "$manifest" || ! $SUDO test -s "$dump"; then
+        fail "Rollback backup not found or incomplete: ${backup_id}"
+        return 1
+    fi
+    if $SUDO test -L "$backup_dir" || $SUDO test -L "$manifest" || $SUDO test -L "$dump"; then
+        fail "Rollback backup contains a symbolic link and is rejected."
+        return 1
+    fi
+    # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
+    if ! $SUDO jq -e \
+        --arg backup_id "$backup_id" \
+        --arg requested "$requested_version" \
+        --arg installed "$installed_version" \
+        '.format_version == 1 and .backup_id == $backup_id and
+         .source_version == $requested and
+         .target_version == $installed and
+         (.database | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+         (.migration_version | type == "string" and test("^[0-9]+$")) and
+         .dump_file == "database.dump" and
+         (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))' \
+        "$manifest" >/dev/null; then
+        fail "Rollback backup manifest does not match the requested recovery transition."
+        return 1
+    fi
+    temp_dump=$(mktemp)
+    CLEANUP_FILES+=("$temp_dump")
+    if ! $SUDO cat "$dump" > "$temp_dump"; then
+        fail "Rollback backup could not be read."
+        return 1
+    fi
+    expected_checksum=$($SUDO jq -r '.sha256' "$manifest")
+    actual_checksum=$(sha256_file "$temp_dump")
+    if [[ "$actual_checksum" != "$expected_checksum" ]]; then
+        fail "Rollback backup checksum mismatch; the active database was not changed."
+        return 1
+    fi
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec pg_restore --list' < "$temp_dump" >> "$LOG_FILE" 2>&1; then
+        fail "Rollback backup archive validation failed; the active database was not changed."
+        return 1
+    fi
+
+    VALIDATED_DATABASE_BACKUP_DUMP="$dump"
+    VALIDATED_DATABASE_BACKUP_MIGRATION=$($SUDO jq -r '.migration_version' "$manifest")
+    DATABASE_ROLLBACK_ACTIVE_DATABASE=$($SUDO jq -r '.database' "$manifest")
+    info "Rollback backup validated: ${backup_id}"
+}
+
+database_swap_sql() {
+    local active_database="$1"
+    local replacement_database="$2"
+    local safety_database="$3"
+    local sql_file
+    sql_file=$(mktemp) || return 1
+    CLEANUP_FILES+=("$sql_file")
+    if ! cat > "$sql_file" <<'SQL'
+\set ON_ERROR_STOP on
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname IN (:'active_database', :'replacement_database')
+  AND pid <> pg_backend_pid();
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'safety_database') \gexec
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'replacement_database', :'active_database') \gexec
+SQL
+    then
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="active_database=${active_database}" \
+        --set="replacement_database=${replacement_database}" \
+        --set="safety_database=${safety_database}" \
+        < "$sql_file" >> "$LOG_FILE" 2>&1
+}
+
+database_drop_replacement_database() {
+    local replacement_database="${DATABASE_ROLLBACK_REPLACEMENT_DATABASE:-}"
+    [[ -n "$replacement_database" ]] || return 0
+    if ! database_recovery_identifier_is_safe "$replacement_database"; then
+        warn "Refusing to drop an unsafe rollback replacement database identifier."
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec dropdb --if-exists --force --username="$POSTGRES_USER" "$1"' \
+        sh "$replacement_database" >> "$LOG_FILE" 2>&1; then
+        warn "Could not remove the installer-managed rollback replacement database."
+        return 1
+    fi
+    info "Rollback replacement database removed"
+}
+
+database_run_timescaledb_restore_lifecycle() {
+    local database="$1"
+    local lifecycle_stage="$2"
+    local statement
+    database_recovery_identifier_is_safe "$database" || return 1
+    case "$lifecycle_stage" in
+        create-extension)
+            statement='CREATE EXTENSION IF NOT EXISTS timescaledb;'
+            ;;
+        pre-restore)
+            statement='SELECT timescaledb_pre_restore();'
+            ;;
+        post-restore)
+            statement='SELECT timescaledb_post_restore();'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    # The database identifier is a validated positional argument, never SQL.
+    # POSTGRES_USER expands only inside the configured database container.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname="$1" --set=ON_ERROR_STOP=1 --command="$2"' \
+        sh "$database" "$statement" >> "$LOG_FILE" 2>&1
+}
+
+database_stage_validated_backup_for_swap() {
+    local operation_label="$1"
+    local replacement_prefix="$2"
+    local safety_prefix="$3"
+    local timestamp restored_migration temp_dump
+
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE="${replacement_prefix}_${timestamp}_$$"
+    DATABASE_ROLLBACK_SAFETY_DATABASE="${safety_prefix}_${timestamp}_$$"
+    if ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
+        || ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
+        fail "${operation_label} database staging identity is unsafe."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_write_recovery_journal "staging"; then
+        fail "Could not persist ${operation_label} database staging identity."
+        database_abort_rollback || true
+        return 1
+    fi
+
+    # Restore into an isolated database. The active database remains unchanged
+    # until the dump and its migration identity have both been verified.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'dropdb --if-exists --force --username="$POSTGRES_USER" "$1"; createdb --username="$POSTGRES_USER" --owner="$POSTGRES_USER" "$1"' \
+        sh "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" >> "$LOG_FILE" 2>&1; then
+        fail "Could not create the isolated ${operation_label} staging database."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_run_timescaledb_restore_lifecycle \
+        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" "create-extension"; then
+        fail "Could not enable TimescaleDB in the isolated ${operation_label} staging database."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_run_timescaledb_restore_lifecycle \
+        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" "pre-restore"; then
+        fail "Could not enter TimescaleDB pre-restore mode in the isolated ${operation_label} staging database."
+        database_abort_rollback || true
+        return 1
+    fi
+
+    temp_dump=$(mktemp) || {
+        database_abort_rollback || true
+        return 1
+    }
+    CLEANUP_FILES+=("$temp_dump")
+    if ! $SUDO cat "$VALIDATED_DATABASE_BACKUP_DUMP" > "$temp_dump"; then
+        database_abort_rollback || true
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec pg_restore --exit-on-error --single-transaction --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$1"' \
+        sh "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" < "$temp_dump" >> "$LOG_FILE" 2>&1; then
+        fail "${operation_label} restore failed in the isolated staging database; the active database was not changed."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_run_timescaledb_restore_lifecycle \
+        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" "post-restore"; then
+        fail "Could not leave TimescaleDB restore mode in the isolated ${operation_label} staging database."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! restored_migration=$(database_query_migration_version "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE") \
+        || [[ "$restored_migration" != "$VALIDATED_DATABASE_BACKUP_MIGRATION" ]]; then
+        fail "${operation_label} staging database migration history does not match its immutable manifest."
+        database_abort_rollback || true
+        return 1
+    fi
+
+    if ! database_remove_quiesced_proxy_container; then
+        database_abort_rollback || true
+        return 1
+    fi
+
+    if ! database_write_recovery_journal "swap-active"; then
+        fail "Could not persist ${operation_label} database swap identity before mutation."
+        database_abort_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="true"
+    if ! database_swap_sql "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
+        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
+        fail "${operation_label} database-name swap failed; attempting automatic recovery."
+        database_recover_interrupted_rollback || true
+        return 1
+    fi
+    info "${operation_label} database restored and verified at migration ${restored_migration}"
+}
+
+database_restore_version_backup() {
+    local installed_version="$1"
+    local requested_version="$2"
+    local backup_id="$3"
+
+    if ! database_validate_rollback_backup "$backup_id" "$requested_version" "$installed_version"; then
+        database_abort_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_SOURCE_VERSION="$installed_version"
+    database_create_version_backup "$installed_version" "$requested_version" "pre-rollback" \
+        || return 1
+    database_stage_validated_backup_for_swap \
+        "Rollback" "llap_restore" "llap_pre_rollback"
+}
+
+database_prepare_forward_upgrade() {
+    local source_version="$1"
+    local target_version="$2"
+    local backup_id="$3"
+
+    if ! database_validate_rollback_backup "$backup_id" "$source_version" "$target_version"; then
+        database_abort_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
+    if ! database_stage_validated_backup_for_swap \
+        "Forward upgrade" "llap_upgrade" "llap_pre_upgrade"; then
+        return 1
+    fi
+    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="true"
+}
+
+database_recover_interrupted_rollback() {
+    [[ "${DATABASE_ROLLBACK_SWAP_ACTIVE:-false}" == "true" ]] || return 0
+    local failed_database sql_file
+    failed_database="${DATABASE_ROLLBACK_REPLACEMENT_DATABASE:-llap_failed_rollback_$$}"
+    $SUDO "${INSTALL_DIR}/compose-command.sh" stop proxy >> "$LOG_FILE" 2>&1 || true
+    DATABASE_ROLLBACK_PROXY_STOPPED="true"
+
+    sql_file=$(mktemp) || return 1
+    CLEANUP_FILES+=("$sql_file")
+    if ! cat > "$sql_file" <<'SQL'
+\set ON_ERROR_STOP on
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = :'active_database' AND pid <> pg_backend_pid();
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'failed_database')
+WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database')
+  AND EXISTS (SELECT 1 FROM pg_database WHERE datname = :'active_database')
+  AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'failed_database') \gexec
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'safety_database', :'active_database')
+WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database')
+  AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'active_database') \gexec
+SQL
+    then
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="active_database=${DATABASE_ROLLBACK_ACTIVE_DATABASE}" \
+        --set="failed_database=${failed_database}" \
+        --set="safety_database=${DATABASE_ROLLBACK_SAFETY_DATABASE}" \
+        < "$sql_file" >> "$LOG_FILE" 2>&1; then
+        warn "Automatic interrupted-rollback database recovery failed; preserved backups require operator escalation."
+        return 1
+    fi
+    if ! database_drop_replacement_database; then
+        return 1
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="false"
+    DATABASE_ROLLBACK_SAFETY_DATABASE=""
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]] \
+        && ! database_write_recovery_journal "deploy-mutating"; then
+        warn "Database swap was reversed, but durable source-state recovery could not be updated."
+        return 1
+    fi
+    info "Interrupted rollback database swap was reversed"
+    if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]]; then
+        database_restore_source_deploy_state
+    else
+        database_resume_proxy
+    fi
+}
+
+database_drop_forward_upgrade_safety_database() {
+    local safety_database="${DATABASE_ROLLBACK_SAFETY_DATABASE:-}"
+    [[ -n "$safety_database" ]] || return 0
+    if ! database_recovery_identifier_is_safe "$safety_database"; then
+        warn "Refusing to drop an unsafe forward-upgrade safety database identifier."
+        return 1
+    fi
+    # The target has crossed a durable no-reversal boundary before this call.
+    # `--if-exists` makes process-loss recovery idempotent when PostgreSQL
+    # completed the drop before the installer recorded its local result.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! $SUDO "${INSTALL_DIR}/compose-command.sh" exec -T timescaledb \
+        sh -ceu 'exec dropdb --if-exists --force --username="$POSTGRES_USER" "$1"' \
+        sh "$safety_database" >> "$LOG_FILE" 2>&1; then
+        warn "Could not remove the forward-upgrade source safety database."
+        return 1
+    fi
+    DATABASE_ROLLBACK_SAFETY_DATABASE=""
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+    info "Forward-upgrade source safety database removed after target health"
+}
+
+database_complete_forward_upgrade_transition() {
+    # Persist the no-reversal boundary while both the exact source database and
+    # source deploy snapshot still exist. A process loss from this point keeps
+    # the proven-healthy target and resumes only idempotent cleanup.
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" != "forward-target-healthy" ]] \
+        && ! database_write_recovery_journal "forward-target-healthy"; then
+        return 1
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="false"
+    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    if ! database_drop_forward_upgrade_safety_database; then
+        return 1
+    fi
+    database_discard_source_deploy_snapshot
+}
+
+database_abort_rollback() {
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == "forward-target-healthy" ]]; then
+        database_complete_forward_upgrade_transition
+        return $?
+    fi
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == "target-healthy" ]]; then
+        database_discard_source_deploy_snapshot
+        return $?
+    fi
+    if [[ "${DATABASE_ROLLBACK_SWAP_ACTIVE:-false}" == "true" ]]; then
+        database_recover_interrupted_rollback
+        return $?
+    fi
+    if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]]; then
+        if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == "staging" ]] \
+            && ! database_drop_replacement_database; then
+            return 1
+        fi
+        database_restore_source_deploy_state
+        return $?
+    fi
+    database_resume_proxy
+}
+
+database_reconcile_pending_recovery() {
+    if ! database_load_recovery_journal; then
+        return 1
+    fi
+    if [[ "$DATABASE_ROLLBACK_RECOVERY_PHASE" == "target-healthy" ]]; then
+        if ! database_discard_source_deploy_snapshot; then
+            fail "Pending healthy-target cleanup could not be completed safely."
+            return 1
+        fi
+        info "Pending healthy-target snapshot cleanup completed"
+        return 0
+    fi
+    if ! database_abort_rollback; then
+        fail "Pending interrupted database rollback could not be recovered safely."
+        return 1
+    fi
+    info "Pending interrupted database rollback recovered to exact source state"
+}
+
+# Pending durable recovery must run before target argument/configuration
+# validation. The target install metadata may already have been finalized when
+# a process or host stops, and validating the repeated rollback command against
+# that transient metadata would otherwise make source recovery unreachable.
+database_reconcile_pending_recovery_before_configuration() {
+    local recovery_journal
+    recovery_journal=$(database_recovery_journal_path)
+    if ! $SUDO test -e "$recovery_journal"; then
+        return 0
+    fi
+    if ! database_reconcile_pending_recovery; then
+        return 1
+    fi
+    fail "Reconciled pending durable recovery state. Re-run this verified installer to begin a new deployment."
+    return 1
+}
+
+database_wait_for_services_healthy() {
+    local timeout="${DATABASE_ROLLBACK_HEALTH_TIMEOUT_SECONDS:-120}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout > 0 && timeout <= 600 )) || timeout=120
+    local started container_id status service all_healthy
+    local -a services=("$@")
+    [[ ${#services[@]} -gt 0 ]] || return 1
+    started=$(date +%s)
+    while (( $(date +%s) - started < timeout )); do
+        all_healthy="true"
+        for service in "${services[@]}"; do
+            container_id=$($SUDO "${INSTALL_DIR}/compose-command.sh" ps -q "$service" 2>/dev/null || true)
+            status=""
+            if [[ -n "$container_id" ]]; then
+                status=$($SUDO docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                    "$container_id" 2>/dev/null || true)
+            fi
+            [[ "$status" == "exited" || "$status" == "dead" ]] && return 1
+            [[ "$status" == "healthy" ]] || all_healthy="false"
+        done
+        [[ "$all_healthy" == "true" ]] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+database_wait_for_proxy_healthy() {
+    database_wait_for_services_healthy proxy
+}
+
+database_wait_for_source_stack_healthy() {
+    database_wait_for_services_healthy timescaledb consul proxy
+}
+
+database_wait_for_target_stack_healthy() {
+    database_wait_for_services_healthy timescaledb consul proxy
+}
+
+database_source_snapshot_required_for_deploy() {
+    [[ "$COMMAND" == "upgrade" ]] || return 1
+    local installed_version
+    installed_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$installed_version" || return 1
+    is_stable_semver "$OPT_VERSION" || return 1
+    [[ -n "$OPT_ROLLBACK_BACKUP_ID" ]] \
+        || stable_semver_gt "$OPT_VERSION" "$installed_version"
+}
+
+deploy_handle_database_transition() {
+    [[ "$COMMAND" == "upgrade" ]] || return 0
+    local installed_version
+    installed_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$installed_version" || return 0
+    is_stable_semver "$OPT_VERSION" || return 0
+
+    if [[ -n "$OPT_ROLLBACK_BACKUP_ID" ]]; then
+        database_restore_version_backup "$installed_version" "$OPT_VERSION" \
+            "$OPT_ROLLBACK_BACKUP_ID"
+    elif stable_semver_gt "$OPT_VERSION" "$installed_version"; then
+        database_create_version_backup "$installed_version" "$OPT_VERSION" "pre-upgrade" \
+            || return 1
+        database_prepare_forward_upgrade "$installed_version" "$OPT_VERSION" \
+            "$CREATED_DATABASE_BACKUP_ID" || return 1
+        info "Retain rollback backup ID: ${CREATED_DATABASE_BACKUP_ID}"
+    elif stable_semver_gt "$installed_version" "$OPT_VERSION"; then
+        fail "Database rollback backup is required before starting an older binary."
+        return 1
+    fi
+}
+
+deploy_complete_database_transition() {
+    if [[ "$DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED" == "true" ]]; then
+        # Compose has started the recovered proxy, so it is no longer quiesced.
+        # Keep source recovery available until the complete target stack proves
+        # healthy after every fallible deploy finalizer.
+        DATABASE_ROLLBACK_PROXY_STOPPED="false"
+        if ! database_wait_for_target_stack_healthy; then
+            fail "Target stack did not become healthy; restoring the exact source deployment."
+            database_abort_rollback || true
+            return 1
+        fi
+        info "Target database, Consul, and proxy are healthy"
+        if [[ "$DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE" == "true" ]]; then
+            if ! database_complete_forward_upgrade_transition; then
+                fail "Target stack is healthy, but durable forward-upgrade cleanup could not be completed."
+                return 1
+            fi
+        elif ! database_discard_source_deploy_snapshot; then
+            fail "Target stack is healthy, but durable recovery cleanup could not be completed."
+            return 1
+        fi
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="false"
+    DATABASE_ROLLBACK_PROXY_STOPPED="false"
 }
 
 # Determine the expected filesystem type ("file" or "dir") of a compose
@@ -4842,6 +6014,13 @@ deploy_post_install_summary() {
 run_deploy() {
     step "[5/5] Deploying..."
 
+    # Capture exact source files and durable recovery identity before the first
+    # target Compose/.env mutation for both stable forward upgrades and
+    # database-backed rollbacks.
+    if database_source_snapshot_required_for_deploy; then
+        database_snapshot_source_deploy_state
+    fi
+
     if [[ "$COMMAND" == "upgrade" ]]; then
         deploy_backup_compose_files
     fi
@@ -4863,14 +6042,56 @@ run_deploy() {
     deploy_verify_bind_mounts
     ghcr_login
     deploy_pull_images
+    deploy_handle_database_transition
     deploy_start_stack
     deploy_consul_acl_bootstrap
     deploy_start_remaining_services
     configure_nftables_docker_forward
     deploy_install_service
     deploy_write_metadata
+    deploy_complete_database_transition
     deploy_post_install_summary
     deploy_open_browser
+}
+
+run_verified_recovery_preflight() {
+    INSTALL_PHASE="verification"
+    if ! run_installer_verification; then
+        return 1
+    fi
+
+    # A journaled source deployment must be recovered immediately after the
+    # installer and host-access boundary is verified. Target credentials,
+    # debug prompts, registry probes, and image/network checks are deliberately
+    # later so a broken or unavailable target cannot make recovery unreachable.
+    INSTALL_PHASE="recovery"
+    if ! database_reconcile_pending_recovery_before_configuration; then
+        return 1
+    fi
+
+    resolve_github_token
+    if [[ -n "${GITHUB_TOKEN_RESOLVED:-}" ]]; then
+        detect_github_user
+    fi
+    load_debug_state_from_env
+    warn_debug_mode
+
+    INSTALL_PHASE="preflight"
+    run_preflight
+}
+
+run_post_preflight_phases() {
+    INSTALL_PHASE="legal"
+    run_tos
+
+    INSTALL_PHASE="prepare"
+    run_prepare
+
+    INSTALL_PHASE="configure"
+    run_configure
+
+    INSTALL_PHASE="deploy"
+    run_deploy
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
@@ -4965,14 +6186,8 @@ main() {
         log "Auto-detected non-TTY execution — forcing non-interactive mode"
     fi
 
-    resolve_github_token
-    if [[ -n "${GITHUB_TOKEN_RESOLVED:-}" ]]; then
-        detect_github_user
-    fi
     detect_dialog
     detect_os
-    load_debug_state_from_env
-    warn_debug_mode
     detect_arch
 
     case "${COMMAND:-}" in
@@ -4982,20 +6197,10 @@ main() {
             ;;
     esac
 
-    INSTALL_PHASE="preflight"
-    run_preflight
-
-    INSTALL_PHASE="legal"
-    run_tos
-
-    INSTALL_PHASE="prepare"
-    run_prepare
-
-    INSTALL_PHASE="configure"
-    run_configure
-
-    INSTALL_PHASE="deploy"
-    run_deploy
+    if ! run_verified_recovery_preflight; then
+        return 1
+    fi
+    run_post_preflight_phases
 
     INSTALL_PHASE=""
     info "Installation complete!"
