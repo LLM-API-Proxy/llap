@@ -283,7 +283,7 @@ services:
 
   # ─── Proxy server ─────────────────────────────────────────────────────────────
   proxy-server:
-    image: ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-latest}
+    image: ${PROXY_SERVER_IMAGE:-ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-latest}}
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:?}@timescaledb:5432/${POSTGRES_DB:-llm_proxy}
@@ -591,7 +591,7 @@ services:
 
   # ─── Proxy TUI (optional — enable with --profile tui) ────────────────────────
   proxy-tui:
-    image: ghcr.io/llm-api-proxy/cli:${PROXY_VERSION:-latest}
+    image: ${PROXY_CLI_IMAGE:-ghcr.io/llm-api-proxy/cli:${PROXY_VERSION:-latest}}
     profiles: ["tui"]
     environment:
       PROXY_API_URL: http://proxy-server:8080

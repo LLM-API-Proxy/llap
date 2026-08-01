@@ -61,7 +61,7 @@ services:
     # Pre-built backup agent image from GHCR.
     # The image bundles restic, supercronic, postgresql-client, and the
     # backup.sh / entrypoint.sh scripts.
-    image: ghcr.io/llm-api-proxy/backup:${PROXY_VERSION:-latest}
+    image: ${PROXY_BACKUP_IMAGE:-ghcr.io/llm-api-proxy/backup:${PROXY_VERSION:-latest}}
     restart: unless-stopped
     depends_on:
       consul:

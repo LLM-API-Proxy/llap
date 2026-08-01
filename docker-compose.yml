@@ -413,7 +413,7 @@ services:
       start_period: 20s
 
   proxy:
-    image: ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-edge}
+    image: ${PROXY_SERVER_IMAGE:-ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-edge}}
     # ── mDNS networking ──────────────────────────────────────────────────────────
     # mDNS (RFC 6762/6763) uses link-local multicast (IPv4: 224.0.0.251:5353,
     # IPv6: ff02::fb:5353). Multicast does NOT cross Docker bridge networks.
