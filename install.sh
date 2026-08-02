@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.132"
+INSTALLER_VERSION="0.0.133"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -3112,9 +3112,9 @@ installer_recovery_compose_file_is_authorized() {
             return 1
             ;;
         *)
-            # Releases installed by this hardened writer have a managed,
-            # non-writable, single-link Compose authority.
-            installer_managed_regular_file_is_safe "$path"
+            # Non-writable, single-link Compose authority, owned by whichever
+            # identity the source version's installer wrote it as (#1755).
+            installer_recovery_regular_file_is_safe "$path" "$source_version"
             return
             ;;
     esac
@@ -3124,6 +3124,10 @@ installer_recovery_compose_file_is_authorized() {
 
 installer_legacy_bound_directory_manifests_are_authorized() {
     local root="${1%/}" monitoring_enabled="$2"
+    # Only ever reached from the 0.0.130|0.0.131 branch of
+    # installer_recovery_fixed_files_are_authorized. Naming the version keeps
+    # the ownership expectation explicit rather than implied (#1755).
+    local legacy_version="${3:-0.0.130}"
     local directory candidate filename
     local -a manifest_status=()
     [[ "$monitoring_enabled" == "true" \
@@ -3147,7 +3151,10 @@ installer_legacy_bound_directory_manifests_are_authorized() {
                 [[ "$filename" =~ \
 ^[A-Za-z0-9][A-Za-z0-9._-]*[.](yml|yaml|toml)$ ]] \
                     || exit 1
-                installer_managed_regular_file_is_safe "$candidate" \
+                # This function only ever validates a legacy tree, which
+                # v0.0.130/v0.0.131 chowned to SERVICE_USER (#1755).
+                installer_recovery_regular_file_is_safe \
+                    "$candidate" "$legacy_version" \
                     || exit 1
             done
         manifest_status=("${PIPESTATUS[@]}")
@@ -3288,7 +3295,8 @@ installer_recovery_fixed_files_are_authorized() {
                 expected="5baafcc0d3f2f4151402be06af26eb99181b9ba3c51ba300add0a589c660198a"
                 ;;
             *)
-                installer_managed_regular_file_is_safe "$path" || return 1
+                installer_recovery_regular_file_is_safe \
+                    "$path" "$source_version" || return 1
                 continue
                 ;;
         esac
@@ -3298,7 +3306,7 @@ installer_recovery_fixed_files_are_authorized() {
     case "$source_version" in
         0.0.130|0.0.131)
             installer_legacy_bound_directory_manifests_are_authorized \
-                "$root" "$monitoring_enabled"
+                "$root" "$monitoring_enabled" "$source_version"
             ;;
     esac
 }
@@ -5886,9 +5894,37 @@ deploy_protect_existing_managed_tree() {
     done
 }
 
-installer_managed_regular_file_is_safe() {
-    local path="$1" expected_uid metadata owner mode mode_value
-    expected_uid="$(installer_managed_deployment_uid)" || return 1
+# Owner uid a source version's installer actually wrote its deploy tree as.
+#
+# v0.0.130 and v0.0.131 chowned the whole tree to the service user:
+#   $SUDO chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}"
+# v0.0.132 replaced that with the managed identity (uid from `id -u` — root on a
+# sudo install — and group from SERVICE_USER), and extract_file now chowns each
+# file individually.
+#
+# Recovery authorization must therefore judge a captured snapshot against the
+# identity that WROTE it, not the identity the running installer would use.
+# Validating a legacy tree against the managed uid can never succeed, which
+# aborted every 0.0.130/0.0.131 upgrade at deploy with "Captured source Compose
+# model does not match the running stack" (#1755).
+installer_recovery_expected_uid() {
+    local source_version="${1:-}" uid
+    case "$source_version" in
+        0.0.130|0.0.131)
+            [[ -n "${SERVICE_USER:-}" ]] || return 1
+            uid="$($SUDO /usr/bin/id -u "$SERVICE_USER" 2>/dev/null)" || return 1
+            [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+            printf '%s\n' "$uid"
+            ;;
+        *)
+            installer_managed_deployment_uid
+            ;;
+    esac
+}
+
+installer_regular_file_is_safe_for_uid() {
+    local path="$1" expected_uid="$2" metadata owner mode mode_value
+    [[ "$expected_uid" =~ ^[0-9]+$ ]] || return 1
     case "$(uname -s 2>/dev/null || true)" in
         Linux)
             metadata="$($SUDO /usr/bin/stat -Lc '%u:%a' "$path" 2>/dev/null)" \
@@ -5911,6 +5947,19 @@ installer_managed_regular_file_is_safe() {
         && $SUDO test -f "$path" \
         && ! $SUDO test -L "$path" \
         && installer_path_has_single_link "$path"
+}
+
+installer_managed_regular_file_is_safe() {
+    local path="$1" expected_uid
+    expected_uid="$(installer_managed_deployment_uid)" || return 1
+    installer_regular_file_is_safe_for_uid "$path" "$expected_uid"
+}
+
+# Same safety contract, but judged against the identity that wrote the snapshot.
+installer_recovery_regular_file_is_safe() {
+    local path="$1" source_version="${2:-}" expected_uid
+    expected_uid="$(installer_recovery_expected_uid "$source_version")" || return 1
+    installer_regular_file_is_safe_for_uid "$path" "$expected_uid"
 }
 
 deploy_harden_recovered_tree() {
