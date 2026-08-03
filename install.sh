@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.134"
+INSTALLER_VERSION="0.0.135"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -5961,10 +5961,36 @@ installer_managed_regular_file_is_safe() {
 }
 
 # Same safety contract, but judged against the identity that wrote the snapshot.
+# A legacy tree may legitimately be owned by EITHER identity.
+#
+# v0.0.130/v0.0.131 chowned the whole tree to SERVICE_USER. v0.0.132+ chowns each
+# file to the managed identity (root) inside deploy_extract_files — which runs
+# EARLY in run_deploy, before the database transition. So an upgrade that
+# extracted files and then aborted (a failed archive validation, a headroom
+# rejection, a lost process) leaves the tree root-owned while install.json still
+# records the OLD version. That is a partially-applied upgrade, not tampering,
+# and it is exactly the state a retry has to be able to authorize.
+#
+# Observed on production: after the v0.0.133 attempt aborted at archive
+# validation, every managed file was 0:750/0:644 while install.json still said
+# 0.0.130, so keying strictly off the recorded source version rejected the whole
+# tree and no retry could ever succeed without manual intervention.
+#
+# Both identities are installer-owned and neither is operator-supplied, so
+# accepting either does not weaken the control in any way that matters: an owner
+# that is neither is still rejected, and every mode/link/symlink check is
+# unchanged.
 installer_recovery_regular_file_is_safe() {
-    local path="$1" source_version="${2:-}" expected_uid
+    local path="$1" source_version="${2:-}" expected_uid managed_uid
     expected_uid="$(installer_recovery_expected_uid "$source_version")" || return 1
-    installer_regular_file_is_safe_for_uid "$path" "$expected_uid"
+    if installer_regular_file_is_safe_for_uid "$path" "$expected_uid"; then
+        return 0
+    fi
+    # Fall back to the post-migration identity only when it actually differs,
+    # so a v0.0.132+ snapshot gets exactly one accepted owner as before.
+    managed_uid="$(installer_managed_deployment_uid)" || return 1
+    [[ "$managed_uid" != "$expected_uid" ]] || return 1
+    installer_regular_file_is_safe_for_uid "$path" "$managed_uid"
 }
 
 deploy_harden_recovered_tree() {
