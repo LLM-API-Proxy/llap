@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.133"
+INSTALLER_VERSION="0.0.134"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -1101,6 +1101,11 @@ DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION=""
 DATABASE_ROLLBACK_TIMESCALEDB_BIND_SOURCE=""
 DATABASE_ROLLBACK_TIMESCALEDB_BIND_IDENTITY=""
 DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+# Recursion guard for the deferred post-health rollback dump. The dump runs
+# from inside database_complete_forward_upgrade_transition, which is itself one
+# of database_abort_rollback's branches — without this flag a dump failure
+# re-enters the same branch forever.
+DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
 
 # Feature toggles
 # WAF defaults to off — the Traefik modsecurity plugin requires command-line
@@ -10266,12 +10271,71 @@ timescaledb_size_to_bytes() {
     return 0
 }
 
+# Status of the process FEEDING an archive into pg_restore.
+#
+# `pg_restore --list` reads only the archive's table of contents and exits,
+# so on any dump larger than the pipe buffer the feeder is still writing and
+# the kernel kills it with SIGPIPE (128 + 13 = 141). That is the reader
+# working exactly as designed, not a damaged archive. A production 0.0.130 ->
+# 0.0.133 upgrade aborted on precisely this: the complete 4,679-line table of
+# contents had already printed to the installer log when the step was reported
+# as "failed archive validation" (#1757). It never fired on small dumps
+# because the Compose daemon drained the whole channel first.
+#
+# Only the WRITER is forgiven, and only for SIGPIPE. The reader's status is
+# still required to be exactly 0 by every caller, so a truncated or corrupt
+# archive — which makes pg_restore itself exit non-zero — still fails closed.
+database_archive_feed_status_is_ok() {
+    local status="${1:-1}"
+    [[ "$status" == 0 || "$status" == 141 ]]
+}
+
+# Run an archive READER on stdin, then swallow whatever the reader did not read.
+#
+# What the feeder's exit status means once the pipe is broken depends on a
+# signal disposition the installer does not own, because SIG_IGN survives both
+# fork and exec:
+#
+#   SIGPIPE default   the feeder is killed outright   -> status 141
+#   SIGPIPE ignored   write() returns EPIPE instead   -> GNU cat prints
+#                     "cat: write error: Broken pipe" -> status 1
+#
+# Any parent that ignores SIGPIPE process-wide imposes the second form on every
+# descendant. The GitHub Actions runner does exactly that, which is why this
+# validation failed only in CI; an operator driving the installer from a .NET,
+# JVM or Node supervisor would have hit the identical fabricated abort in
+# production. Status 1 is indistinguishable from "could not read the dump", so
+# it cannot be forgiven without also forgiving a genuine read failure.
+#
+# The fix is to stop breaking the pipe. This function holds the read end open
+# and discards the remainder ON THE HOST — the drained bytes never reach the
+# database container — so the feeder always terminates normally and its status
+# stays trustworthy. The reader's status, which is what actually validates the
+# archive, is returned unchanged, so a corrupt archive still fails closed.
+database_read_archive_then_drain() {
+    local reader_status=0
+    "$@" || reader_status=$?
+    cat > /dev/null 2>> "$LOG_FILE" || true
+    return "$reader_status"
+}
+
+# Create the durable, checksummed rollback dump.
+#
+# `source_database` (optional 4th positional) selects WHERE the bytes come from.
+# Empty — the rollback path — dumps the LIVE installer-managed database and
+# quiesces the proxy first, so the dump is a consistent recovery point.
+# Non-empty — the deferred forward-upgrade dump (#1757) — dumps a named frozen
+# database that nothing is writing to, so there is nothing to quiesce and the
+# proxy must keep serving.
 database_create_version_backup() {
     local source_version="$1"
     local target_version="$2"
     local purpose="$3"
+    local source_database="${4:-}"
     local database timestamp backup_id rollback_root final_dir staging_dir
     local dump_file manifest_file migration_version checksum
+    local -a archive_status=()
+    local -a dump_command=()
 
     if ! is_stable_semver "$source_version" \
         || ! is_stable_semver "$target_version" \
@@ -10296,11 +10360,18 @@ database_create_version_backup() {
         return 1
     fi
 
-    if ! database_quiesce_proxy; then
+    if [[ -n "$source_database" ]]; then
+        if ! database_recovery_identifier_is_safe "$source_database"; then
+            fail "Refusing to dump an unsafe source database identifier."
+            database_abort_rollback || true
+            return 1
+        fi
+    elif ! database_quiesce_proxy; then
         database_abort_rollback || true
         return 1
     fi
-    if ! migration_version=$(database_query_migration_version "$database"); then
+    if ! migration_version=$(database_query_migration_version \
+        "${source_database:-$database}"); then
         fail "Could not read the current migration version before database backup."
         database_abort_rollback || true
         return 1
@@ -10328,8 +10399,13 @@ database_create_version_backup() {
     database_raise_runtime_memory_limit
 
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if [[ -n "$source_database" ]]; then
+        dump_command=(sh -ceu 'exec pg_dump --format=custom --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$1"' sh "$source_database")
+    else
+        dump_command=(sh -ceu 'exec pg_dump --format=custom --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"')
+    fi
     if ! installer_run_live_compose exec -T timescaledb \
-        sh -ceu 'exec pg_dump --format=custom --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+        "${dump_command[@]}" \
         2>> "$LOG_FILE" \
         | $SUDO /usr/bin/tee "$dump_file" >/dev/null; then
         fail "PostgreSQL recovery dump failed; the active database was not changed."
@@ -10351,10 +10427,20 @@ database_create_version_backup() {
         database_abort_rollback || true
         return 1
     fi
-    if ! $SUDO cat "$dump_file" \
-        | installer_run_live_compose exec -T timescaledb \
-        sh -ceu 'exec pg_restore --list' >> "$LOG_FILE" 2>&1; then
-        fail "PostgreSQL recovery dump failed archive validation."
+    {
+        $SUDO cat "$dump_file" 2>> "$LOG_FILE" \
+            | database_read_archive_then_drain \
+                installer_run_live_compose exec -T timescaledb \
+                sh -ceu 'exec pg_restore --list' >> "$LOG_FILE" 2>&1
+        archive_status=("${PIPESTATUS[@]}")
+    } || true
+    if ! database_archive_feed_status_is_ok "${archive_status[0]:-1}" \
+        || [[ "${archive_status[1]:-1}" != 0 ]]; then
+        # Name both halves. "failed archive validation" alone is what made the
+        # production abort unreadable: the complete table of contents had
+        # already printed, so the archive was demonstrably fine and only the
+        # status was wrong.
+        fail "PostgreSQL recovery dump failed archive validation (feeder=${archive_status[0]:-unset} reader=${archive_status[1]:-unset})."
         database_discard_backup_staging || true
         database_abort_rollback || true
         return 1
@@ -10665,12 +10751,13 @@ database_validate_rollback_backup() {
     if [[ -z "$validation_error" ]]; then
         {
             $SUDO cat "$snapshot_dump" 2>> "$LOG_FILE" \
-                | installer_run_live_compose exec -T timescaledb \
+                | database_read_archive_then_drain \
+                    installer_run_live_compose exec -T timescaledb \
                     sh -ceu 'exec pg_restore --list' >> "$LOG_FILE" 2>&1
             archive_status=("${PIPESTATUS[@]}")
         } || true
-        if [[ "${archive_status[0]:-1}" != 0 \
-            || "${archive_status[1]:-1}" != 0 ]]; then
+        if ! database_archive_feed_status_is_ok "${archive_status[0]:-1}" \
+            || [[ "${archive_status[1]:-1}" != 0 ]]; then
             validation_error="Rollback backup archive validation failed; the active database was not changed."
         fi
     fi
@@ -10707,6 +10794,140 @@ WHERE datname IN (:'active_database', :'replacement_database')
 SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'safety_database') \gexec
 SELECT format('ALTER DATABASE %I RENAME TO %I', :'replacement_database', :'active_database') \gexec
 SQL
+}
+
+# Physically clone the live database instead of rebuilding it from a logical
+# dump (#1757). A forward upgrade must never let the new binary migrate the
+# ORIGINAL database, because sqlx refuses to start an older binary against a
+# database carrying migrations it does not know. The original therefore has to
+# be preserved untouched — but a full pg_dump plus pg_restore inside the
+# proxy-stopped window took production down for ~35 minutes on an 11 GB
+# database. `CREATE DATABASE ... TEMPLATE` copies the data directory at the
+# filesystem layer instead, which is bounded by disk throughput rather than by
+# SQL replay.
+#
+# ALLOW_CONNECTIONS false BEFORE the copy is load-bearing. CREATE DATABASE
+# requires that no other session is connected to the template, and TimescaleDB
+# starts a per-database background worker that reconnects within seconds of
+# being terminated. Terminating alone therefore loses the race; the database
+# must be closed to new connections first, then drained again.
+#
+# The replacement keeps a distinct name and is renamed into place afterwards so
+# database_recover_interrupted_rollback still reasons about exactly the same
+# intermediate states as the dump-and-restore swap it replaces.
+database_clone_active_database() {
+    local active_database="$1"
+    local replacement_database="$2"
+    local safety_database="$3"
+    database_recovery_identifier_is_safe "$active_database" || return 1
+    database_recovery_identifier_is_safe "$replacement_database" || return 1
+    database_recovery_identifier_is_safe "$safety_database" || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="active_database=${active_database}" \
+        --set="replacement_database=${replacement_database}" \
+        --set="safety_database=${safety_database}" \
+        >> "$LOG_FILE" 2>&1 <<'SQL'
+\set ON_ERROR_STOP on
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname IN (:'active_database', :'replacement_database', :'safety_database')
+  AND pid <> pg_backend_pid();
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'safety_database') \gexec
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS false', :'safety_database') \gexec
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = :'safety_database' AND pid <> pg_backend_pid();
+SELECT format('CREATE DATABASE %I TEMPLATE %I', :'replacement_database', :'safety_database') \gexec
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'replacement_database', :'active_database') \gexec
+SQL
+}
+
+# Re-open the frozen safety database so the deferred rollback dump can connect.
+database_allow_safety_database_connections() {
+    local safety_database="$1"
+    database_recovery_identifier_is_safe "$safety_database" || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="safety_database=${safety_database}" \
+        >> "$LOG_FILE" 2>&1 <<'SQL'
+\set ON_ERROR_STOP on
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS true', :'safety_database')
+WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database') \gexec
+SQL
+}
+
+# A physical clone needs room for a second copy of the data directory on the
+# database volume. check_disk is a fixed 10 GB budget against INSTALL_DIR,
+# called with `|| true`, and never inspects the docker volume the data
+# directory actually lives on — it cannot answer this question. Refuse before
+# the proxy is quiesced so a headroom failure costs no downtime at all.
+database_require_clone_headroom() {
+    local database="$1"
+    local size_bytes data_directory df_output free_kb free_bytes required_bytes
+    if ! database_recovery_identifier_is_safe "$database"; then
+        fail "Refusing to size an unsafe database identifier before the upgrade clone."
+        return 1
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    size_bytes=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="target_database=${database}" \
+        2>> "$LOG_FILE" <<'SQL'
+SELECT pg_database_size(:'target_database');
+SQL
+    ) || {
+        fail "Could not measure the database size before the forward-upgrade clone."
+        return 1
+    }
+    size_bytes=$(printf '%s' "$size_bytes" | tr -d '[:space:]')
+    if [[ ! "$size_bytes" =~ ^[0-9]+$ ]]; then
+        fail "Database size probe did not return a byte count before the forward-upgrade clone."
+        return 1
+    fi
+
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    data_directory=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 --command="SHOW data_directory"' \
+        </dev/null 2>> "$LOG_FILE") || {
+        fail "Could not locate the database data directory before the forward-upgrade clone."
+        return 1
+    }
+    data_directory=$(printf '%s' "$data_directory" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if ! database_recovery_install_dir_is_safe "$data_directory"; then
+        fail "Database data directory is not a safe absolute path; refusing the forward-upgrade clone."
+        return 1
+    fi
+
+    # `df` runs in the container because the volume is only mounted there; the
+    # output is parsed on the host so container output never becomes shell.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    df_output=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec df -Pk -- "$1"' sh "$data_directory" </dev/null 2>> "$LOG_FILE") || {
+        fail "Could not read free space on the database volume before the forward-upgrade clone."
+        return 1
+    }
+    free_kb=$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $4 }')
+    free_kb=$(printf '%s' "$free_kb" | tr -d '[:space:]')
+    if [[ ! "$free_kb" =~ ^[0-9]+$ ]]; then
+        fail "Free space on the database volume could not be parsed before the forward-upgrade clone."
+        return 1
+    fi
+
+    free_bytes=$(( free_kb * 1024 ))
+    # 1.2x: the clone is a byte-for-byte copy plus WAL written while it runs.
+    required_bytes=$(( size_bytes * 12 / 10 ))
+    if (( free_bytes < required_bytes )); then
+        fail "Insufficient database volume headroom for the forward-upgrade clone."
+        fail "  Database: $(( size_bytes / 1024 / 1024 )) MiB at ${data_directory}"
+        fail "  Required: $(( required_bytes / 1024 / 1024 )) MiB free (1.2x)"
+        fail "  Available: $(( free_bytes / 1024 / 1024 )) MiB"
+        fail "The proxy was not stopped; free space on the database volume and retry."
+        return 1
+    fi
+    info "Database volume headroom verified for the forward-upgrade clone: $(( free_bytes / 1024 / 1024 )) MiB free for a $(( size_bytes / 1024 / 1024 )) MiB database"
 }
 
 database_drop_replacement_database() {
@@ -10813,16 +11034,20 @@ database_stage_validated_backup_for_swap() {
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     {
         $SUDO cat "$VALIDATED_DATABASE_BACKUP_DUMP_PATH" 2>> "$LOG_FILE" \
-            | installer_run_live_compose exec -T timescaledb \
+            | database_read_archive_then_drain \
+                installer_run_live_compose exec -T timescaledb \
                 sh -ceu 'exec pg_restore --exit-on-error --single-transaction --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$1"' \
                 sh "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
                 >> "$LOG_FILE" 2>&1
         restore_status=("${PIPESTATUS[@]}")
     } || true
-    if [[ "${restore_status[0]:-1}" != 0 \
-        || "${restore_status[1]:-1}" != 0 ]]; then
+    # A pg_restore that stops reading — because it finished, or because
+    # --exit-on-error aborted it — SIGPIPEs the feeder. Its own status below
+    # is what decides success, so the feeder's 141 is never load-bearing.
+    if ! database_archive_feed_status_is_ok "${restore_status[0]:-1}" \
+        || [[ "${restore_status[1]:-1}" != 0 ]]; then
         database_close_validated_backup_dump || true
-        fail "${operation_label} restore failed in the isolated staging database; the active database was not changed."
+        fail "${operation_label} restore failed in the isolated staging database (feeder=${restore_status[0]:-unset} reader=${restore_status[1]:-unset}); the active database was not changed."
         database_abort_rollback || true
         return 1
     fi
@@ -10880,21 +11105,89 @@ database_restore_version_backup() {
         "Rollback" "llap_restore" "llap_pre_rollback"
 }
 
+# Forward upgrades no longer rebuild the database from a logical dump on the
+# critical path (#1757). The rollback target is produced by a physical clone,
+# and the durable dump is published later, from the frozen safety database,
+# only after the target has proven healthy — see
+# database_publish_frozen_safety_dump.
 database_prepare_forward_upgrade() {
     local source_version="$1"
     local target_version="$2"
-    local backup_id="$3"
+    local database timestamp source_migration
 
-    if ! database_validate_rollback_backup "$backup_id" "$source_version" "$target_version"; then
+    if ! is_stable_semver "$source_version" \
+        || ! is_stable_semver "$target_version"; then
         database_abort_rollback || true
         return 1
     fi
+    if ! database=$(database_install_identifier); then
+        database_abort_rollback || true
+        return 1
+    fi
+
+    # Before the proxy stops: a headroom failure must cost zero downtime.
+    #
+    # It must still restore the source deploy tree. By the time this runs,
+    # run_deploy has already executed deploy_extract_files, deploy_upgrade_env,
+    # deploy_write_compose_command and deploy_pull_images, and journalled
+    # "deploy-mutating" — so docker-compose.yml, .env and compose-command.sh
+    # already point at the TARGET release while the OLD stack is still running.
+    # The systemd unit is `ExecStart=${INSTALL_DIR}/compose-command.sh up -d`,
+    # so a reboot, a `systemctl restart llm-api-proxy`, or any container restart
+    # in that window would start the NEW binary against the ORIGINAL, un-cloned
+    # production database. sqlx would then apply the new migrations to the live
+    # database — precisely the irreversible state this whole clone-the-database
+    # design exists to prevent — and because the durable dump is now deferred
+    # until after the health gate, there would be no pre-upgrade dump either.
+    if ! database_require_clone_headroom "$database"; then
+        database_abort_rollback || true
+        return 1
+    fi
+
     DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
-    if ! database_stage_validated_backup_for_swap \
-        "Forward upgrade" "llap_upgrade" "llap_pre_upgrade"; then
+    if ! database_quiesce_proxy; then
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! source_migration=$(database_query_migration_version "$database"); then
+        fail "Could not read the current migration version before the forward-upgrade clone."
+        database_abort_rollback || true
+        return 1
+    fi
+
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE="llap_upgrade_${timestamp}_$$"
+    DATABASE_ROLLBACK_SAFETY_DATABASE="llap_pre_upgrade_${timestamp}_$$"
+    if ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
+        || ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
+        fail "Forward upgrade database staging identity is unsafe."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_write_recovery_journal "staging"; then
+        fail "Could not persist Forward upgrade database staging identity."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_remove_quiesced_proxy_container; then
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_write_recovery_journal "swap-active"; then
+        fail "Could not persist Forward upgrade database swap identity before mutation."
+        database_abort_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="true"
+    if ! database_clone_active_database "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
+        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
+        "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
+        fail "Forward upgrade database clone failed; attempting automatic recovery."
+        database_recover_interrupted_rollback || true
         return 1
     fi
     DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="true"
+    info "Forward upgrade cloned the source database at migration ${source_migration}"
 }
 
 database_recover_interrupted_rollback() {
@@ -10919,6 +11212,8 @@ SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'failed_dat
 WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database')
   AND EXISTS (SELECT 1 FROM pg_database WHERE datname = :'active_database')
   AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'failed_database') \gexec
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS true', :'safety_database')
+WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database') \gexec
 SELECT format('ALTER DATABASE %I RENAME TO %I', :'safety_database', :'active_database')
 WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database')
   AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'active_database') \gexec
@@ -10986,13 +11281,83 @@ database_complete_forward_upgrade_transition() {
     fi
     DATABASE_ROLLBACK_SWAP_ACTIVE="false"
     DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    if ! database_publish_frozen_safety_dump; then
+        return 1
+    fi
     if ! database_drop_forward_upgrade_safety_database; then
         return 1
     fi
     database_discard_source_deploy_snapshot
 }
 
+# Publish the durable rollback dump AFTER the target has proven healthy, from
+# the frozen safety database rather than from the live one (#1757). The dump is
+# still required — it is the only artifact that survives the safety database
+# being dropped — but it no longer has to sit inside the proxy-stopped window,
+# because the bytes it reads can no longer change.
+#
+# The safety database was closed to connections by the clone, so reopen it, and
+# put TimescaleDB into pre-restore mode first so retention and compression
+# policies cannot mutate the frozen artifact while pg_dump reads it.
+database_publish_frozen_safety_dump() {
+    local safety_database="${DATABASE_ROLLBACK_SAFETY_DATABASE:-}"
+    local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-}"
+    local target_version=""
+    [[ -n "$safety_database" ]] || return 0
+    if ! database_recovery_identifier_is_safe "$safety_database"; then
+        fail "Refusing to dump an unsafe forward-upgrade safety database identifier."
+        return 1
+    fi
+    # The INSTALLED version is authoritative here, not $OPT_VERSION.
+    #
+    # deploy_write_metadata has already published the target by the time this
+    # boundary is reachable, so existing_install_version is what actually got
+    # deployed. $OPT_VERSION is not: this point is re-entered on a resumed run
+    # (process or host loss between "forward-target-healthy" and the dump), and
+    # the recovery reconciler runs BEFORE target-argument validation — so an
+    # operator resuming with a different --version would stamp that version into
+    # the manifest. database_validate_rollback_backup requires
+    # `.target_version == <currently installed version>`, so such an artifact can
+    # never be used, and database_drop_forward_upgrade_safety_database destroys
+    # the safety database immediately afterwards. Rollback capability would be
+    # lost silently, behind a success message.
+    target_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$target_version" \
+        || target_version="${OPT_VERSION:-}"
+    if ! is_stable_semver "$source_version" \
+        || ! is_stable_semver "$target_version"; then
+        fail "Forward-upgrade rollback dump has no stable version identity; the source safety database is retained."
+        return 1
+    fi
+
+    DATABASE_DURABLE_DUMP_IN_PROGRESS="true"
+    step "  Publishing the rollback dump from the frozen source database..."
+    if ! database_allow_safety_database_connections "$safety_database"; then
+        fail "Could not reopen the frozen source database for the rollback dump."
+        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+        return 1
+    fi
+    if ! database_run_timescaledb_restore_lifecycle \
+        "$safety_database" "pre-restore"; then
+        fail "Could not suspend TimescaleDB background jobs on the frozen source database."
+        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+        return 1
+    fi
+    if ! database_create_version_backup "$source_version" "$target_version" \
+        "pre-upgrade" "$safety_database"; then
+        fail "Rollback dump failed; the source safety database is retained for operator recovery."
+        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+        return 1
+    fi
+    DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+    info "Retain rollback backup ID: ${CREATED_DATABASE_BACKUP_ID}"
+}
+
 database_abort_rollback() {
+    # The durable dump runs inside database_complete_forward_upgrade_transition,
+    # which is one of this function's own branches. Without this guard a dump
+    # failure re-enters that branch and recurses without bound.
+    [[ "${DATABASE_DURABLE_DUMP_IN_PROGRESS:-false}" != "true" ]] || return 1
     database_close_validated_backup_dump || true
     database_discard_backup_staging || true
     database_discard_restore_staging || true
@@ -11163,11 +11528,9 @@ deploy_handle_database_transition() {
         database_restore_version_backup "$installed_version" "$OPT_VERSION" \
             "$OPT_ROLLBACK_BACKUP_ID"
     elif stable_semver_gt "$OPT_VERSION" "$installed_version"; then
-        database_create_version_backup "$installed_version" "$OPT_VERSION" "pre-upgrade" \
-            || return 1
         database_prepare_forward_upgrade "$installed_version" "$OPT_VERSION" \
-            "$CREATED_DATABASE_BACKUP_ID" || return 1
-        info "Retain rollback backup ID: ${CREATED_DATABASE_BACKUP_ID}"
+            || return 1
+        info "Rollback dump publishes from the frozen source database after the target proves healthy; retain the backup ID printed then."
     elif stable_semver_gt "$installed_version" "$OPT_VERSION"; then
         fail "Database rollback backup is required before starting an older binary."
         return 1
