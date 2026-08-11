@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.136"
+INSTALLER_VERSION="0.0.137"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -12298,10 +12298,30 @@ database_publish_restic_recovery_manifest() {
     info "Recovery record: ${backup_id}"
 }
 
+# True (exit 0) only when a query against `postgres` positively confirms the
+# named database does not exist. False (exit 1) for a connectivity or
+# permission failure too — "confirmed absent" must never be inferred from "the
+# check itself failed". Connects to the `postgres` maintenance database, never
+# to the target, so it works whether or not the target exists.
+database_confirmed_absent() {
+    local database="$1"
+    local result
+    database_recovery_identifier_is_safe "$database" || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    result=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="absence_check_database=${database}" \
+        2>> "$LOG_FILE" <<'SQL'
+SELECT NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'absence_check_database');
+SQL
+    ) || return 1
+    [[ "$result" == "t" ]]
+}
+
 # Publish the durable rollback artifact AFTER the target has proven healthy.
 #
-# The artifact IS the frozen safety database that database_clone_active_database
-# already produced, so publishing it is a few hundred bytes of manifest instead
+# The artifact IS the frozen safety database the forward upgrade's physical
+# clone produced, so publishing it is a few hundred bytes of manifest instead
 # of an O(database size) pg_dump. That dump was the defect: it was unbudgeted,
 # ran against the same volume PostgreSQL lives on, and on 2026-08-03 could not
 # complete against a 33 GB source with 8.5 GB free — pinning the safety database
@@ -12310,10 +12330,18 @@ database_publish_restic_recovery_manifest() {
 # The one thing that must be read from inside the frozen database is its
 # migration version. Prefer the value the forward upgrade already recorded in
 # the journal; only when that is absent (a v3 journal written by an older
-# release, which is exactly production's resumed state) reopen it for a single
-# round trip and close it again. An artifact left open is one TimescaleDB
-# retention cycle away from being silently gutted, so the re-freeze is not
-# optional and its failure is fatal.
+# release) reopen it for a single round trip and close it again. An artifact
+# left open is one TimescaleDB retention cycle away from being silently
+# gutted, so the re-freeze is not optional and its failure is fatal.
+#
+# A v3 journal's safety database can also be CONFIRMED gone — not a read
+# failure, a positive "no such row in pg_database" — when an operator removed
+# it out-of-band after the installer got stuck (exactly production's
+# 2026-08-11 state, #1780: the database named in the stuck journal was
+# permanently released to unblock the same upgrade this function is trying to
+# complete). There is nothing left to publish an artifact from. Treat that as
+# "no artifact for this already-superseded transition", not as a failure —
+# the alternative is a journal that can never reconcile again.
 database_publish_frozen_safety_artifact() {
     local safety_database="${DATABASE_ROLLBACK_SAFETY_DATABASE:-}"
     local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-}"
@@ -12364,6 +12392,13 @@ database_publish_frozen_safety_artifact() {
             return 1
         fi
         if [[ ! "$migration_version" =~ ^[0-9]+$ ]]; then
+            if database_confirmed_absent "$safety_database"; then
+                warn "Forward-upgrade safety database ${safety_database} no longer exists; no rollback artifact can be published for this already-superseded transition."
+                DATABASE_ROLLBACK_BACKUP_STAGING_DIR=""
+                DATABASE_ROLLBACK_SAFETY_DATABASE=""
+                DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+                return 0
+            fi
             fail "Could not read the migration version of the frozen source database; it is retained for operator recovery."
             return 1
         fi
