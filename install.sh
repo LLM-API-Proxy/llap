@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.135"
+INSTALLER_VERSION="0.0.136"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -1057,6 +1057,8 @@ OPT_SKIP_SECURITY_UPDATES="false"
 OPT_SKIP_CHECKSUM="false"
 OPT_VERIFY_SELF_CHECKSUM="false"
 OPT_ROLLBACK_BACKUP_ID=""
+OPT_RELEASE_ROLLBACK_ARTIFACT=""
+OPT_ACCEPT_NO_RECOVERY_POINT="false"
 RELEASE_IMAGE_LOCK_ACTIVE="false"
 RELEASE_IMAGE_LOCK_FROM_EXISTING="false"
 RELEASE_IMAGE_LOCK_VERSION=""
@@ -1100,12 +1102,26 @@ DATABASE_ROLLBACK_RECOVERY_PHASE=""
 DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION=""
 DATABASE_ROLLBACK_TIMESCALEDB_BIND_SOURCE=""
 DATABASE_ROLLBACK_TIMESCALEDB_BIND_IDENTITY=""
-DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
-# Recursion guard for the deferred post-health rollback dump. The dump runs
-# from inside database_complete_forward_upgrade_transition, which is itself one
-# of database_abort_rollback's branches — without this flag a dump failure
-# re-enters the same branch forever.
-DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+# True once this run has crossed the in-place migration boundary and owes the
+# post-health transition. It is NOT a swap flag: nothing is swapped any more.
+DATABASE_FORWARD_UPGRADE_ACTIVE="false"
+# The restic snapshot recorded as the recovery point for an in-place upgrade.
+DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
+DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+# Identity of the frozen rollback artifact a rollback is adopting, and the
+# migration version read before the upgrade.
+DATABASE_ROLLBACK_SOURCE_MIGRATION=""
+DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="false"
+VALIDATED_DATABASE_BACKUP_KIND=""
+VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE=""
+# Re-entrancy guard for the post-health forward transition. The transition is
+# itself one of database_abort_rollback's branches, and `trap cleanup EXIT`
+# calls database_abort_rollback — so a failed transition would otherwise be
+# re-run in full by the installer's own exit path (#1762). It is set on entry
+# and cleared ONLY on the success path: a failed transition must stay latched
+# for the remaining life of the process. A fresh process starts with it false,
+# so an operator re-run still resumes normally.
+DATABASE_FORWARD_TRANSITION_IN_PROGRESS="false"
 
 # Feature toggles
 # WAF defaults to off — the Traefik modsecurity plugin requires command-line
@@ -1220,6 +1236,18 @@ General:
   --verify-self-checksum  Verify the embedded installer payload and exit
   --rollback-backup=ID    Restore the named installer-created database backup
                           when targeting an older stable version
+  --release-rollback-artifact=ID
+                          Permanently release the named rollback artifact
+                          before the upgrade, reclaiming its disk. Required
+                          only when the upgrade headroom gate names it, and it
+                          gives up the ability to roll back to that artifact's
+                          source version. Upgrade command only.
+  --accept-no-recovery-point
+                          Upgrade in place even though no PostgreSQL snapshot
+                          exists to restore from. An in-place migration cannot
+                          be reversed by the installer, so this leaves the
+                          upgrade with no way back. Take a backup instead
+                          unless you are certain. Upgrade command only.
 
 Authentication:
   --github-token=TOKEN    GitHub PAT for authenticated GHCR access
@@ -1418,6 +1446,8 @@ parse_args() {
             --verify-self-checksum)
                 OPT_VERIFY_SELF_CHECKSUM="true" ;;
             --rollback-backup=*) OPT_ROLLBACK_BACKUP_ID="${1#*=}" ;;
+            --release-rollback-artifact=*) OPT_RELEASE_ROLLBACK_ARTIFACT="${1#*=}" ;;
+            --accept-no-recovery-point) OPT_ACCEPT_NO_RECOVERY_POINT="true" ;;
             --version=*)          OPT_VERSION="${1#*=}"; OPT_VERSION="${OPT_VERSION#v}" ;;
             --install-dir=*)      OPT_INSTALL_DIR="${1#*=}" ;;
             --non-interactive)    OPT_NON_INTERACTIVE="true" ;;
@@ -5319,6 +5349,34 @@ configure_database_recovery_contract() {
     fi
 }
 
+# --release-rollback-artifact destroys a rollback path, so the ID is validated
+# against the published artifacts here — before any deployment mutation — and
+# never treated as a path. An ID that does not resolve is refused rather than
+# silently ignored: an operator who mistypes it must not discover that the
+# upgrade proceeded without freeing anything, or that a DIFFERENT artifact went.
+configure_rollback_artifact_release_contract() {
+    local rollback_root="${METADATA_DIR}/database-rollback"
+    [[ -n "$OPT_RELEASE_ROLLBACK_ARTIFACT" ]] || return 0
+    [[ "$COMMAND" == "upgrade" ]] \
+        || die "--release-rollback-artifact is valid only with the upgrade command."
+    database_backup_id_is_safe "$OPT_RELEASE_ROLLBACK_ARTIFACT" \
+        || die "--release-rollback-artifact must be an installer-issued backup ID, not a path."
+    [[ -z "$OPT_ROLLBACK_BACKUP_ID" ]] \
+        || die "--release-rollback-artifact cannot be combined with --rollback-backup."
+    $SUDO test -s "${rollback_root}/${OPT_RELEASE_ROLLBACK_ARTIFACT}/manifest.json" \
+        || die "--release-rollback-artifact=${OPT_RELEASE_ROLLBACK_ARTIFACT} does not name a published rollback artifact. If it has already been released, re-run without the flag."
+}
+
+# --accept-no-recovery-point gives up the only way back from an in-place
+# migration, so it is refused anywhere it cannot mean that. Scoping it to the
+# upgrade command keeps it from sitting unnoticed in an operator's install
+# script and silently applying to a later upgrade.
+configure_accept_no_recovery_point_contract() {
+    [[ "${OPT_ACCEPT_NO_RECOVERY_POINT:-false}" == "true" ]] || return 0
+    [[ "$COMMAND" == "upgrade" ]] \
+        || die "--accept-no-recovery-point is valid only with the upgrade command."
+}
+
 configure_version() {
     if [[ -n "$OPT_VERSION" ]]; then
         info "Version: ${OPT_VERSION} (from CLI/env)"
@@ -5801,6 +5859,8 @@ run_configure() {
     configure_install_mode
     configure_version
     configure_database_recovery_contract
+    configure_rollback_artifact_release_contract
+    configure_accept_no_recovery_point_contract
     configure_features
     configure_debug_profile
     configure_core
@@ -6269,6 +6329,12 @@ deploy_extract_files() {
         # loads must be deployed or Prometheus fails to start (#1390).
         extract_file EMBED_prometheus_rules_llap_sse_health_yml \
             "${INSTALL_DIR}/docker/prometheus/rules/llap-sse-health.yml" \
+            0644 true prometheus
+        # Backup health alerting (#1758). Without this file the entire backup
+        # alert group is absent on the installed host — Prometheus globs
+        # rule_files and silently ignores a pattern matching nothing.
+        extract_file EMBED_prometheus_rules_llap_backup_health_yml \
+            "${INSTALL_DIR}/docker/prometheus/rules/llap-backup-health.yml" \
             0644 true prometheus
         extract_file EMBED_grafana_dashboard_yml \
             "${INSTALL_DIR}/docker/grafana/provisioning/dashboards/dashboard.yml" \
@@ -7999,7 +8065,7 @@ database_write_recovery_journal() {
     local phase="$1"
     local rollback_root journal journal_staging suffix
     case "$phase" in
-        deploy-files-mutating|deploy-mutating|deploy-stack-stopped|staging|swap-active|forward-target-healthy|target-healthy) ;;
+        deploy-files-mutating|deploy-mutating|deploy-stack-stopped|staging|swap-active|target-migrating-in-place|forward-target-healthy|target-healthy) ;;
         *) return 1 ;;
     esac
     is_stable_semver "$DATABASE_ROLLBACK_SOURCE_VERSION" || return 1
@@ -8018,7 +8084,15 @@ database_write_recovery_journal() {
             || -n "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" ) ]]; then
         database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE" || return 1
         database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" || return 1
-    elif [[ "$phase" == "forward-target-healthy" ]]; then
+    elif [[ "$phase" == "target-migrating-in-place" ]]; then
+        # Nothing is copied or swapped, so naming either database here would be
+        # a lie the recovery path could act on.
+        [[ -z "$DATABASE_ROLLBACK_SAFETY_DATABASE" \
+            && -z "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" ]] || return 1
+    elif [[ "$phase" == "forward-target-healthy" \
+        && ( -n "$DATABASE_ROLLBACK_SAFETY_DATABASE" \
+            || -n "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" ) ]]; then
+        # A journal written by <= 0.0.135 names the frozen clone pair here.
         database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE" || return 1
         database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" || return 1
     elif [[ "$phase" == "target-healthy" \
@@ -8070,14 +8144,23 @@ database_write_recovery_journal() {
         --arg active_database "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
         --arg safety_database "$DATABASE_ROLLBACK_SAFETY_DATABASE" \
         --arg replacement_database "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
-        '{format_version: 3, phase: $phase, source_version: $source_version,
+        --arg source_migration "$DATABASE_ROLLBACK_SOURCE_MIGRATION" \
+        --arg recovery_snapshot_id "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID" \
+        --arg recovery_snapshot_time "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME" \
+        --arg replacement_is_adopted \
+            "$DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT" \
+        '{format_version: 4, phase: $phase, source_version: $source_version,
           install_dir: $install_dir, metadata_path: $metadata_path,
           snapshot_path: $snapshot_path,
           timescaledb_bind_source: $timescaledb_bind_source,
           timescaledb_bind_identity: $timescaledb_bind_identity,
           active_database: $active_database,
           safety_database: $safety_database,
-          replacement_database: $replacement_database}' \
+          replacement_database: $replacement_database,
+          source_migration: $source_migration,
+          recovery_snapshot_id: $recovery_snapshot_id,
+          recovery_snapshot_time: $recovery_snapshot_time,
+          replacement_is_adopted_artifact: ($replacement_is_adopted == "true")}' \
         | $SUDO /usr/bin/tee "$journal_staging" >/dev/null \
         || ! $SUDO chmod 0600 "$journal_staging" \
         || ! installer_durable_sync_path "$journal_staging" \
@@ -8089,7 +8172,7 @@ database_write_recovery_journal() {
     fi
     DATABASE_ROLLBACK_JOURNAL_STAGING_FILE=""
     DATABASE_ROLLBACK_RECOVERY_PHASE="$phase"
-    DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION="3"
+    DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION="4"
 }
 
 database_legacy_recovery_install_dir() {
@@ -8131,6 +8214,8 @@ database_load_recovery_journal() {
     local metadata_path snapshot_path
     local timescaledb_bind_source timescaledb_bind_identity
     local active_database safety_database replacement_database
+    local source_migration replacement_is_adopted
+    local recovery_snapshot_id recovery_snapshot_time
     rollback_root="${METADATA_DIR}/database-rollback"
     journal=$(database_recovery_journal_path)
     if ! $SUDO test -f "$journal" || $SUDO test -L "$journal"; then
@@ -8140,20 +8225,29 @@ database_load_recovery_journal() {
         $SUDO cat "$journal" | jq -er '
           if (
             (.format_version == 1 or .format_version == 2 or
-             .format_version == 3) and
+             .format_version == 3 or .format_version == 4) and
             (.phase == "deploy-files-mutating" or
              .phase == "deploy-mutating" or
              .phase == "deploy-stack-stopped" or .phase == "staging" or
-             .phase == "swap-active" or .phase == "forward-target-healthy" or
+             .phase == "swap-active" or
+             .phase == "target-migrating-in-place" or
+             .phase == "forward-target-healthy" or
              .phase == "target-healthy") and
             (.source_version | type == "string" and test("^[0-9]+[.][0-9]+[.][0-9]+$")) and
-            (if (.format_version == 2 or .format_version == 3) then
+            (if (.format_version >= 2) then
                 (.install_dir | type == "string" and startswith("/") and
                   . != "/" and (contains("\\") | not) and
                   (contains("\t") | not) and (contains("\r") | not) and
                   (contains("\n") | not))
              else true end) and
-            (if .format_version == 3 then
+            (if (.format_version >= 4) then
+                (.source_migration | type == "string" and test("^[0-9]*$")) and
+                (.recovery_snapshot_id | type == "string" and
+                    test("^([0-9a-f]{8,64})?$")) and
+                (.recovery_snapshot_time | type == "string") and
+                (.replacement_is_adopted_artifact | type == "boolean")
+             else true end) and
+            (if (.format_version >= 3) then
                 (.timescaledb_bind_source | type == "string") and
                 (.timescaledb_bind_identity | type == "string") and
                 ((.timescaledb_bind_source == "" and
@@ -8178,9 +8272,12 @@ database_load_recovery_journal() {
                 ((.safety_database == "" and .replacement_database == "") or
                  ((.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
                   (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))))
+             elif .phase == "target-migrating-in-place" then
+                .safety_database == "" and .replacement_database == ""
              elif .phase == "forward-target-healthy" then
-                (.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
-                (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))
+                ((.safety_database == "" and .replacement_database == "") or
+                 ((.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                  (.replacement_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$"))))
              elif .phase == "target-healthy" then
                 ((.safety_database == "" and .replacement_database == "") or
                  ((.safety_database | test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
@@ -8191,16 +8288,27 @@ database_load_recovery_journal() {
              end))
           then [
             (.format_version | tostring), .phase, .source_version,
-            (if (.format_version == 2 or .format_version == 3) then .install_dir
+            (if (.format_version >= 2) then .install_dir
              else "__LEGACY_V1__" end),
             .metadata_path, .snapshot_path,
-            (if .format_version == 3 and
+            (if (.format_version >= 3) and
                 .timescaledb_bind_source != ""
              then .timescaledb_bind_source else "__NO_BIND__" end),
-            (if .format_version == 3 and
+            (if (.format_version >= 3) and
                 .timescaledb_bind_identity != ""
              then .timescaledb_bind_identity else "__NO_BIND__" end),
-            .active_database, .safety_database, .replacement_database
+            .active_database,
+            (if .safety_database == "" then "-" else .safety_database end),
+            (if .replacement_database == "" then "-"
+             else .replacement_database end),
+            (if (.format_version >= 4) and .source_migration != ""
+             then .source_migration else "-" end),
+            (if (.format_version >= 4) and .recovery_snapshot_id != ""
+             then .recovery_snapshot_id else "-" end),
+            (if (.format_version >= 4) and .recovery_snapshot_time != ""
+             then .recovery_snapshot_time else "-" end),
+            (if (.format_version >= 4) and .replacement_is_adopted_artifact
+             then "true" else "false" end)
           ] | @tsv
           else error("invalid recovery journal")
           end'
@@ -8208,10 +8316,23 @@ database_load_recovery_journal() {
         fail "Pending database recovery journal is malformed; refusing deployment."
         return 1
     fi
+    # Every projected field above is non-empty by construction, and that is
+    # load-bearing: TAB is an IFS *whitespace* character, so `read` collapses a
+    # run of consecutive empty fields into one and silently shifts every value
+    # after it into the wrong variable. The "-" sentinels below cannot be
+    # smuggled in through the journal — the schema rejects "-" for each field
+    # that uses one — so they are unambiguous on the way back out.
     IFS=$'\t' read -r format_version phase source_version install_dir \
         metadata_path snapshot_path \
         timescaledb_bind_source timescaledb_bind_identity \
-        active_database safety_database replacement_database <<< "$journal_fields"
+        active_database safety_database replacement_database \
+        source_migration recovery_snapshot_id recovery_snapshot_time \
+        replacement_is_adopted <<< "$journal_fields"
+    [[ "$safety_database" != "-" ]] || safety_database=""
+    [[ "$replacement_database" != "-" ]] || replacement_database=""
+    [[ "$source_migration" != "-" ]] || source_migration=""
+    [[ "$recovery_snapshot_id" != "-" ]] || recovery_snapshot_id=""
+    [[ "$recovery_snapshot_time" != "-" ]] || recovery_snapshot_time=""
     if [[ "$(dirname -- "$snapshot_path")" != "$rollback_root" ]] \
         || [[ "$(basename -- "$snapshot_path")" != .source-deploy-* ]]; then
         fail "Pending database recovery journal references an unsafe source snapshot."
@@ -8265,12 +8386,28 @@ database_load_recovery_journal() {
     DATABASE_ROLLBACK_ACTIVE_DATABASE="$active_database"
     DATABASE_ROLLBACK_SAFETY_DATABASE="$safety_database"
     DATABASE_ROLLBACK_REPLACEMENT_DATABASE="$replacement_database"
+    # Absent in format 1/2/3, which is how a journal written by an older
+    # release resumes: an unknown source migration is re-read from the frozen
+    # artifact, and an unrecorded adoption flag means "not adopted", which is
+    # correct because no older release could have adopted anything.
+    if [[ "$source_migration" =~ ^[0-9]+$ ]]; then
+        DATABASE_ROLLBACK_SOURCE_MIGRATION="$source_migration"
+    else
+        DATABASE_ROLLBACK_SOURCE_MIGRATION=""
+    fi
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID="$recovery_snapshot_id"
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME="$recovery_snapshot_time"
+    if [[ "$replacement_is_adopted" == "true" ]]; then
+        DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="true"
+    else
+        DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="false"
+    fi
     if [[ "$phase" == "swap-active" ]]; then
         DATABASE_ROLLBACK_SWAP_ACTIVE="true"
     else
         DATABASE_ROLLBACK_SWAP_ACTIVE="false"
     fi
-    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    DATABASE_FORWARD_UPGRADE_ACTIVE="false"
     # The journal is the durable authority when live install metadata may
     # already have been renamed aside. Assign it before any deploy-tree check.
     INSTALL_DIR="$install_dir"
@@ -9263,6 +9400,58 @@ database_sweep_orphaned_source_snapshots() {
     done
 }
 
+# Sweep `.partial-<backup_id>-<pid>` rollback-artifact staging left by a
+# SIGKILLed installer.
+#
+# The in-process EXIT path covers the ordinary case, but a SIGKILL leaks the
+# directory — and until the pg_dump left the critical path each leak was a
+# partial multi-GB dump on the very volume this change exists to protect.
+# Sweepers exist for `.source-deploy-*`, `.rollback-failed-deploy-*`, image-lock
+# and compose-command staging; nothing swept this one.
+#
+# Like the source-snapshot sweeper this runs only on a fresh run (no recovery
+# journal, no staging directory owned by this process), so it can never remove
+# an in-flight allocation. `.partial-source-deploy-*` belongs to the snapshot
+# path and is skipped here.
+database_sweep_orphaned_backup_staging() {
+    local rollback_root="${METADATA_DIR%/}/database-rollback"
+    local journal candidate candidate_output name
+    local -a candidates=()
+    $SUDO test -d "$rollback_root" || return 0
+    [[ -z "${DATABASE_ROLLBACK_BACKUP_STAGING_DIR:-}" ]] || return 0
+    journal="$(database_recovery_journal_path)"
+    if $SUDO test -e "$journal" || $SUDO test -L "$journal"; then
+        return 1
+    fi
+    candidate_output="$(
+        $SUDO /usr/bin/find -P "$rollback_root" \
+            ! -path "$rollback_root" -prune \
+            -name '.partial-*' -print
+    )" || return 1
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        name="$(basename -- "$candidate")"
+        [[ "$name" != .partial-source-deploy-* ]] || continue
+        database_path_is_safe_direct_child \
+            "$rollback_root" "$candidate" ".partial-" || return 1
+        candidates+=("$candidate")
+    done <<< "$candidate_output"
+    for candidate in "${candidates[@]}"; do
+        if ! installer_private_staging_is_safe \
+            "$candidate" "directory" "700"; then
+            warn "Refusing to remove orphaned rollback artifact staging with unsafe ownership."
+            return 1
+        fi
+    done
+    for candidate in "${candidates[@]}"; do
+        if ! $SUDO rm -rf -- "$candidate"; then
+            warn "Could not remove orphaned rollback artifact staging."
+            return 1
+        fi
+        info "Removed orphaned rollback artifact staging: $(basename -- "$candidate")"
+    done
+}
+
 database_snapshot_source_deploy_state() {
     [[ "$DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED" != "true" ]] || return 0
     local rollback_root snapshot_dir staging_dir archive checksum
@@ -9355,7 +9544,8 @@ database_snapshot_source_deploy_state() {
         || $SUDO test -L "$rollback_root" \
         || ! installer_private_staging_is_safe \
             "$rollback_root" "directory" "700" \
-        || ! database_sweep_orphaned_source_snapshots; then
+        || ! database_sweep_orphaned_source_snapshots \
+        || ! database_sweep_orphaned_backup_staging; then
         fail "Could not authenticate and sweep orphaned source snapshots."
         return 1
     fi
@@ -10134,7 +10324,7 @@ database_discard_source_deploy_snapshot() {
     DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="false"
     DATABASE_ROLLBACK_INSTALL_DIR=""
     DATABASE_ROLLBACK_SOURCE_METADATA_PATH=""
-    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    DATABASE_FORWARD_UPGRADE_ACTIVE="false"
 }
 
 # Read and validate the database identifier from the installer-managed .env.
@@ -10614,6 +10804,94 @@ database_validated_dump_is_safe() {
         == "$VALIDATED_DATABASE_BACKUP_DUMP_IDENTITY" ]]
 }
 
+# Validate a kind == "database" rollback artifact: a frozen PostgreSQL database
+# rather than a dump file.
+#
+# All of it runs BEFORE the proxy is quiesced, so a bad artifact costs zero
+# downtime. There is deliberately no checksum and no `pg_restore --list`
+# equivalent: `pg_restore --list` proves only that a table of contents parses,
+# it costs a full re-read of the archive, and there is no cheap byte-identity
+# check for a live database — autovacuum wraparound processing touches
+# datallowconn = false databases, so size or checksum equality would be
+# brittle. The contract that IS enforced is stronger where it matters: the
+# database exists, nothing has been able to write to it since it was frozen,
+# and (after adoption, while the swap is still reversible by rename) its
+# migration history equals the manifest's.
+database_validate_database_rollback_artifact() {
+    local backup_id="$1"
+    local snapshot_manifest="$2"
+    local requested_version="$3"
+    local installed_version="$4"
+    local manifest_values="" artifact_database="" catalog_state=""
+    # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
+    if ! manifest_values="$(
+        set -o pipefail
+        $SUDO cat "$snapshot_manifest" \
+            | jq -er \
+                --arg backup_id "$backup_id" \
+                --arg requested "$requested_version" \
+                --arg installed "$installed_version" \
+                'if (.format_version == 2 and .kind == "database" and
+                     .backup_id == $backup_id and
+                     .source_version == $requested and
+                     .target_version == $installed and
+                     (.database | type == "string" and
+                         test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                     (.artifact_database | type == "string" and
+                         test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                     (.migration_version | type == "string" and
+                         test("^[0-9]+$")))
+                 then [.artifact_database, .migration_version, .database] | @tsv
+                 else error("rollback manifest mismatch")
+                 end' 2>> "$LOG_FILE"
+    )"; then
+        fail "Rollback artifact manifest does not match the requested recovery transition."
+        return 1
+    fi
+    IFS=$'\t' read -r artifact_database \
+        VALIDATED_DATABASE_BACKUP_MIGRATION \
+        DATABASE_ROLLBACK_ACTIVE_DATABASE <<< "$manifest_values"
+    if ! database_recovery_identifier_is_safe "$artifact_database" \
+        || [[ ! "$VALIDATED_DATABASE_BACKUP_MIGRATION" =~ ^[0-9]+$ ]] \
+        || ! database_recovery_identifier_is_safe \
+            "$DATABASE_ROLLBACK_ACTIVE_DATABASE"; then
+        fail "Rollback artifact manifest authority is malformed."
+        return 1
+    fi
+
+    # Catalog probe. Exactly one row, and still closed to connections: an
+    # artifact that has been reopened may have been written to, and nothing may
+    # have written to it since it was frozen.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    catalog_state=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="catalog_database=${artifact_database}" \
+        2>> "$LOG_FILE" <<'SQL'
+SELECT count(*) || ':' || COALESCE(bool_and(datallowconn)::text, 'none')
+FROM pg_database WHERE datname = :'catalog_database';
+SQL
+    ) || {
+        fail "Could not probe the rollback artifact database in the catalog."
+        return 1
+    }
+    catalog_state=$(printf '%s' "$catalog_state" | tr -d '[:space:]')
+    if [[ "$catalog_state" != "1:false" ]]; then
+        case "$catalog_state" in
+            0:*|:*|"")
+                fail "Rollback artifact database ${artifact_database} is absent; the artifact cannot be used." ;;
+            1:true)
+                fail "Rollback artifact database ${artifact_database} is open to connections and can no longer be trusted as frozen." ;;
+            *)
+                fail "Rollback artifact database ${artifact_database} is not a single frozen database (catalog reported '${catalog_state}')." ;;
+        esac
+        VALIDATED_DATABASE_BACKUP_MIGRATION=""
+        DATABASE_ROLLBACK_ACTIVE_DATABASE=""
+        return 1
+    fi
+    VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE="$artifact_database"
+    VALIDATED_DATABASE_BACKUP_KIND="database"
+}
+
 database_validate_rollback_backup() {
     local backup_id="$1"
     local requested_version="$2"
@@ -10622,13 +10900,15 @@ database_validate_rollback_backup() {
     local snapshot_dir="" suffix snapshot_manifest snapshot_dump
     local expected_uid expected_gid expected_metadata
     local manifest_identity="" dump_identity="" manifest_values=""
-    local capture_error="" validation_error=""
+    local capture_error="" validation_error="" artifact_kind=""
     local -a archive_status=()
 
     if ! database_close_validated_backup_dump; then
         fail "A prior validated rollback snapshot could not be removed."
         return 1
     fi
+    VALIDATED_DATABASE_BACKUP_KIND=""
+    VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE=""
     if ! database_backup_id_is_safe "$backup_id"; then
         fail "Rollback backup ID is invalid."
         return 1
@@ -10636,14 +10916,57 @@ database_validate_rollback_backup() {
     backup_dir="${METADATA_DIR}/database-rollback/${backup_id}"
     manifest="${backup_dir}/manifest.json"
     dump="${backup_dir}/database.dump"
-    if ! $SUDO test -d "$backup_dir" \
-        || ! $SUDO test -s "$manifest" || ! $SUDO test -s "$dump"; then
+    if ! $SUDO test -d "$backup_dir" || ! $SUDO test -s "$manifest"; then
         fail "Rollback backup not found or incomplete: ${backup_id}"
         return 1
     fi
-    if $SUDO test -L "$backup_dir" || $SUDO test -L "$manifest" \
-        || $SUDO test -L "$dump"; then
+    if $SUDO test -L "$backup_dir" || $SUDO test -L "$manifest"; then
         fail "Rollback backup contains a symbolic link and is rejected."
+        return 1
+    fi
+    # Which artifact shape is this? format_version 1 (or no kind) is the
+    # original dump artifact and keeps its entire validation and restore path,
+    # so pre-existing pre-upgrade-* directories on operator hosts stay usable.
+    # This probe only SELECTS a branch: each branch re-proves the shape from the
+    # root-only snapshot with a predicate that pins format_version and kind, so
+    # a manifest exchanged between the two reads fails closed either way.
+    # shellcheck disable=SC2016  # jq programs are intentionally single-quoted.
+    artifact_kind="$(
+        set -o pipefail
+        $SUDO cat "$manifest" 2>> "$LOG_FILE" \
+            | jq -er 'if (.format_version == 2 and .kind == "database")
+                      then "database"
+                      elif (.format_version == 3 and .kind == "restic")
+                      then "restic"
+                      elif .format_version == 1 then "dump"
+                      else error("unsupported rollback artifact kind") end' \
+                2>> "$LOG_FILE"
+    )" || {
+        fail "Rollback backup manifest does not declare a supported artifact kind: ${backup_id}"
+        return 1
+    }
+    # An in-place upgrade left no on-host artifact. Say so precisely, name the
+    # snapshot, and refuse — rather than accepting the flag and then failing
+    # somewhere less recoverable. Restoring a restic snapshot into production
+    # is a separately approved procedure, not an installer flag.
+    if [[ "$artifact_kind" == "restic" ]]; then
+        local recorded_snapshot=""
+        recorded_snapshot="$(
+            $SUDO cat "$manifest" 2>> "$LOG_FILE" \
+                | jq -r '.recovery_snapshot_id // ""' 2>> "$LOG_FILE"
+        )" || recorded_snapshot=""
+        fail "Rollback backup ${backup_id} records an in-place upgrade; there is no on-host artifact to restore."
+        if [[ -n "$recorded_snapshot" ]]; then
+            fail "  Its recovery point is restic snapshot ${recorded_snapshot}."
+        else
+            fail "  No recovery point was recorded for that upgrade."
+        fi
+        fail "  Restoring it is an operator procedure — see docs/runbooks/database-rollback.md."
+        return 1
+    fi
+    if [[ "$artifact_kind" == "dump" ]] \
+        && { ! $SUDO test -s "$dump" || $SUDO test -L "$dump"; }; then
+        fail "Rollback backup not found or incomplete: ${backup_id}"
         return 1
     fi
 
@@ -10676,31 +10999,45 @@ database_validate_rollback_backup() {
         capture_error="Rollback snapshot ownership is invalid."
     fi
     if [[ -z "$capture_error" ]] \
-        && { ! $SUDO install -m 0400 "$manifest" "$snapshot_manifest" \
-            || ! $SUDO install -m 0400 "$dump" "$snapshot_dump"; }; then
+        && ! $SUDO install -m 0400 "$manifest" "$snapshot_manifest"; then
+        capture_error="Rollback backup could not be captured."
+    fi
+    if [[ -z "$capture_error" && "$artifact_kind" == "dump" ]] \
+        && ! $SUDO install -m 0400 "$dump" "$snapshot_dump"; then
         capture_error="Rollback backup could not be captured."
     fi
     if [[ -z "$capture_error" ]] \
         && { ! $SUDO chown "${expected_uid}:${expected_gid}" \
-                "$snapshot_manifest" "$snapshot_dump" \
-            || ! $SUDO chmod 0400 "$snapshot_manifest" "$snapshot_dump"; }; then
+                "$snapshot_manifest" \
+            || ! $SUDO chmod 0400 "$snapshot_manifest"; }; then
+        capture_error="Rollback backup snapshot could not be protected."
+    fi
+    if [[ -z "$capture_error" && "$artifact_kind" == "dump" ]] \
+        && { ! $SUDO chown "${expected_uid}:${expected_gid}" \
+                "$snapshot_dump" \
+            || ! $SUDO chmod 0400 "$snapshot_dump"; }; then
         capture_error="Rollback backup snapshot could not be protected."
     fi
     expected_metadata="${expected_uid}:${expected_gid}:400:1"
     if [[ -z "$capture_error" ]] \
         && { [[ "$(database_snapshot_file_metadata "$snapshot_manifest")" \
                 != "$expected_metadata" ]] \
-            || [[ "$(database_snapshot_file_metadata "$snapshot_dump")" \
-                != "$expected_metadata" ]] \
             || ! $SUDO test -s "$snapshot_manifest" \
+            || $SUDO test -L "$snapshot_manifest"; }; then
+        capture_error="Rollback backup snapshot ownership or type is unsafe."
+    fi
+    if [[ -z "$capture_error" && "$artifact_kind" == "dump" ]] \
+        && { [[ "$(database_snapshot_file_metadata "$snapshot_dump")" \
+                != "$expected_metadata" ]] \
             || ! $SUDO test -s "$snapshot_dump" \
-            || $SUDO test -L "$snapshot_manifest" \
             || $SUDO test -L "$snapshot_dump"; }; then
         capture_error="Rollback backup snapshot ownership or type is unsafe."
     fi
     if [[ -z "$capture_error" ]]; then
         manifest_identity="$(database_snapshot_file_identity "$snapshot_manifest")" \
             || capture_error="Rollback manifest identity could not be read."
+    fi
+    if [[ -z "$capture_error" && "$artifact_kind" == "dump" ]]; then
         dump_identity="$(database_snapshot_file_identity "$snapshot_dump")" \
             || capture_error="Rollback dump identity could not be read."
     fi
@@ -10715,6 +11052,26 @@ database_validate_rollback_backup() {
         || "$(database_snapshot_file_identity "$snapshot_manifest")" \
             != "$manifest_identity" ]]; then
         validation_error="Rollback manifest identity changed before validation."
+    fi
+    # The frozen-database artifact carries no bytes of its own on this
+    # filesystem, so there is nothing to checksum, copy or feed to pg_restore.
+    if [[ -z "$validation_error" && "$artifact_kind" == "database" ]]; then
+        if ! database_validate_database_rollback_artifact \
+            "$backup_id" "$snapshot_manifest" \
+            "$requested_version" "$installed_version"; then
+            VALIDATED_DATABASE_BACKUP_MIGRATION=""
+            DATABASE_ROLLBACK_ACTIVE_DATABASE=""
+            VALIDATED_DATABASE_BACKUP_KIND=""
+            VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE=""
+            database_discard_validation_staging || true
+            return 1
+        fi
+        if ! database_discard_validation_staging; then
+            fail "Rollback artifact manifest snapshot could not be removed."
+            return 1
+        fi
+        info "Rollback artifact validated: ${backup_id} (frozen database ${VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE})"
+        return 0
     fi
     # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
     if [[ -z "$validation_error" ]] \
@@ -10798,6 +11155,7 @@ database_validate_rollback_backup() {
     VALIDATED_DATABASE_BACKUP_DUMP_PATH="$snapshot_dump"
     VALIDATED_DATABASE_BACKUP_DUMP_IDENTITY="$dump_identity"
     VALIDATED_DATABASE_BACKUP_DUMP_METADATA="$expected_metadata"
+    VALIDATED_DATABASE_BACKUP_KIND="dump"
     info "Rollback backup validated: ${backup_id}"
 }
 
@@ -10822,55 +11180,7 @@ SELECT format('ALTER DATABASE %I RENAME TO %I', :'replacement_database', :'activ
 SQL
 }
 
-# Physically clone the live database instead of rebuilding it from a logical
-# dump (#1757). A forward upgrade must never let the new binary migrate the
-# ORIGINAL database, because sqlx refuses to start an older binary against a
-# database carrying migrations it does not know. The original therefore has to
-# be preserved untouched — but a full pg_dump plus pg_restore inside the
-# proxy-stopped window took production down for ~35 minutes on an 11 GB
-# database. `CREATE DATABASE ... TEMPLATE` copies the data directory at the
-# filesystem layer instead, which is bounded by disk throughput rather than by
-# SQL replay.
-#
-# ALLOW_CONNECTIONS false BEFORE the copy is load-bearing. CREATE DATABASE
-# requires that no other session is connected to the template, and TimescaleDB
-# starts a per-database background worker that reconnects within seconds of
-# being terminated. Terminating alone therefore loses the race; the database
-# must be closed to new connections first, then drained again.
-#
-# The replacement keeps a distinct name and is renamed into place afterwards so
-# database_recover_interrupted_rollback still reasons about exactly the same
-# intermediate states as the dump-and-restore swap it replaces.
-database_clone_active_database() {
-    local active_database="$1"
-    local replacement_database="$2"
-    local safety_database="$3"
-    database_recovery_identifier_is_safe "$active_database" || return 1
-    database_recovery_identifier_is_safe "$replacement_database" || return 1
-    database_recovery_identifier_is_safe "$safety_database" || return 1
-    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
-    installer_run_live_compose exec -T timescaledb \
-        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
-        --set="active_database=${active_database}" \
-        --set="replacement_database=${replacement_database}" \
-        --set="safety_database=${safety_database}" \
-        >> "$LOG_FILE" 2>&1 <<'SQL'
-\set ON_ERROR_STOP on
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE datname IN (:'active_database', :'replacement_database', :'safety_database')
-  AND pid <> pg_backend_pid();
-SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'safety_database') \gexec
-SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS false', :'safety_database') \gexec
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE datname = :'safety_database' AND pid <> pg_backend_pid();
-SELECT format('CREATE DATABASE %I TEMPLATE %I', :'replacement_database', :'safety_database') \gexec
-SELECT format('ALTER DATABASE %I RENAME TO %I', :'replacement_database', :'active_database') \gexec
-SQL
-}
-
-# Re-open the frozen safety database so the deferred rollback dump can connect.
+# Re-open the frozen safety database so a deferred read can connect.
 database_allow_safety_database_connections() {
     local safety_database="$1"
     database_recovery_identifier_is_safe "$safety_database" || return 1
@@ -10885,45 +11195,77 @@ WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'safety_database') \gex
 SQL
 }
 
-# A physical clone needs room for a second copy of the data directory on the
-# database volume. check_disk is a fixed 10 GB budget against INSTALL_DIR,
-# called with `|| true`, and never inspects the docker volume the data
-# directory actually lives on — it cannot answer this question. Refuse before
-# the proxy is quiesced so a headroom failure costs no downtime at all.
-database_require_clone_headroom() {
+# Open or close a database to new connections.
+#
+# `datallowconn = false` is what makes a rollback artifact frozen: it is both
+# the reason CREATE DATABASE ... TEMPLATE can copy it and the reason TimescaleDB
+# cannot restart a per-database background worker against it. The artifact must
+# be closed at all times except for the single round trip that reads its
+# migration version.
+#
+# `allow` is validated to be exactly true or false in the shell, so it is safe
+# to interpolate as a literal; the identifier goes through %I regardless.
+database_set_database_connections() {
     local database="$1"
-    local size_bytes data_directory df_output free_kb free_bytes required_bytes
-    if ! database_recovery_identifier_is_safe "$database"; then
-        fail "Refusing to size an unsafe database identifier before the upgrade clone."
-        return 1
-    fi
+    local allow="$2"
+    database_recovery_identifier_is_safe "$database" || return 1
+    [[ "$allow" == "true" || "$allow" == "false" ]] || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="connections_database=${database}" \
+        --set="allow_connections=${allow}" \
+        >> "$LOG_FILE" 2>&1 <<'SQL'
+\set ON_ERROR_STOP on
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS %s',
+              :'connections_database', :'allow_connections')
+WHERE EXISTS (SELECT 1 FROM pg_database
+              WHERE datname = :'connections_database') \gexec
+SQL
+}
+
+# Echo pg_database_size() for a database, in bytes. Reads from `postgres`, so it
+# works against a frozen artifact with datallowconn = false.
+database_measure_database_size() {
+    local database="$1"
+    local size_bytes
+    database_recovery_identifier_is_safe "$database" || return 1
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     size_bytes=$(installer_run_live_compose exec -T timescaledb \
         sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 "$@"' sh \
         --set="target_database=${database}" \
         2>> "$LOG_FILE" <<'SQL'
-SELECT pg_database_size(:'target_database');
+SELECT COALESCE(pg_database_size(:'target_database'), 0)
+WHERE EXISTS (SELECT 1 FROM pg_database WHERE datname = :'target_database');
 SQL
-    ) || {
-        fail "Could not measure the database size before the forward-upgrade clone."
-        return 1
-    }
+    ) || return 1
     size_bytes=$(printf '%s' "$size_bytes" | tr -d '[:space:]')
-    if [[ ! "$size_bytes" =~ ^[0-9]+$ ]]; then
-        fail "Database size probe did not return a byte count before the forward-upgrade clone."
-        return 1
-    fi
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$size_bytes"
+}
 
+# Echo `<free_bytes> <total_bytes> <wal_bytes> <reserve_bytes> <data_directory>`
+# for the volume PostgreSQL's data directory lives on.
+#
+#   wal      = max(4 * max_wal_size, 1 GiB) — read from the server, not guessed.
+#              A `CREATE DATABASE ... TEMPLATE` on PostgreSQL 15+ defaults to
+#              STRATEGY = WAL_LOG, which WAL-logs the whole copy, and production
+#              already logs "checkpoints are occurring too frequently".
+#   reserve  = max(2 GiB, total/20) — the floor the installer will never
+#              consume, so a fully successful upgrade still leaves headroom.
+database_probe_volume_budget() {
+    local data_directory df_output free_kb total_kb max_wal_bytes
+    local free_bytes total_bytes wal_bytes reserve_bytes
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     data_directory=$(installer_run_live_compose exec -T timescaledb \
         sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 --command="SHOW data_directory"' \
         </dev/null 2>> "$LOG_FILE") || {
-        fail "Could not locate the database data directory before the forward-upgrade clone."
+        fail "Could not locate the database data directory."
         return 1
     }
     data_directory=$(printf '%s' "$data_directory" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     if ! database_recovery_install_dir_is_safe "$data_directory"; then
-        fail "Database data directory is not a safe absolute path; refusing the forward-upgrade clone."
+        fail "Database data directory is not a safe absolute path."
         return 1
     fi
 
@@ -10932,28 +11274,199 @@ SQL
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     df_output=$(installer_run_live_compose exec -T timescaledb \
         sh -ceu 'exec df -Pk -- "$1"' sh "$data_directory" </dev/null 2>> "$LOG_FILE") || {
-        fail "Could not read free space on the database volume before the forward-upgrade clone."
+        fail "Could not read free space on the database volume."
         return 1
     }
-    free_kb=$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $4 }')
-    free_kb=$(printf '%s' "$free_kb" | tr -d '[:space:]')
-    if [[ ! "$free_kb" =~ ^[0-9]+$ ]]; then
-        fail "Free space on the database volume could not be parsed before the forward-upgrade clone."
+    free_kb=$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $4 }' | tr -d '[:space:]')
+    total_kb=$(printf '%s\n' "$df_output" | awk 'NR == 2 { print $2 }' | tr -d '[:space:]')
+    if [[ ! "$free_kb" =~ ^[0-9]+$ || ! "$total_kb" =~ ^[0-9]+$ ]]; then
+        fail "Free and total space on the database volume could not be parsed."
         return 1
     fi
 
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    max_wal_bytes=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --no-align --tuples-only --set=ON_ERROR_STOP=1 --command="SELECT pg_size_bytes(current_setting('"'"'max_wal_size'"'"'))"' \
+        </dev/null 2>> "$LOG_FILE") || max_wal_bytes=""
+    max_wal_bytes=$(printf '%s' "$max_wal_bytes" | tr -d '[:space:]')
+    # An unreadable max_wal_size must not silently shrink the budget.
+    [[ "$max_wal_bytes" =~ ^[0-9]+$ ]] || max_wal_bytes=$(( 1024 * 1024 * 1024 ))
+
     free_bytes=$(( free_kb * 1024 ))
-    # 1.2x: the clone is a byte-for-byte copy plus WAL written while it runs.
-    required_bytes=$(( size_bytes * 12 / 10 ))
+    total_bytes=$(( total_kb * 1024 ))
+    wal_bytes=$(( max_wal_bytes * 4 ))
+    (( wal_bytes >= 1024 * 1024 * 1024 )) || wal_bytes=$(( 1024 * 1024 * 1024 ))
+    reserve_bytes=$(( total_bytes / 20 ))
+    (( reserve_bytes >= 2 * 1024 * 1024 * 1024 )) \
+        || reserve_bytes=$(( 2 * 1024 * 1024 * 1024 ))
+
+    printf '%s %s %s %s %s\n' "$free_bytes" "$total_bytes" "$wal_bytes" \
+        "$reserve_bytes" "$data_directory"
+}
+
+# The disk precondition for an in-place forward upgrade.
+#
+# It runs BEFORE database_quiesce_proxy, so a refusal costs no downtime at all.
+#
+# What it budgets is deliberately NOT a function of database size. The upgrade
+# no longer copies the database: sqlx applies migrations to the live database,
+# which is what migrations are for (#1757 Direction item 1). The previous gate
+# required `size * 1.2` for a physical clone and the run then took a second,
+# entirely unbudgeted O(size) write for the durable dump — 37 GB of database
+# meant ~44 GB required against 17 GB free, so production could not upgrade at
+# all (#1762). With the copy gone there is nothing left that scales with size:
+#
+#   required = wal + churn + reserve
+#     wal     max(4 * max_wal_size, 1 GiB), read from the server
+#     churn   a fixed allowance for what a migration itself writes
+#     reserve max(2 GiB, volume total / 20), never consumed by the installer
+#
+# `churn` is an engineering constant, not a measurement: the installer cannot
+# know what the TARGET release's migrations will do before running them. It is
+# sized for the metadata-only DDL this project's migrations are required to be
+# (ALTER ... SET DEFAULT, policy changes, catalog updates). A migration that
+# rewrites or recompresses table data is O(size) again and is outside this
+# budget by construction — such a migration must be sized separately and must
+# not be shipped as an inline upgrade step. See
+# docs/runbooks/database-rollback.md.
+DATABASE_IN_PLACE_MIGRATION_CHURN_BYTES=$(( 2 * 1024 * 1024 * 1024 ))
+
+database_require_in_place_upgrade_headroom() {
+    local budget free_bytes total_bytes wal_bytes reserve_bytes data_directory
+    local churn_bytes required_bytes releasable_bytes=0
+    local backup_id target_version artifact_database artifact_size
+    local installed_version=""
+    local -a releasable_ids=()
+
+    # Explicit consent, honoured before anything is measured, so its space is
+    # counted by the very first measurement.
+    if [[ -n "${OPT_RELEASE_ROLLBACK_ARTIFACT:-}" ]] \
+        && ! database_release_requested_rollback_artifact; then
+        return 1
+    fi
+
+    if ! budget=$(database_probe_volume_budget); then
+        fail "Could not budget the database volume before the in-place upgrade."
+        return 1
+    fi
+    read -r free_bytes total_bytes wal_bytes reserve_bytes data_directory \
+        <<< "$budget"
+    churn_bytes="$DATABASE_IN_PLACE_MIGRATION_CHURN_BYTES"
+    required_bytes=$(( wal_bytes + churn_bytes + reserve_bytes ))
+
+    # Artifacts that can never validate again are free to reclaim. This is now
+    # housekeeping rather than a precondition — the requirement above is small
+    # and fixed — but a nearly-full volume is still worth reclaiming before a
+    # migration runs.
     if (( free_bytes < required_bytes )); then
-        fail "Insufficient database volume headroom for the forward-upgrade clone."
-        fail "  Database: $(( size_bytes / 1024 / 1024 )) MiB at ${data_directory}"
-        fail "  Required: $(( required_bytes / 1024 / 1024 )) MiB free (1.2x)"
+        database_release_superseded_rollback_artifacts \
+            || warn "Some superseded rollback artifacts could not be released."
+        if ! budget=$(database_probe_volume_budget); then
+            fail "Could not re-measure the database volume after releasing superseded rollback artifacts."
+            return 1
+        fi
+        read -r free_bytes total_bytes wal_bytes reserve_bytes \
+            data_directory <<< "$budget"
+    fi
+
+    if (( free_bytes >= required_bytes )); then
+        info "Database volume headroom verified for the in-place upgrade: $(( free_bytes / 1024 / 1024 )) MiB free, $(( required_bytes / 1024 / 1024 )) MiB required"
+        return 0
+    fi
+
+    installed_version="$(existing_install_version 2>/dev/null || true)"
+    if is_stable_semver "$installed_version"; then
+        while IFS=$'\t' read -r backup_id target_version artifact_database \
+            artifact_size; do
+            [[ -n "$backup_id" ]] || continue
+            [[ "$target_version" == "$installed_version" ]] || continue
+            [[ "$artifact_size" =~ ^[0-9]+$ ]] || artifact_size=0
+            releasable_ids+=("$backup_id")
+            releasable_bytes=$(( releasable_bytes + artifact_size ))
+        done < <(database_enumerate_rollback_artifacts)
+    fi
+
+    fail "Insufficient database volume headroom for the in-place upgrade."
+    fail "  Volume: ${data_directory} ($(( total_bytes / 1024 / 1024 )) MiB total)"
+    fail "  WAL allowance: $(( wal_bytes / 1024 / 1024 )) MiB"
+    fail "  Migration churn allowance: $(( churn_bytes / 1024 / 1024 )) MiB"
+    fail "  Reserve kept free: $(( reserve_bytes / 1024 / 1024 )) MiB"
+    fail "  Required: $(( required_bytes / 1024 / 1024 )) MiB"
+    fail "  Available: $(( free_bytes / 1024 / 1024 )) MiB"
+    fail "  Short by: $(( (required_bytes - free_bytes) / 1024 / 1024 )) MiB"
+    if (( ${#releasable_ids[@]} > 0 )); then
+        fail "  Releasable rollback artifacts: $(( releasable_bytes / 1024 / 1024 )) MiB"
+        for backup_id in "${releasable_ids[@]}"; do
+            fail "    --release-rollback-artifact=${backup_id}"
+        done
+        fail "Releasing one gives up the ability to roll this installation back to that artifact's source version."
+    fi
+    fail "The proxy was not stopped."
+    return 1
+}
+
+# The rollback precondition. Adopting a frozen artifact renames two databases
+# and copies nothing, so unlike the upgrade it does NOT need room for another
+# copy — deliberately, because a tight disk is exactly when a rollback is
+# needed. It still refuses to start on a volume with no working room at all.
+database_require_rollback_headroom() {
+    local budget free_bytes total_bytes wal_bytes reserve_bytes data_directory
+    local required_bytes
+    if ! budget=$(database_probe_volume_budget); then
+        fail "Could not budget the database volume before the rollback."
+        return 1
+    fi
+    read -r free_bytes total_bytes wal_bytes reserve_bytes data_directory \
+        <<< "$budget"
+    required_bytes=$(( wal_bytes + reserve_bytes ))
+    if (( free_bytes < required_bytes )); then
+        fail "Insufficient database volume headroom for the rollback."
+        fail "  Volume: ${data_directory} ($(( total_bytes / 1024 / 1024 )) MiB total)"
+        fail "  WAL allowance: $(( wal_bytes / 1024 / 1024 )) MiB"
+        fail "  Reserve kept free: $(( reserve_bytes / 1024 / 1024 )) MiB"
+        fail "  Required: $(( required_bytes / 1024 / 1024 )) MiB"
         fail "  Available: $(( free_bytes / 1024 / 1024 )) MiB"
         fail "The proxy was not stopped; free space on the database volume and retry."
         return 1
     fi
-    info "Database volume headroom verified for the forward-upgrade clone: $(( free_bytes / 1024 / 1024 )) MiB free for a $(( size_bytes / 1024 / 1024 )) MiB database"
+    info "Database volume headroom verified for the rollback: $(( free_bytes / 1024 / 1024 )) MiB free, $(( required_bytes / 1024 / 1024 )) MiB required"
+}
+
+# Release the artifact the operator named with --release-rollback-artifact.
+#
+# This is destructive and irreversible, so it states exactly what it is about to
+# destroy before it does it, and it refuses an ID that does not resolve to a
+# published artifact rather than treating an absent one as "already released".
+database_release_requested_rollback_artifact() {
+    local requested="${OPT_RELEASE_ROLLBACK_ARTIFACT:-}"
+    local backup_id target_version artifact_database artifact_size
+    local matched="false"
+    [[ -n "$requested" ]] || return 0
+    if ! database_backup_id_is_safe "$requested"; then
+        fail "--release-rollback-artifact must be an installer-issued backup ID, not a path."
+        return 1
+    fi
+    while IFS=$'\t' read -r backup_id target_version artifact_database \
+        artifact_size; do
+        [[ "$backup_id" == "$requested" ]] || continue
+        matched="true"
+        [[ "$artifact_size" =~ ^[0-9]+$ ]] || artifact_size=0
+        warn "Releasing rollback artifact ${backup_id} at operator request."
+        warn "  Frozen database to drop: ${artifact_database:-<none; dump artifact>}"
+        warn "  Reclaims approximately: $(( artifact_size / 1024 / 1024 )) MiB"
+        warn "  This permanently gives up the ability to roll this installation back"
+        warn "  to the source version recorded in ${backup_id}."
+        if ! database_release_rollback_artifact \
+            "$backup_id" "$artifact_database"; then
+            fail "Could not release the requested rollback artifact ${backup_id}."
+            return 1
+        fi
+    done < <(database_enumerate_rollback_artifacts)
+    if [[ "$matched" != "true" ]]; then
+        fail "--release-rollback-artifact=${requested} does not name a published rollback artifact."
+        fail "If it has already been released, re-run without the flag."
+        return 1
+    fi
 }
 
 database_drop_replacement_database() {
@@ -10962,6 +11475,24 @@ database_drop_replacement_database() {
     if ! database_recovery_identifier_is_safe "$replacement_database"; then
         warn "Refusing to drop an unsafe rollback replacement database identifier."
         return 1
+    fi
+    # THE replacement database is not always disposable.
+    #
+    # On the adopt path the "replacement" IS the durable rollback artifact — a
+    # frozen database this installer did not create and cannot recreate. It is
+    # reached here through database_recover_interrupted_rollback, i.e. on a
+    # FAILED rollback, which is exactly when the artifact must survive. Dropping
+    # it would mean a failed rollback destroys the only rollback path. Restore
+    # it to the frozen state it was found in instead, and never dropdb it.
+    if [[ "${DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT:-false}" \
+        == "true" ]]; then
+        if ! database_set_database_connections "$replacement_database" "false"; then
+            warn "Could not re-freeze the adopted rollback artifact ${replacement_database}; it is retained but open to connections."
+            return 1
+        fi
+        DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="false"
+        info "Adopted rollback artifact re-frozen and retained: ${replacement_database}"
+        return 0
     fi
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     if ! installer_run_live_compose exec -T timescaledb \
@@ -11016,6 +11547,10 @@ database_stage_validated_backup_for_swap() {
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
     DATABASE_ROLLBACK_REPLACEMENT_DATABASE="${replacement_prefix}_${timestamp}_$$"
     DATABASE_ROLLBACK_SAFETY_DATABASE="${safety_prefix}_${timestamp}_$$"
+    # This replacement is a database this installer just created from a dump, so
+    # it is disposable. Say so explicitly rather than inheriting whatever a
+    # previous adoption left behind.
+    DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="false"
     if ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
         || ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
         fail "${operation_label} database staging identity is unsafe."
@@ -11115,6 +11650,114 @@ database_stage_validated_backup_for_swap() {
     info "${operation_label} database restored and verified at migration ${restored_migration}"
 }
 
+# Adopt a validated frozen artifact as the active database.
+#
+# This is the rename-only counterpart of database_stage_validated_backup_for_swap
+# and it copies nothing: the artifact is renamed into place, and the database
+# being rolled back FROM is renamed aside and frozen, which makes it a zero-copy
+# rollback artifact in its own right and the swap reversible by rename. That is
+# why there is no pre-rollback pg_dump on this path — a rollback is the
+# emergency path and must work when the disk is tight, which is exactly when a
+# full extra copy is unaffordable.
+database_adopt_frozen_artifact_for_swap() {
+    local operation_label="$1"
+    local safety_prefix="$2"
+    local artifact_database="${VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE:-}"
+    local timestamp adopted_migration
+
+    if ! database_recovery_identifier_is_safe "$artifact_database"; then
+        fail "${operation_label} validated rollback artifact identity is absent or unsafe."
+        database_abort_rollback || true
+        return 1
+    fi
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    # The artifact IS the replacement. Recording it under its own name is what
+    # lets database_recover_interrupted_rollback rename it back, and the adopted
+    # flag is what stops database_drop_replacement_database destroying it.
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE="$artifact_database"
+    DATABASE_ROLLBACK_SAFETY_DATABASE="${safety_prefix}_${timestamp}_$$"
+    DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="true"
+    if ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
+        fail "${operation_label} database staging identity is unsafe."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_write_recovery_journal "staging"; then
+        fail "Could not persist ${operation_label} database staging identity."
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_remove_quiesced_proxy_container; then
+        database_abort_rollback || true
+        return 1
+    fi
+    if ! database_write_recovery_journal "swap-active"; then
+        fail "Could not persist ${operation_label} database swap identity before mutation."
+        database_abort_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_SWAP_ACTIVE="true"
+    if ! database_adopt_sql "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
+        "$DATABASE_ROLLBACK_SAFETY_DATABASE" "$artifact_database"; then
+        fail "${operation_label} database adoption failed; attempting automatic recovery."
+        database_recover_interrupted_rollback || true
+        return 1
+    fi
+    # Unconditionally. A frozen artifact may carry timescaledb.restoring = on
+    # from whatever put it there, and a database left in restoring mode runs no
+    # background workers at all — it would come back as the live database with
+    # retention, compression and every other policy silently stopped.
+    if ! database_run_timescaledb_restore_lifecycle \
+        "$DATABASE_ROLLBACK_ACTIVE_DATABASE" "post-restore"; then
+        fail "Could not leave TimescaleDB restore mode on the adopted ${operation_label} database."
+        database_recover_interrupted_rollback || true
+        return 1
+    fi
+    if ! adopted_migration=$(database_query_migration_version \
+            "$DATABASE_ROLLBACK_ACTIVE_DATABASE") \
+        || [[ "$adopted_migration" != "$VALIDATED_DATABASE_BACKUP_MIGRATION" ]]; then
+        fail "${operation_label} adopted database migration history does not match its immutable manifest."
+        database_recover_interrupted_rollback || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="false"
+    info "${operation_label} database adopted and verified at migration ${adopted_migration}"
+}
+
+# The rename-only adoption swap.
+#
+# The database being rolled back FROM is renamed aside and CLOSED before the
+# artifact is opened, so at no point are two databases carrying the same
+# identity both connectable.
+database_adopt_sql() {
+    local active_database="$1"
+    local safety_database="$2"
+    local artifact_database="$3"
+    database_recovery_identifier_is_safe "$active_database" || return 1
+    database_recovery_identifier_is_safe "$safety_database" || return 1
+    database_recovery_identifier_is_safe "$artifact_database" || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname=postgres --set=ON_ERROR_STOP=1 "$@"' sh \
+        --set="active_database=${active_database}" \
+        --set="safety_database=${safety_database}" \
+        --set="artifact_database=${artifact_database}" \
+        >> "$LOG_FILE" 2>&1 <<'SQL'
+\set ON_ERROR_STOP on
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname IN (:'active_database', :'artifact_database')
+  AND pid <> pg_backend_pid();
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'active_database', :'safety_database') \gexec
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS false', :'safety_database') \gexec
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = :'safety_database' AND pid <> pg_backend_pid();
+SELECT format('ALTER DATABASE %I WITH ALLOW_CONNECTIONS true', :'artifact_database') \gexec
+SELECT format('ALTER DATABASE %I RENAME TO %I', :'artifact_database', :'active_database') \gexec
+SQL
+}
+
 database_restore_version_backup() {
     local installed_version="$1"
     local requested_version="$2"
@@ -11125,21 +11768,51 @@ database_restore_version_backup() {
         return 1
     fi
     DATABASE_ROLLBACK_SOURCE_VERSION="$installed_version"
+    if [[ "${VALIDATED_DATABASE_BACKUP_KIND:-}" == "database" ]]; then
+        if ! database_require_rollback_headroom; then
+            database_abort_rollback || true
+            return 1
+        fi
+        if ! database_quiesce_proxy; then
+            database_abort_rollback || true
+            return 1
+        fi
+        database_adopt_frozen_artifact_for_swap "Rollback" "llap_pre_rollback"
+        return $?
+    fi
     database_create_version_backup "$installed_version" "$requested_version" "pre-rollback" \
         || return 1
     database_stage_validated_backup_for_swap \
         "Rollback" "llap_restore" "llap_pre_rollback"
 }
 
-# Forward upgrades no longer rebuild the database from a logical dump on the
-# critical path (#1757). The rollback target is produced by a physical clone,
-# and the durable dump is published later, from the frozen safety database,
-# only after the target has proven healthy — see
-# database_publish_frozen_safety_dump.
+# Forward upgrades apply migrations IN PLACE (#1757 Direction item 1).
+#
+# The previous design rebuilt the database to upgrade it: first a logical
+# dump + restore (a ~35-minute outage on 11 GB), then a physical
+# `CREATE DATABASE ... TEMPLATE` clone (no outage, but still a full second
+# copy). Both made every upgrade cost O(database size) in disk, and the clone
+# left a 1.2x free-space requirement that production could no longer meet:
+# 37 GB of database against 17 GB free (#1762).
+#
+# Migrations exist precisely to evolve a database in place. sqlx applies them
+# to the live database, so the upgrade writes only what the migrations
+# themselves write. Disk stops being a function of database size, and the
+# proxy-stopped window collapses to the duration of the migration.
+#
+# WHAT THIS GIVES UP, EXPLICITLY. The clone existed because sqlx refuses to
+# start an older binary against a database carrying migrations it does not
+# know, so the pre-upgrade state had to survive untouched. Migrating in place
+# destroys that state by construction: after this runs there is no on-host
+# copy of the source schema, and rolling back means restoring the recorded
+# recovery point (the restic snapshot resolved below) — an operator procedure
+# measured in tens of minutes, not a rename. That trade is the point of #1757
+# and it is documented in docs/runbooks/database-rollback.md; it is announced
+# to the operator before the proxy is stopped, not discovered afterwards.
 database_prepare_forward_upgrade() {
     local source_version="$1"
     local target_version="$2"
-    local database timestamp source_migration
+    local database source_migration
 
     if ! is_stable_semver "$source_version" \
         || ! is_stable_semver "$target_version"; then
@@ -11159,39 +11832,73 @@ database_prepare_forward_upgrade() {
     # "deploy-mutating" — so docker-compose.yml, .env and compose-command.sh
     # already point at the TARGET release while the OLD stack is still running.
     # The systemd unit is `ExecStart=${INSTALL_DIR}/compose-command.sh up -d`,
-    # so a reboot, a `systemctl restart llm-api-proxy`, or any container restart
-    # in that window would start the NEW binary against the ORIGINAL, un-cloned
-    # production database. sqlx would then apply the new migrations to the live
-    # database — precisely the irreversible state this whole clone-the-database
-    # design exists to prevent — and because the durable dump is now deferred
-    # until after the health gate, there would be no pre-upgrade dump either.
-    if ! database_require_clone_headroom "$database"; then
+    # so a reboot or `systemctl restart llm-api-proxy` in that window would
+    # start the NEW binary and migrate the database outside this function's
+    # control. Restoring the source tree on refusal closes that window.
+    if ! database_require_in_place_upgrade_headroom; then
         database_abort_rollback || true
         return 1
     fi
 
+    # Resolve the recovery point BEFORE anything is mutated, so what it names
+    # is unambiguously the pre-upgrade state.
+    #
+    # Refuses when NO recovery point exists at all. That is not a health gate:
+    # snapshot AGE and backup-agent health never block an upgrade, because a
+    # stale snapshot is a scheduling fact the installer cannot fix at 03:00.
+    # Absence is different in kind. Once the migration runs in place there is no
+    # second copy to fall back to, so a missing snapshot means an irreversible
+    # change with no recovery path — and `AGENTS.md` requires a tested recovery
+    # path for a destructive action. Proceeding on a warning here is exactly the
+    # #1758 failure class: believing a recovery point exists because a warning
+    # scrolled past.
+    database_resolve_upgrade_recovery_point
+    if [[ -z "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID" \
+        && "${DATABASE_ROLLBACK_RECOVERY_EXPECTED:-false}" == "true" \
+        && "${DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ:-false}" == "true" ]]; then
+        if [[ "${OPT_ACCEPT_NO_RECOVERY_POINT:-false}" != "true" ]]; then
+            fail "No recovery point exists for this in-place upgrade."
+            fail "  Migrating in place cannot be reversed by the installer, and no"
+            fail "  PostgreSQL snapshot was found in the backup repository to restore from."
+            fail "  Take a backup first, then re-run this installer; or pass"
+            fail "  --accept-no-recovery-point to upgrade with no way back."
+            database_abort_rollback || true
+            return 1
+        fi
+        warn "Proceeding with NO recovery point: --accept-no-recovery-point was given."
+    fi
+
     DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
+    # Announce the irreversibility before taking it, not after.
+    step "  Applying ${target_version} migrations in place to ${database}..."
+    warn "This upgrade migrates the live database in place and cannot be reversed by the installer."
+    if [[ -n "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID" ]]; then
+        warn "  Recovery point: restic snapshot ${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID} (${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME})"
+    else
+        warn "  Recovery point: NONE could be resolved from the backup repository."
+    fi
+    warn "  Restoring it is an operator procedure — see docs/runbooks/database-rollback.md."
+
     if ! database_quiesce_proxy; then
         database_abort_rollback || true
         return 1
     fi
     if ! source_migration=$(database_query_migration_version "$database"); then
-        fail "Could not read the current migration version before the forward-upgrade clone."
+        fail "Could not read the current migration version before the in-place upgrade."
         database_abort_rollback || true
         return 1
     fi
+    DATABASE_ROLLBACK_SOURCE_MIGRATION="$source_migration"
 
-    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-    DATABASE_ROLLBACK_REPLACEMENT_DATABASE="llap_upgrade_${timestamp}_$$"
-    DATABASE_ROLLBACK_SAFETY_DATABASE="llap_pre_upgrade_${timestamp}_$$"
-    if ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
-        || ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
-        fail "Forward upgrade database staging identity is unsafe."
-        database_abort_rollback || true
-        return 1
-    fi
-    if ! database_write_recovery_journal "staging"; then
-        fail "Could not persist Forward upgrade database staging identity."
+    # The durable no-return boundary. Everything before it is reversible by
+    # restoring the source deploy tree and restarting the source binary against
+    # an untouched database; everything after it is not, because the target
+    # binary is about to migrate that database. There is deliberately no
+    # safety or replacement database: nothing is being copied or swapped.
+    DATABASE_ROLLBACK_SAFETY_DATABASE=""
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+    if ! database_write_recovery_journal "target-migrating-in-place"; then
+        fail "Could not persist the in-place upgrade boundary before mutation."
         database_abort_rollback || true
         return 1
     fi
@@ -11199,21 +11906,73 @@ database_prepare_forward_upgrade() {
         database_abort_rollback || true
         return 1
     fi
-    if ! database_write_recovery_journal "swap-active"; then
-        fail "Could not persist Forward upgrade database swap identity before mutation."
-        database_abort_rollback || true
-        return 1
+    DATABASE_FORWARD_UPGRADE_ACTIVE="true"
+    info "In-place upgrade authorized from migration ${source_migration}; the target binary applies its own migrations"
+}
+
+# Resolve the recovery point for an in-place upgrade: the newest PostgreSQL
+# snapshot in the restic repository.
+#
+# Deliberately best-effort. It reads through the backup container that already
+# holds RESTIC_REPOSITORY and RESTIC_PASSWORD — the same `compose exec` channel
+# the installer already uses for the database — so it needs no new credentials
+# and no Consul client. It NEVER refuses the upgrade: gating an upgrade on the
+# backup agent responding would couple the installer's critical path to a
+# component whose health reporting is separately tracked (#1758), and a
+# not-yet-taken snapshot is a scheduling fact for the deploy plan to handle,
+# not something the installer can fix at 03:00.
+#
+# The timeout runs INSIDE the container: an unreachable object store must cost
+# seconds, not a stalled upgrade.
+database_resolve_upgrade_recovery_point() {
+    local snapshot_output="" snapshot_id="" snapshot_time=""
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+    # Distinguishes "the operator opted out of backups" from "backups are on and
+    # the snapshot is missing". Only the second is a broken expectation the
+    # installer should refuse on; refusing the first would permanently block
+    # upgrades for a deliberately backup-less install.
+    DATABASE_ROLLBACK_RECOVERY_EXPECTED="false"
+    DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ="false"
+    if [[ "${OPT_BACKUP:-false}" != "true" ]]; then
+        warn "Backups are disabled, so this in-place upgrade has no recorded recovery point."
+        return 0
     fi
-    DATABASE_ROLLBACK_SWAP_ACTIVE="true"
-    if ! database_clone_active_database "$DATABASE_ROLLBACK_ACTIVE_DATABASE" \
-        "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
-        "$DATABASE_ROLLBACK_SAFETY_DATABASE"; then
-        fail "Forward upgrade database clone failed; attempting automatic recovery."
-        database_recover_interrupted_rollback || true
-        return 1
+    DATABASE_ROLLBACK_RECOVERY_EXPECTED="true"
+    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
+    if ! snapshot_output=$(installer_run_live_compose exec -T backup \
+        sh -ceu 'exec timeout 60 restic snapshots --json --latest 1 --tag postgres' \
+        </dev/null 2>> "$LOG_FILE"); then
+        warn "Could not read the restic repository; this in-place upgrade has no recorded recovery point."
+        return 0
     fi
-    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="true"
-    info "Forward upgrade cloned the source database at migration ${source_migration}"
+    # An unreadable repository is NOT proof that no snapshot exists, so it must
+    # not arm the refusal — only a repository that answered, and answered
+    # "none", proves absence. Anything else warns and proceeds, which keeps a
+    # transient object-store outage from blocking an upgrade.
+    if ! printf '%s' "$snapshot_output" | jq -e 'type == "array"' >/dev/null 2>> "$LOG_FILE"; then
+        warn "The restic repository returned an unreadable snapshot listing; this in-place upgrade has no recorded recovery point."
+        return 0
+    fi
+    DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ="true"
+    if ! snapshot_output=$(
+        printf '%s' "$snapshot_output" \
+            | jq -er 'if (type == "array" and length > 0) then
+                          (.[0] | [(.short_id // .id), .time] | @tsv)
+                      else error("no snapshot") end' 2>> "$LOG_FILE"
+    ); then
+        warn "The restic repository reported no PostgreSQL snapshot; this in-place upgrade has no recorded recovery point."
+        return 0
+    fi
+    IFS=$'\t' read -r snapshot_id snapshot_time <<< "$snapshot_output"
+    if [[ ! "$snapshot_id" =~ ^[0-9a-f]{8,64}$ ]] \
+        || [[ ! "$snapshot_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ ]]; then
+        warn "The restic repository returned an unusable snapshot identity; this in-place upgrade has no recorded recovery point."
+        return 0
+    fi
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID="$snapshot_id"
+    DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME="$snapshot_time"
+    info "Recovery point for this upgrade: restic snapshot ${snapshot_id} taken ${snapshot_time}"
 }
 
 database_recover_interrupted_rollback() {
@@ -11254,7 +12013,7 @@ SQL
     DATABASE_ROLLBACK_SWAP_ACTIVE="false"
     DATABASE_ROLLBACK_SAFETY_DATABASE=""
     DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
-    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
+    DATABASE_FORWARD_UPGRADE_ACTIVE="false"
     if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]] \
         && ! database_write_recovery_journal "deploy-mutating"; then
         warn "Database swap was reversed, but durable source-state recovery could not be updated."
@@ -11268,29 +12027,134 @@ SQL
     fi
 }
 
-database_drop_forward_upgrade_safety_database() {
-    local safety_database="${DATABASE_ROLLBACK_SAFETY_DATABASE:-}"
-    [[ -n "$safety_database" ]] || return 0
-    if ! database_recovery_identifier_is_safe "$safety_database"; then
-        warn "Refusing to drop an unsafe forward-upgrade safety database identifier."
+# Drop an installer-managed rollback artifact database. `--if-exists` makes
+# process-loss recovery idempotent when PostgreSQL completed the drop before
+# the installer recorded its local result.
+database_drop_rollback_artifact_database() {
+    local artifact_database="$1"
+    [[ -n "$artifact_database" ]] || return 0
+    if ! database_recovery_identifier_is_safe "$artifact_database"; then
+        warn "Refusing to drop an unsafe rollback artifact database identifier."
         return 1
     fi
-    # The target has crossed a durable no-reversal boundary before this call.
-    # `--if-exists` makes process-loss recovery idempotent when PostgreSQL
-    # completed the drop before the installer recorded its local result.
     # shellcheck disable=SC2016  # Expanded by sh inside the database container.
     if ! installer_run_live_compose exec -T timescaledb \
         sh -ceu 'exec dropdb --if-exists --force --username="$POSTGRES_USER" "$1"' \
-        sh "$safety_database" >> "$LOG_FILE" 2>&1; then
-        warn "Could not remove the forward-upgrade source safety database."
+        sh "$artifact_database" >> "$LOG_FILE" 2>&1; then
+        warn "Could not remove the rollback artifact database ${artifact_database}."
         return 1
     fi
-    DATABASE_ROLLBACK_SAFETY_DATABASE=""
-    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
-    info "Forward-upgrade source safety database removed after target health"
+}
+
+# Remove a published rollback artifact: its frozen database, then its manifest
+# directory. The directory goes last so a process loss between the two leaves a
+# manifest naming an absent database — which database_validate_rollback_backup
+# rejects at its catalog probe — rather than an orphaned 30 GB database with no
+# record of what it was.
+database_release_rollback_artifact() {
+    local backup_id="$1"
+    local artifact_database="$2"
+    local rollback_root="${METADATA_DIR}/database-rollback"
+    local backup_dir="${rollback_root}/${backup_id}"
+    database_backup_id_is_safe "$backup_id" || return 1
+    if ! database_path_is_strict_child "$rollback_root" "$backup_dir" \
+        || [[ "$(dirname -- "$backup_dir")" != "$rollback_root" ]]; then
+        warn "Refusing to release a rollback artifact outside its own directory."
+        return 1
+    fi
+    if [[ -n "$artifact_database" ]] \
+        && ! database_drop_rollback_artifact_database "$artifact_database"; then
+        return 1
+    fi
+    if $SUDO test -L "$backup_dir"; then
+        warn "Refusing to remove a symlinked rollback artifact directory."
+        return 1
+    fi
+    if $SUDO test -e "$backup_dir" && ! $SUDO rm -rf -- "$backup_dir"; then
+        warn "Could not remove the rollback artifact directory ${backup_id}."
+        return 1
+    fi
+    installer_durable_sync_path "$rollback_root" || return 1
+    info "Rollback artifact released: ${backup_id}"
+}
+
+# Enumerate published rollback artifacts as `backup_id<TAB>target_version<TAB>
+# artifact_database<TAB>size_bytes`, one per line. `artifact_database` is empty
+# for a format_version 1 dump artifact, whose bytes live in its directory.
+# Unreadable or malformed manifests are skipped rather than fatal: an operator
+# hand-made directory must never be able to stop an upgrade.
+database_enumerate_rollback_artifacts() {
+    local rollback_root="${METADATA_DIR}/database-rollback"
+    local manifest backup_id record
+    $SUDO test -d "$rollback_root" || return 0
+    while IFS= read -r manifest; do
+        [[ -n "$manifest" ]] || continue
+        backup_id="$(basename -- "$(dirname -- "$manifest")")"
+        database_backup_id_is_safe "$backup_id" || continue
+        $SUDO test -L "$manifest" && continue
+        # shellcheck disable=SC2016  # jq variables are intentionally quoted.
+        record="$(
+            $SUDO cat "$manifest" 2>/dev/null \
+                | jq -er --arg backup_id "$backup_id" '
+                    if (.backup_id == $backup_id and
+                        (.target_version | type == "string" and
+                            test("^[0-9]+[.][0-9]+[.][0-9]+$")))
+                    then [
+                        .backup_id,
+                        .target_version,
+                        (if (.format_version == 2 and .kind == "database" and
+                             (.artifact_database | type == "string" and
+                               test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")))
+                         then .artifact_database else "" end),
+                        (if (.size_bytes | type == "string" and
+                             test("^[0-9]+$"))
+                         then .size_bytes else "0" end)
+                    ] | @tsv
+                    else empty end' 2>> "$LOG_FILE"
+        )" || continue
+        [[ -n "$record" ]] || continue
+        printf '%s\n' "$record"
+    done < <($SUDO find "$rollback_root" -mindepth 2 -maxdepth 2 \
+        -name manifest.json -type f 2>/dev/null | LC_ALL=C sort)
+}
+
+# Release every artifact that can never be validated again.
+#
+# database_validate_rollback_backup requires `.target_version == <currently
+# installed version>`, so an artifact recorded against any other target is
+# already unusable — keeping it only consumes the volume this whole change
+# exists to protect. The artifact for the INSTALLED version is never touched
+# here; releasing that one needs the operator's explicit
+# --release-rollback-artifact consent.
+database_release_superseded_rollback_artifacts() {
+    local installed_version="" backup_id target_version artifact_database size
+    local released=0 failed=0
+    installed_version="$(existing_install_version 2>/dev/null || true)"
+    if ! is_stable_semver "$installed_version"; then
+        # Without a trustworthy installed version nothing can be proven
+        # superseded, so nothing is released.
+        return 0
+    fi
+    while IFS=$'\t' read -r backup_id target_version artifact_database size; do
+        [[ -n "$backup_id" ]] || continue
+        [[ "$target_version" != "$installed_version" ]] || continue
+        info "Releasing superseded rollback artifact ${backup_id} (target ${target_version}, installed ${installed_version})"
+        if database_release_rollback_artifact \
+            "$backup_id" "$artifact_database"; then
+            released=$(( released + 1 ))
+        else
+            failed=$(( failed + 1 ))
+        fi
+    done < <(database_enumerate_rollback_artifacts)
+    (( released == 0 )) || info "Released ${released} superseded rollback artifact(s)"
+    (( failed == 0 ))
 }
 
 database_complete_forward_upgrade_transition() {
+    # Latch before anything can fail. Every `return 1` below leaves the guard
+    # set, so `trap cleanup EXIT` -> database_abort_rollback cannot dispatch on
+    # the still-current forward-target-healthy phase and re-run this body.
+    DATABASE_FORWARD_TRANSITION_IN_PROGRESS="true"
     # Persist the no-reversal boundary while both the exact source database and
     # source deploy snapshot still exist. A process loss from this point keeps
     # the proven-healthy target and resumes only idempotent cleanup.
@@ -11306,32 +12170,159 @@ database_complete_forward_upgrade_transition() {
         fi
     fi
     DATABASE_ROLLBACK_SWAP_ACTIVE="false"
-    DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE="false"
-    if ! database_publish_frozen_safety_dump; then
+    DATABASE_FORWARD_UPGRADE_ACTIVE="false"
+    if ! database_publish_upgrade_recovery_record; then
         return 1
     fi
-    if ! database_drop_forward_upgrade_safety_database; then
+    # The frozen safety database is NOT dropped here any more: it IS the
+    # rollback artifact. What is released instead is every artifact recorded
+    # against a target_version other than the one now installed — those can
+    # never pass validation again, so they are pure dead weight. GC failing is
+    # not a correctness failure, so it warns rather than stranding the journal.
+    database_release_superseded_rollback_artifacts \
+        || warn "Superseded rollback artifacts could not all be released; free space may be lower than expected."
+    if ! database_discard_source_deploy_snapshot; then
         return 1
     fi
-    database_discard_source_deploy_snapshot
+    # Success is the ONLY path that clears the guard.
+    DATABASE_FORWARD_TRANSITION_IN_PROGRESS="false"
 }
 
-# Publish the durable rollback dump AFTER the target has proven healthy, from
-# the frozen safety database rather than from the live one (#1757). The dump is
-# still required — it is the only artifact that survives the safety database
-# being dropped — but it no longer has to sit inside the proxy-stopped window,
-# because the bytes it reads can no longer change.
+# Publish the durable record of how this upgrade can be recovered, AFTER the
+# target has proven healthy.
 #
-# The safety database was closed to connections by the clone, so reopen it, and
-# put TimescaleDB into pre-restore mode first so retention and compression
-# policies cannot mutate the frozen artifact while pg_dump reads it.
-database_publish_frozen_safety_dump() {
+# Two shapes, decided by what the run actually did rather than by a flag:
+#
+#   - An in-place upgrade copied nothing, so there is no on-host artifact. The
+#     record names the restic snapshot resolved before the migration ran.
+#   - A journal written by <= 0.0.135 names a frozen safety database left by
+#     the old clone path. That database IS a usable rollback artifact, so it is
+#     manifested rather than dumped or dropped — which is what unpins the 32 GB
+#     production has been holding since 2026-08-03 (#1762).
+database_publish_upgrade_recovery_record() {
+    if [[ -n "${DATABASE_ROLLBACK_SAFETY_DATABASE:-}" ]]; then
+        database_publish_frozen_safety_artifact
+        return $?
+    fi
+    database_publish_restic_recovery_manifest
+}
+
+# Record the restic snapshot that is the recovery point for an in-place
+# upgrade. O(1): a few hundred bytes, no database bytes read or written.
+#
+# The manifest is deliberately NOT consumable by --rollback-backup. Restoring a
+# restic snapshot into production is a separately approved procedure with its
+# own dual control (docs/operations/backups.md), and pretending the installer
+# can do it in one flag would be the most dangerous kind of convenience. What
+# this buys is that the recovery point is unambiguous and written down at the
+# moment it was true, instead of being reconstructed from cron schedules after
+# an incident.
+database_publish_restic_recovery_manifest() {
+    local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-}"
+    local target_version="" database timestamp backup_id
+    local rollback_root final_dir staging_dir manifest_file
+    local migration_version="${DATABASE_ROLLBACK_SOURCE_MIGRATION:-}"
+    target_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$target_version" \
+        || target_version="${OPT_VERSION:-}"
+    if ! is_stable_semver "$source_version" \
+        || ! is_stable_semver "$target_version"; then
+        fail "In-place upgrade has no stable version identity; its recovery point cannot be recorded."
+        return 1
+    fi
+    if ! database=$(database_install_identifier); then
+        fail "Could not resolve the installer-managed database identifier for the recovery record."
+        return 1
+    fi
+    [[ "$migration_version" =~ ^[0-9]+$ ]] || migration_version="0"
+
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup_id="pre-upgrade-${source_version}-to-${target_version}-${timestamp}"
+    database_backup_id_is_safe "$backup_id" || return 1
+    rollback_root="${METADATA_DIR}/database-rollback"
+    final_dir="${rollback_root}/${backup_id}"
+    staging_dir="${rollback_root}/.partial-${backup_id}-$$"
+    if ! database_path_is_safe_direct_child \
+        "$rollback_root" "$staging_dir" ".partial-"; then
+        fail "Recovery record staging path is unsafe."
+        return 1
+    fi
+    DATABASE_ROLLBACK_BACKUP_STAGING_DIR="$staging_dir"
+    if ! installer_install_private_directories "$rollback_root" \
+        || $SUDO test -L "$rollback_root" \
+        || $SUDO test -e "$final_dir" \
+        || $SUDO test -e "$staging_dir" \
+        || ! installer_install_private_directories "$staging_dir"; then
+        fail "Recovery record staging could not be allocated safely."
+        database_discard_backup_staging || true
+        return 1
+    fi
+    manifest_file="${staging_dir}/manifest.json"
+    if ! jq -n \
+        --arg backup_id "$backup_id" \
+        --arg source_version "$source_version" \
+        --arg target_version "$target_version" \
+        --arg database "$database" \
+        --arg migration_version "$migration_version" \
+        --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg snapshot_id "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID:-}" \
+        --arg snapshot_time "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME:-}" \
+        '{format_version: 3, kind: "restic", backup_id: $backup_id,
+          source_version: $source_version, target_version: $target_version,
+          database: $database, migration_version: $migration_version,
+          created_at: $created_at,
+          recovery_snapshot_id: $snapshot_id,
+          recovery_snapshot_time: $snapshot_time,
+          migrated_in_place: true}' \
+        | $SUDO /usr/bin/tee "$manifest_file" >/dev/null \
+        || ! $SUDO chmod 0600 "$manifest_file" \
+        || ! $SUDO test -s "$manifest_file" \
+        || ! installer_durable_sync_path "$manifest_file"; then
+        fail "Could not write the private in-place upgrade recovery record."
+        database_discard_backup_staging || true
+        return 1
+    fi
+    if ! $SUDO mv "$staging_dir" "$final_dir" \
+        || ! installer_durable_sync_path "$rollback_root"; then
+        fail "Could not publish the private in-place upgrade recovery record."
+        database_discard_backup_staging || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_BACKUP_STAGING_DIR=""
+    CREATED_DATABASE_BACKUP_ID="$backup_id"
+    if [[ -n "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID:-}" ]]; then
+        info "In-place upgrade recorded: recovery point is restic snapshot ${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID} (${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME})"
+    else
+        warn "In-place upgrade recorded with NO recovery point; the pre-upgrade database state is not recoverable from this host."
+    fi
+    info "Recovery record: ${backup_id}"
+}
+
+# Publish the durable rollback artifact AFTER the target has proven healthy.
+#
+# The artifact IS the frozen safety database that database_clone_active_database
+# already produced, so publishing it is a few hundred bytes of manifest instead
+# of an O(database size) pg_dump. That dump was the defect: it was unbudgeted,
+# ran against the same volume PostgreSQL lives on, and on 2026-08-03 could not
+# complete against a 33 GB source with 8.5 GB free — pinning the safety database
+# and leaving production unable to upgrade at all (#1762).
+#
+# The one thing that must be read from inside the frozen database is its
+# migration version. Prefer the value the forward upgrade already recorded in
+# the journal; only when that is absent (a v3 journal written by an older
+# release, which is exactly production's resumed state) reopen it for a single
+# round trip and close it again. An artifact left open is one TimescaleDB
+# retention cycle away from being silently gutted, so the re-freeze is not
+# optional and its failure is fatal.
+database_publish_frozen_safety_artifact() {
     local safety_database="${DATABASE_ROLLBACK_SAFETY_DATABASE:-}"
     local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-}"
-    local target_version=""
+    local target_version="" database timestamp backup_id
+    local rollback_root final_dir staging_dir manifest_file
+    local migration_version="" size_bytes=""
     [[ -n "$safety_database" ]] || return 0
     if ! database_recovery_identifier_is_safe "$safety_database"; then
-        fail "Refusing to dump an unsafe forward-upgrade safety database identifier."
+        fail "Refusing to publish an unsafe forward-upgrade safety database identifier."
         return 1
     fi
     # The INSTALLED version is authoritative here, not $OPT_VERSION.
@@ -11339,55 +12330,122 @@ database_publish_frozen_safety_dump() {
     # deploy_write_metadata has already published the target by the time this
     # boundary is reachable, so existing_install_version is what actually got
     # deployed. $OPT_VERSION is not: this point is re-entered on a resumed run
-    # (process or host loss between "forward-target-healthy" and the dump), and
-    # the recovery reconciler runs BEFORE target-argument validation — so an
+    # (process or host loss between "forward-target-healthy" and the publish),
+    # and the recovery reconciler runs BEFORE target-argument validation — so an
     # operator resuming with a different --version would stamp that version into
     # the manifest. database_validate_rollback_backup requires
-    # `.target_version == <currently installed version>`, so such an artifact can
-    # never be used, and database_drop_forward_upgrade_safety_database destroys
-    # the safety database immediately afterwards. Rollback capability would be
-    # lost silently, behind a success message.
+    # `.target_version == <currently installed version>`, so such an artifact
+    # could never be used, and rollback capability would be lost silently,
+    # behind a success message.
     target_version=$(existing_install_version 2>/dev/null || true)
     is_stable_semver "$target_version" \
         || target_version="${OPT_VERSION:-}"
     if ! is_stable_semver "$source_version" \
         || ! is_stable_semver "$target_version"; then
-        fail "Forward-upgrade rollback dump has no stable version identity; the source safety database is retained."
+        fail "Forward-upgrade rollback artifact has no stable version identity; the source safety database is retained."
+        return 1
+    fi
+    if ! database=$(database_install_identifier); then
+        fail "Could not resolve the installer-managed database identifier for the rollback artifact."
         return 1
     fi
 
-    DATABASE_DURABLE_DUMP_IN_PROGRESS="true"
-    step "  Publishing the rollback dump from the frozen source database..."
-    if ! database_allow_safety_database_connections "$safety_database"; then
-        fail "Could not reopen the frozen source database for the rollback dump."
-        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+    step "  Publishing the frozen source database as the rollback artifact..."
+    migration_version="${DATABASE_ROLLBACK_SOURCE_MIGRATION:-}"
+    if [[ ! "$migration_version" =~ ^[0-9]+$ ]]; then
+        if ! database_set_database_connections "$safety_database" "true"; then
+            fail "Could not reopen the frozen source database to read its migration version."
+            return 1
+        fi
+        migration_version=$(database_query_migration_version "$safety_database") \
+            || migration_version=""
+        if ! database_set_database_connections "$safety_database" "false"; then
+            fail "Could not re-freeze the source database after reading its migration version."
+            return 1
+        fi
+        if [[ ! "$migration_version" =~ ^[0-9]+$ ]]; then
+            fail "Could not read the migration version of the frozen source database; it is retained for operator recovery."
+            return 1
+        fi
+    fi
+    # Advisory only: it sizes the headroom budget's releasable term. It is
+    # deliberately NOT an integrity check — autovacuum wraparound processing
+    # touches datallowconn=false databases, so byte equality would be brittle.
+    size_bytes=$(database_measure_database_size "$safety_database") || size_bytes="0"
+
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup_id="pre-upgrade-${source_version}-to-${target_version}-${timestamp}"
+    database_backup_id_is_safe "$backup_id" || return 1
+    rollback_root="${METADATA_DIR}/database-rollback"
+    final_dir="${rollback_root}/${backup_id}"
+    staging_dir="${rollback_root}/.partial-${backup_id}-$$"
+    if ! database_path_is_safe_direct_child \
+        "$rollback_root" "$staging_dir" ".partial-"; then
+        fail "Rollback artifact staging path is unsafe; the source safety database is retained."
         return 1
     fi
-    if ! database_run_timescaledb_restore_lifecycle \
-        "$safety_database" "pre-restore"; then
-        fail "Could not suspend TimescaleDB background jobs on the frozen source database."
-        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+    DATABASE_ROLLBACK_BACKUP_STAGING_DIR="$staging_dir"
+    if ! installer_install_private_directories "$rollback_root" \
+        || $SUDO test -L "$rollback_root" \
+        || $SUDO test -e "$final_dir" \
+        || $SUDO test -e "$staging_dir" \
+        || ! installer_install_private_directories "$staging_dir"; then
+        fail "Rollback artifact staging could not be allocated safely."
+        database_discard_backup_staging || true
         return 1
     fi
-    if ! database_create_version_backup "$source_version" "$target_version" \
-        "pre-upgrade" "$safety_database"; then
-        fail "Rollback dump failed; the source safety database is retained for operator recovery."
-        DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+    manifest_file="${staging_dir}/manifest.json"
+    if ! jq -n \
+        --arg backup_id "$backup_id" \
+        --arg source_version "$source_version" \
+        --arg target_version "$target_version" \
+        --arg database "$database" \
+        --arg artifact_database "$safety_database" \
+        --arg migration_version "$migration_version" \
+        --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg size_bytes "$size_bytes" \
+        '{format_version: 2, kind: "database", backup_id: $backup_id,
+          source_version: $source_version, target_version: $target_version,
+          database: $database, artifact_database: $artifact_database,
+          migration_version: $migration_version, created_at: $created_at,
+          size_bytes: $size_bytes}' \
+        | $SUDO /usr/bin/tee "$manifest_file" >/dev/null \
+        || ! $SUDO chmod 0600 "$manifest_file" \
+        || ! $SUDO test -s "$manifest_file" \
+        || ! installer_durable_sync_path "$manifest_file"; then
+        fail "Could not write the private rollback artifact manifest."
+        database_discard_backup_staging || true
         return 1
     fi
-    DATABASE_DURABLE_DUMP_IN_PROGRESS="false"
+    if ! $SUDO mv "$staging_dir" "$final_dir" \
+        || ! installer_durable_sync_path "$rollback_root"; then
+        fail "Could not publish the private rollback artifact."
+        database_discard_backup_staging || true
+        return 1
+    fi
+    DATABASE_ROLLBACK_BACKUP_STAGING_DIR=""
+    DATABASE_ROLLBACK_SAFETY_DATABASE=""
+    DATABASE_ROLLBACK_REPLACEMENT_DATABASE=""
+
+    CREATED_DATABASE_BACKUP_ID="$backup_id"
+    info "Rollback artifact published: frozen database ${safety_database} at migration ${migration_version}"
     info "Retain rollback backup ID: ${CREATED_DATABASE_BACKUP_ID}"
 }
 
 database_abort_rollback() {
-    # The durable dump runs inside database_complete_forward_upgrade_transition,
-    # which is one of this function's own branches. Without this guard a dump
-    # failure re-enters that branch and recurses without bound.
-    [[ "${DATABASE_DURABLE_DUMP_IN_PROGRESS:-false}" != "true" ]] || return 1
+    # The forward transition runs from inside one of this function's own
+    # branches, and `trap cleanup EXIT` calls this function. Without this guard
+    # a failed transition is re-run in full by the installer's own exit path.
+    [[ "${DATABASE_FORWARD_TRANSITION_IN_PROGRESS:-false}" != "true" ]] || return 1
     database_close_validated_backup_dump || true
     database_discard_backup_staging || true
     database_discard_restore_staging || true
     database_discard_source_snapshot_staging || true
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == \
+        "target-migrating-in-place" ]]; then
+        database_reconcile_in_place_migration
+        return $?
+    fi
     if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == "forward-target-healthy" ]]; then
         database_complete_forward_upgrade_transition
         return $?
@@ -11414,6 +12472,42 @@ database_abort_rollback() {
         return $?
     fi
     database_resume_proxy
+}
+
+# There is no automatic recovery from an interrupted in-place migration.
+#
+# The database may sit at any migration between the recorded source version and
+# the target's. Reversing is impossible — a migration is not undoable — and
+# restoring the SOURCE deploy tree would be actively harmful: sqlx refuses to
+# start the older binary against a database carrying migrations it does not
+# know, so the old release would crash-loop against its own data.
+#
+# So this does the only two useful things. It states the exact situation and
+# the recorded recovery point, and it clears the journal so the installer is
+# not permanently wedged — leaving the TARGET deploy tree in place, which is
+# what a re-run needs. sqlx is idempotent, so re-running the target simply
+# finishes or no-ops the remaining migrations.
+database_reconcile_in_place_migration() {
+    local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-unknown}"
+    local source_migration="${DATABASE_ROLLBACK_SOURCE_MIGRATION:-unknown}"
+    warn "This deployment was interrupted while migrating the database IN PLACE."
+    warn "  Source release: ${source_version} at migration ${source_migration}"
+    warn "  The database may carry migrations the source release cannot start against."
+    warn "  The installer cannot reverse this and will not try."
+    if [[ -n "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID:-}" ]]; then
+        warn "  Recovery point: restic snapshot ${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID} (${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME})"
+    else
+        warn "  Recovery point: NONE was recorded for this upgrade."
+    fi
+    warn "  To go forward, re-run this installer for the same target version."
+    warn "  To go back, follow docs/runbooks/database-rollback.md — it is an operator procedure."
+    # The target deploy tree stays. Only the durable snapshot of the SOURCE
+    # tree is discarded, because restoring it can no longer help.
+    if ! database_discard_source_deploy_snapshot; then
+        fail "Interrupted in-place migration state could not be cleared safely."
+        return 1
+    fi
+    info "Interrupted in-place migration acknowledged; the deployment is at the target release"
 }
 
 database_reconcile_pending_recovery() {
@@ -11556,7 +12650,7 @@ deploy_handle_database_transition() {
     elif stable_semver_gt "$OPT_VERSION" "$installed_version"; then
         database_prepare_forward_upgrade "$installed_version" "$OPT_VERSION" \
             || return 1
-        info "Rollback dump publishes from the frozen source database after the target proves healthy; retain the backup ID printed then."
+        info "Migrations apply in place; the recovery point is recorded after the target proves healthy."
     elif stable_semver_gt "$installed_version" "$OPT_VERSION"; then
         fail "Database rollback backup is required before starting an older binary."
         return 1
@@ -11575,7 +12669,7 @@ deploy_complete_database_transition() {
             return 1
         fi
         info "Target database, Consul, proxy, and ingress are healthy"
-        if [[ "$DATABASE_FORWARD_UPGRADE_SWAP_ACTIVE" == "true" ]]; then
+        if [[ "$DATABASE_FORWARD_UPGRADE_ACTIVE" == "true" ]]; then
             if ! database_complete_forward_upgrade_transition; then
                 fail "Target stack is healthy, but durable forward-upgrade cleanup could not be completed."
                 return 1
@@ -12482,7 +13576,7 @@ fi
 # ── Embedded files (injected by build-installer.sh) ──────────────────────────
 # --- BEGIN EMBEDDED FILES ---
 # FILE: docker/docker-compose.yml
-EMBED_docker_compose_yml="c2VydmljZXM6CiAgdGltZXNjYWxlZGI6CiAgICAjIFBJTk5FRCAoIzEzMjUpOiBhIGNvbmNyZXRlIFRpbWVzY2FsZURCK3BnMTggdGFnIHdpdGggaXRzIGRpZ2VzdCwgbm90IHRoZQogICAgIyBmbG9hdGluZyBgbGF0ZXN0LXBnMThgLiBBIGZsb2F0aW5nIHRhZyBtZWFucyB0d28gaW5zdGFsbHMgZGF5cyBhcGFydCBjYW4KICAgICMgbGFuZCBvbiBkaWZmZXJlbnQgUG9zdGdyZXMgYnVpbGRzLCBhbmQgYW4gYHVwZ3JhZGVgIHRoYXQgcHJlc2VydmVzIHRoZSBkYXRhCiAgICAjIHZvbHVtZSBjYW4gcHVsbCBhbiBpbWFnZSBpbmNvbXBhdGlibGUgd2l0aCB0aGUgb24tZGlzayBkYXRhIGRpcmVjdG9yeS4KICAgICMgQnVtcCBkZWxpYmVyYXRlbHkgKGFuZCB2ZXJpZnkgZGF0YS12b2x1bWUgY29tcGF0aWJpbGl0eSkgd2hlbiB1cGRhdGluZy4KICAgIGltYWdlOiB0aW1lc2NhbGUvdGltZXNjYWxlZGI6Mi4yNy4yLXBnMThAc2hhMjU2OjQwNTFlYzZlMmM2YzViMzFmZTc4OWNmMmNkODc5OTFlZTE0OTBiMzEyYjc3ZmUwMmVmYWY1MWJlYzg0Yjg5YjcKICAgICMg4pSA4pSAIENvbm5lY3Rpb24gYnVkZ2V0IChpc3N1ZSAjMTI4OCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIFJhaXNlIG1heF9jb25uZWN0aW9ucyB0byAxMDAgc28gdGhlIHByb3h5J3MgY29ubmVjdGlvbiBidWRnZXQgKGNvbnRyb2wKICAgICMgcG9vbCArIGRhdGEgcG9vbCkgcGx1cyBoZWFkcm9vbSBmb3IgbWlncmF0aW9ucywgcHNxbCwgYW5kIGJhY2tncm91bmQKICAgICMgdG9vbGluZyBuZXZlciBzYXR1cmF0ZXMgdGhlIHNlcnZlci4gaW5zdGFsbC5zaCBhdXRvLXNpemVzIHRoZSB0d28gcG9vbHMKICAgICMgZnJvbSB0aGUgaG9zdCBDUFUgY291bnQgKCMxNDE2KSwgY2xhbXBlZCBzbyB0aGVpciBzdW0gc3RheXMgd2VsbCBiZWxvdyB0aGlzCiAgICAjIGNlaWxpbmcgKHdvcnN0IGNhc2UgMzIgKyA1NiA9IDg4LCBsZWF2aW5nIDEyIGZyZWUpLiBUaGUgcHJldmlvdXMgZGVwbG95bWVudCByYW4KICAgICMgdGhlIFBvc3RncmVzIGRlZmF1bHQgb2YgMjUsIHdoaWNoIHRoZSBhcHAgcG9vbCBhbG9uZSBjb3VsZCBleGhhdXN0IGR1cmluZwogICAgIyB0aGUgcG9zdC1kZXBsb3kgYmFja2dyb3VuZCB3cml0ZSBzdG9ybSwgc3RhcnZpbmcgdGhlIHJlcXVlc3QgcGF0aCBhbmQKICAgICMgcHJvZHVjaW5nIGEgYnJpZWYgSFRUUCA1MDAgYnVyc3Qgb24gZXZlcnkgZGVwbG95LgogICAgIwogICAgIyBSZWxhdGlvbnNoaXAgdG8gdGhlIGFwcCBwb29sIChzZWUgY29uZmlnLmV4YW1wbGUudG9tbCBbZGF0YWJhc2VdKToKICAgICMgICBtYXhfY29ubmVjdGlvbnMgKDEwMCkgID4+ICBjb250cm9sX3Bvb2xfc2l6ZSAoNSkgKyBkYXRhX3Bvb2xfc2l6ZSAoMjApCiAgICAjIEFkanVzdCBQUk9YWV9EQVRBQkFTRV9fQ09OVFJPTF9QT09MX1NJWkUgLyBfX0RBVEFfUE9PTF9TSVpFIHRvZ2V0aGVyIHdpdGgKICAgICMgdGhpcyB2YWx1ZSBpZiB5b3UgdHVuZSB0aGUgYXBwIHBvb2w7IGtlZXAgdGhlaXIgc3VtIHdlbGwgYmVsb3cgaXQuCiAgICAjCiAgICAjIOKUgOKUgCBPcHRpb25hbCBQb3N0Z3JlcyBSQU0gdHVuaW5nIChpc3N1ZSAjMTMwNSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIHRpbWVzY2FsZWRiLXR1bmUgcnVucyBPTkNFIG9uIGZpcnN0IGluaXQgYW5kIHdyaXRlcyBzaGFyZWRfYnVmZmVycyAvCiAgICAjIGVmZmVjdGl2ZV9jYWNoZV9zaXplIGludG8gdGhlIGRhdGEgdm9sdW1lJ3MgcG9zdGdyZXNxbC5jb25mLiBSYWlzaW5nIHRoZQogICAgIyBjb250YWluZXIgbWVtb3J5IGxpbWl0IGFsb25lIGRvZXMgTk9UIHJldHVuZSBhbiBleGlzdGluZyB2b2x1bWUsIHNvIHRoZXNlCiAgICAjIGAtY2AgZmxhZ3MgbGV0IGFuIG9wZXJhdG9yIG92ZXJyaWRlIHRoZSBzdG9yZWQgdmFsdWVzIGZvciBhbiBFWElTVElORyBEQi4KICAgICMKICAgICMgU0FGRVRZIOKAlCBkZWZhdWx0cyBwcmVzZXJ2ZSBjdXJyZW50IGJlaGF2aW91ciBFWEFDVExZOgogICAgIyAgIFdoZW4gVElNRVNDQUxFREJfU0hBUkVEX0JVRkZFUlMgLyBfRUZGRUNUSVZFX0NBQ0hFX1NJWkUgLyBfV09SS19NRU0gYXJlCiAgICAjICAgdW5zZXQsIHRoZSBgJHtWQVI6Ky4uLn1gIHN1YnN0aXR1dGlvbnMgY29sbGFwc2UgdG8gbm90aGluZyBhbmQgdGhlCiAgICAjICAgcmVuZGVyZWQgY29tbWFuZCBpcyBieXRlLWlkZW50aWNhbCB0byAicG9zdGdyZXMgLWMgbWF4X2Nvbm5lY3Rpb25zPTEwMCIuCiAgICAjICAgTm8gYC1jIHNoYXJlZF9idWZmZXJzPS4uLmAgZmxhZyBpcyBlbWl0dGVkLCBzbyB0aGUgdmFsdWVzIHN0b3JlZCBpbiB0aGUKICAgICMgICBleGlzdGluZyB2b2x1bWUncyBwb3N0Z3Jlc3FsLmNvbmYgKGUuZy4gdGltZXNjYWxlZGItdHVuZSdzKSBhcmUgdW50b3VjaGVkLgogICAgIyAgIEFuIGVtcHR5IGAtYyBzaGFyZWRfYnVmZmVycz1gIHZhbHVlIGlzIEZBVEFMIHRvIFBvc3RncmVzLCB3aGljaCBpcyB3aHkgdGhlCiAgICAjICAgZmxhZyBtdXN0IGJlIG9taXR0ZWQgZW50aXJlbHkgKG5vdCBkZWZhdWx0ZWQgdG8gYW4gZW1wdHkgc3RyaW5nKSB3aGVuIHVuc2V0LgogICAgIwogICAgIyBJTVBPUlRBTlQ6IHRoaXMgaXMgdGhlIFNIRUxMIChzdHJpbmcpIGZvcm0gb2YgYGNvbW1hbmQ6YCBvbiBwdXJwb3NlIOKAlCBpdAogICAgIyBsZXRzIHRoZSBjb25kaXRpb25hbCBgJHtWQVI6Ky4uLn1gIHRva2VucyB3b3JkLXNwbGl0IGludG8gc2VwYXJhdGUgYXJncyBhbmQKICAgICMgdmFuaXNoIGNsZWFubHkgd2hlbiB1bnNldC4gS2VlcCBpdCBhIHNpbmdsZSBsaW5lLiBUaGUgaW1hZ2UncwogICAgIyBzaGFyZWRfcHJlbG9hZF9saWJyYXJpZXM9dGltZXNjYWxlZGIgKHNldCBieSB0aGUgZW50cnlwb2ludCBpbgogICAgIyBwb3N0Z3Jlc3FsLmNvbmYpIGlzIE5PVCB0b3VjaGVkIGJ5IHRoZXNlIGZsYWdzIGFuZCByZW1haW5zIGFjdGl2ZS4KICAgICMKICAgICMgRXhhbXBsZSAob3BlcmF0b3Igb3B0cyBpbiB2aWEgZG9ja2VyLy5lbnYpOgogICAgIyAgIFRJTUVTQ0FMRURCX1NIQVJFRF9CVUZGRVJTPTRHQgogICAgIyAgIFRJTUVTQ0FMRURCX0VGRkVDVElWRV9DQUNIRV9TSVpFPThHQgogICAgIyAgIFRJTUVTQ0FMRURCX1dPUktfTUVNPTY0TUIKICAgIGNvbW1hbmQ6IC1jIG1heF9jb25uZWN0aW9ucz0xMDAgJHtUSU1FU0NBTEVEQl9TSEFSRURfQlVGRkVSUzorLWMgc2hhcmVkX2J1ZmZlcnM9JHtUSU1FU0NBTEVEQl9TSEFSRURfQlVGRkVSU319ICR7VElNRVNDQUxFREJfRUZGRUNUSVZFX0NBQ0hFX1NJWkU6Ky1jIGVmZmVjdGl2ZV9jYWNoZV9zaXplPSR7VElNRVNDQUxFREJfRUZGRUNUSVZFX0NBQ0hFX1NJWkV9fSAke1RJTUVTQ0FMRURCX1dPUktfTUVNOistYyB3b3JrX21lbT0ke1RJTUVTQ0FMRURCX1dPUktfTUVNfX0KICAgIGVudmlyb25tZW50OgogICAgICBQT1NUR1JFU19EQjogJHtQT1NUR1JFU19EQjotbGxtX3Byb3h5fQogICAgICBQT1NUR1JFU19VU0VSOiAke1BPU1RHUkVTX1VTRVI6LXByb3h5fQogICAgICBQT1NUR1JFU19QQVNTV09SRDogJHtQT1NUR1JFU19QQVNTV09SRDotcHJveHlfZGV2X3Bhc3N3b3JkfQogICAgcG9ydHM6CiAgICAgICMgTE9PUEJBQ0stT05MWTogcHVibGlzaCBvbiBbOjoxXSBzbyBQb3N0Z3JlcyBpcyByZWFjaGFibGUgYnkgdGhlCiAgICAgICMgaG9zdC1uZXR3b3JrZWQgcHJveHkgYXQgbG9jYWxob3N0OjU0MzIgYnV0IE5PVCBvbiBhbnkgcHVibGljIGludGVyZmFjZS4KICAgICAgIwogICAgICAjIFNFQ1VSSVRZICgjMTMyNCk6IERvY2tlciBwdWJsaXNoZXMgcG9ydHMgdmlhIGEgRE5BVCBydWxlIHRoYXQgQllQQVNTRVMKICAgICAgIyB0aGUgaG9zdCBuZnRhYmxlcy9pcHRhYmxlcyBJTlBVVCBjaGFpbiwgc28gYSBgWzo6XWAgLyBgMC4wLjAuMGAgYmluZAogICAgICAjIHdvdWxkIGV4cG9zZSBQb3N0Z3JlcyB0byB0aGUgaW50ZXJuZXQgb24gYSBib3ggd2l0aCBhIHB1YmxpYyBJUCwKICAgICAgIyByZWdhcmRsZXNzIG9mIHRoZSBmaXJld2FsbCB0aGUgaW5zdGFsbGVyIGNvbmZpZ3VyZXMuIEJpbmRpbmcgWzo6MV0ga2VlcHMKICAgICAgIyB0aGUgREIgcHJpdmF0ZS4gSW50ZXItY29udGFpbmVyIHRyYWZmaWMgdXNlcyB0aGUgcHJveHlfbmV0IGRvY2tlciBuZXR3b3JrCiAgICAgICMgKHNlcnZpY2UgbmFtZSBgdGltZXNjYWxlZGJgKSwgbm90IHRoaXMgcHVibGlzaGVkIHBvcnQsIHNvIHRoaXMgaXMgc2FmZS4KICAgICAgLSAiWzo6MV06NTQzMjo1NDMyIgogICAgdm9sdW1lczoKICAgICAgIyDilIDilIAgT3B0aW9uYWwgU1NEIGJpbmQtbW91bnQgZm9yIHRoZSBEQiBkYXRhIGRpciAoaXNzdWUgIzEzMDUpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICAgICAjIERFRkFVTFQgKFRJTUVTQ0FMRURCX0RBVEFfUEFUSCB1bnNldCk6IHRoZSBuYW1lZCB2b2x1bWUgdGltZXNjYWxlZGJfZGF0YQogICAgICAjIG1vdW50ZWQgYXQgdGhlIHBnMTggaW1hZ2UncyBQR0RBVEEg4oCUIGJ5dGUtaWRlbnRpY2FsIHRvIHByaW9yIHJlbGVhc2VzLCBzbwogICAgICAjIGFuIGB1cGdyYWRlYCAod2hpY2ggb3ZlcndyaXRlcyBjb21wb3NlIGJ1dCBwcmVzZXJ2ZXMgZG9ja2VyLy5lbnYpIGZpbmRzIHRoZQogICAgICAjIGV4aXN0aW5nIGRhdGEgaW4gdGhlIGV4YWN0IHNhbWUgcGxhY2UuIFplcm8gZGF0YS1sb3NzIHJpc2suCiAgICAgICMKICAgICAgIyBPUFQtSU4gKFRJTUVTQ0FMRURCX0RBVEFfUEFUSD0vbW50L3NzZC9wZ2RhdGEpOiBjb21wb3NlIHJlbmRlcnMgYSBiaW5kCiAgICAgICMgbW91bnQgdG8gdGhhdCBob3N0IHBhdGggaW5zdGVhZC4gVGhpcyBkb2VzIE5PVCBtaWdyYXRlIGV4aXN0aW5nIGRhdGEg4oCUIGl0CiAgICAgICMgb25seSBwb2ludHMgdGhlIGNvbnRhaW5lciBhdCB0aGUgcGF0aC4gTW92aW5nIHRvIFNTRCByZXF1aXJlcyB0aGUgb3BlcmF0b3IKICAgICAgIyB0byBjb3B5L3Jlc3RvcmUgdGhlIGRhdGEgaW50byB0aGUgbmV3IHBhdGggRklSU1QgKHNlZSBkb2NrZXIvdGxzLmVudi5leGFtcGxlKS4KICAgICAgIyBUaGUgdGFyZ2V0IHBhdGggL3Zhci9saWIvcG9zdGdyZXNxbC8xOC9kb2NrZXIgaXMgdW5jaGFuZ2VkIGluIGJvdGggbW9kZXMuCiAgICAgIC0gJHtUSU1FU0NBTEVEQl9EQVRBX1BBVEg6LXRpbWVzY2FsZWRiX2RhdGF9Oi92YXIvbGliL3Bvc3RncmVzcWwvMTgvZG9ja2VyCiAgICBuZXR3b3JrczoKICAgICAgLSBwcm94eV9uZXQKICAgIGhlYWx0aGNoZWNrOgogICAgICB0ZXN0OiBbIkNNRC1TSEVMTCIsICJwZ19pc3JlYWR5IC1VIHByb3h5IC1kIGxsbV9wcm94eSJdCiAgICAgIGludGVydmFsOiAxMHMKICAgICAgdGltZW91dDogNXMKICAgICAgcmV0cmllczogNQoKICBjb25zdWw6CiAgICBpbWFnZTogaGFzaGljb3JwL2NvbnN1bDoxLjIyCiAgICAjIFNpbmdsZS1ub2RlIHNlcnZlciB3aXRoIHBlcnNpc3RlbnQgc3RvcmFnZS4KICAgICMgUHJldmlvdXMgdmVyc2lvbnMgdXNlZCAtZGV2IG1vZGUgKGluLW1lbW9yeSksIHdoaWNoIGNhdXNlZCBjb21wbGV0ZSBUcmFlZmlrCiAgICAjIHJvdXRpbmcgZmFpbHVyZSBvbiBhbnkgQ29uc3VsIHJlc3RhcnQg4oCUIGFsbCBLViBkYXRhIChpbmNsdWRpbmcgVExTIG9wdGlvbnMKICAgICMgc2VlZGVkIGJ5IGNvbnN1bC1pbml0KSB3YXMgbG9zdCwgYW5kIFRyYWVmaWsncyBwcm94eS1hcGkgcm91dGVyIGZhaWxlZCB3aXRoCiAgICAjICJ1bmtub3duIFRMUyBvcHRpb25zOiBzdHJvbmctdGxzQGNvbnN1bCIuIFNlZSBpc3N1ZSAjMzM1LgogICAgIyAtY2xpZW50PVs6Ol0gYmluZHMgdGhlIGFnZW50J3MgSFRUUCBBUEkgdG8gYWxsIElQdjYgaW50ZXJmYWNlcyBJTlNJREUgdGhlCiAgICAjIGNvbnRhaW5lcjsgdGhlIHB1Ymxpc2hlZCBob3N0IHBvcnQgYmVsb3cgaXMgd2hhdCBjb250cm9scyBleHRlcm5hbCByZWFjaC4KICAgICMgVHJhZWZpayB1c2VzIG5ldHdvcmtfbW9kZTogaG9zdCBhbmQgcmVhY2hlcyBDb25zdWwgYXQgWzo6MV06ODUwMCB2aWEgdGhlCiAgICAjIGxvb3BiYWNrLW9ubHkgcHVibGlzaGVkIGhvc3QgcG9ydCBiZWxvdy4KICAgIGNvbW1hbmQ6CiAgICAgIC0gImNvbnN1bCIKICAgICAgLSAiYWdlbnQiCiAgICAgIC0gIi1zZXJ2ZXIiCiAgICAgIC0gIi1ib290c3RyYXAtZXhwZWN0PTEiCiAgICAgIC0gIi1jbGllbnQ9Wzo6XSIKICAgICAgLSAiLWRhdGEtZGlyPS9jb25zdWwvZGF0YSIKICAgIHBvcnRzOgogICAgICAjIExPT1BCQUNLLU9OTFk6IHB1Ymxpc2ggb24gWzo6MV0gc28gaG9zdC1uZXR3b3JrZWQgVHJhZWZpayBjYW4gcmVhY2ggdGhlCiAgICAgICMgSFRUUCBBUEkgYXQgWzo6MV06ODUwMCBidXQgdGhlIENvbnN1bCBBUEkgaXMgTk9UIGV4cG9zZWQgcHVibGljbHkuCiAgICAgICMKICAgICAgIyBTRUNVUklUWSAoIzEzMjQpOiBEb2NrZXIncyBgLXBgIEROQVQgYnlwYXNzZXMgdGhlIGhvc3QgZmlyZXdhbGwgSU5QVVQKICAgICAgIyBjaGFpbiwgc28gYSBgWzo6XWAgLyBgMC4wLjAuMGAgYmluZCB3b3VsZCBleHBvc2UgdGhlIENvbnN1bCBLVi9BUEkKICAgICAgIyAod2hpY2ggY2FycmllcyBUcmFlZmlrIFRMUyBjb25maWcpIHRvIHRoZSBpbnRlcm5ldCBvbiBhIHB1YmxpYyBib3guCiAgICAgICMgY29uc3VsLWluaXQgcmVhY2hlcyBDb25zdWwgb3ZlciB0aGUgcHJveHlfbmV0IGRvY2tlciBuZXR3b3JrLCBzbyB0aGlzCiAgICAgICMgbG9vcGJhY2sgYmluZCBkb2VzIG5vdCBhZmZlY3QgaW50ZXItY29udGFpbmVyIGluaXQuCiAgICAgIC0gIls6OjFdOjg1MDA6ODUwMCIKICAgIHZvbHVtZXM6CiAgICAgIC0gY29uc3VsX2RhdGE6L2NvbnN1bC9kYXRhCiAgICBuZXR3b3JrczoKICAgICAgLSBwcm94eV9uZXQKICAgIGhlYWx0aGNoZWNrOgogICAgICAjIFVzZSB0aGUgSFRUUCBBUEkgc3RhdHVzIGVuZHBvaW50IOKAlCBpdCBpcyByZWFkeSBvbmx5IGFmdGVyIHRoZSBhZ2VudCBpcwogICAgICAjIGZ1bGx5IGluaXRpYWxpc2VkLiBgY29uc3VsIG1lbWJlcnNgIGZpcmVzIGVhcmxpZXIgYW5kIGlzIG5vdCBzdWZmaWNpZW50LgogICAgICB0ZXN0OiBbIkNNRC1TSEVMTCIsICJjdXJsIC1zZiBodHRwOi8vWzo6MV06ODUwMC92MS9zdGF0dXMvbGVhZGVyIl0KICAgICAgaW50ZXJ2YWw6IDEwcwogICAgICB0aW1lb3V0OiA1cwogICAgICByZXRyaWVzOiA1CiAgICAgIHN0YXJ0X3BlcmlvZDogNXMKCiAgIyDilIDilIDilIAgQ29uc3VsIEtWIGluaXQgKG9uZS1zaG90KSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAjIFNlZWRzIFRyYWVmaWsgVExTIG9wdGlvbnMgaW50byBDb25zdWwgS1YgYmVmb3JlIFRyYWVmaWsgc3RhcnRzLgogICMgTXVzdCBydW4gYWZ0ZXIgQ29uc3VsIGlzIGhlYWx0aHkgYW5kIG11c3QgY29tcGxldGUgc3VjY2Vzc2Z1bGx5IGJlZm9yZQogICMgVHJhZWZpayBpcyBhbGxvd2VkIHRvIHN0YXJ0IChzZWUgdHJhZWZpay5kZXBlbmRzX29uIGJlbG93KS4KICAjCiAgIyBSZXF1aXJlcyBEb2NrZXIgQ29tcG9zZSB2Mi4xKyBmb3Igc2VydmljZV9jb21wbGV0ZWRfc3VjY2Vzc2Z1bGx5IGNvbmRpdGlvbi4KICAjCiAgIyBJbiB0aGUgYmFzZSAoZGV2KSBjb21wb3NlLCBDb25zdWwgaXMgcmVhY2hhYmxlIGF0IGNvbnN1bDo4NTAwIHZpYSBEb2NrZXIKICAjIGJyaWRnZSBETlMgc2luY2UgY29uc3VsLWluaXQgcnVucyBvbiBwcm94eV9uZXQgYWxvbmdzaWRlIGNvbnN1bC4KICBjb25zdWwtaW5pdDoKICAgIGltYWdlOiBoYXNoaWNvcnAvY29uc3VsOjEuMjIKICAgICMgcmVzdGFydDogIm5vIiDigJQgb25lLXNob3QgaW5pdCBjb250YWluZXI7IG11c3Qgbm90IGJlIHJlc3RhcnRlZCBhZnRlciBleGl0LgogICAgcmVzdGFydDogIm5vIgogICAgZGVwZW5kc19vbjoKICAgICAgY29uc3VsOgogICAgICAgIGNvbmRpdGlvbjogc2VydmljZV9oZWFsdGh5CiAgICBuZXR3b3JrczoKICAgICAgLSBwcm94eV9uZXQKICAgIGVudmlyb25tZW50OgogICAgICBDT05TVUxfSFRUUF9BRERSOiBodHRwOi8vY29uc3VsOjg1MDAKICAgICAgIyBDT05TVUxfSFRUUF9UT0tFTiBtdXN0IGJlIHRoZSBib290c3RyYXAgdG9rZW4gd3JpdHRlbiB0byAuZW52IGJ5IHRoZQogICAgICAjIGluc3RhbGxlcidzIEFDTCBib290c3RyYXAgc3RlcC4gV2l0aG91dCBpdCwgYWxsIGNvbnN1bCBrdiBwdXQgY2FsbHMKICAgICAgIyBmYWlsIHdpdGggNDAzIChkZWZhdWx0X3BvbGljeTogZGVueSkgYW5kIFRyYWVmaWsgaGFzIG5vIFRMUyBvcHRpb25zLgogICAgICBDT05TVUxfSFRUUF9UT0tFTjogJHtDT05TVUxfSFRUUF9UT0tFTjotfQogICAgICAjIGJhY2tlbmQtdW5hdmFpbGFibGUgcmVzcG9uZGVyIFVSTCAoaXNzdWUgIzEzMzQpLiBJbiB0aGUgYmFzZSBjb21wb3NlIGJvdGgKICAgICAgIyBUcmFlZmlrIGFuZCB0aGUgcmVzcG9uZGVyIGFyZSByZWFjaGVkIG92ZXIgdGhlIGhvc3QgbmV0d29yayBzdGFjaywgc28KICAgICAgIyBUcmFlZmlrIHJlYWNoZXMgdGhlIHJlc3BvbmRlciBhdCB0aGUgcHVibGlzaGVkIGhvc3QgcG9ydCBbOjoxXTo4MDgxLgogICAgICBUUkFFRklLX1VOQVZBSUxBQkxFX0JBQ0tFTkRfVVJMOiAke1RSQUVGSUtfVU5BVkFJTEFCTEVfQkFDS0VORF9VUkw6LWh0dHA6Ly9bOjoxXTo4MDgxfQogICAgZW50cnlwb2ludDoKICAgICAgLSAvYmluL3NoCiAgICAgIC0gLWMKICAgICAgLSB8CiAgICAgICAgc2V0IC1lCiAgICAgICAgIyDilIDilIAgRmFpbC1sb3VkIEFDTCB3cml0ZSBnYXRlICgjMTU1MCAvICMxNTUxKSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICAgICAjIEFMV0FZUyBwcm9iZSB0aGF0IHdlIGNhbiBXUklURSB0aGUgdHJhZWZpay8gS1YgcHJlZml4IGJlZm9yZSBzZWVkaW5nLgogICAgICAgICMgVGhlIFdSSVRFIFJFU1VMVCBpcyB0aGUgZGlzY3JpbWluYXRvciwgTk9UIHRva2VuIHByZXNlbmNlOgogICAgICAgICMgICAqIEFDTHMgb2ZmIChiYXNlL2RldiDigJQgYW5vbnltb3VzIHdyaXRlcyBhbGxvd2VkKSDihpIgcHJvYmUgc3VjY2VlZHMg4oaSIGNvbnRpbnVlLgogICAgICAgICMgICAqIEFDTHMgb24gd2l0aCBhbiBlbXB0eS9pbnZhbGlkIHRva2VuICh0aGUgIzE1NTAgaW5jaWRlbnQpIOKGkiA0MDMg4oaSIEZBVEFMLgogICAgICAgICMgQSB0b2tlbi1wcmVzZW5jZSBndWFyZCBjYW5ub3QgdGVsbCB0aGVzZSBhcGFydCDigJQgdGhlIGluY2lkZW50IHRva2VuIHdhcwogICAgICAgICMgQUxTTyBlbXB0eSDigJQgc28gdGhlIHByb2JlIG11c3QgcnVuIHVuY29uZGl0aW9uYWxseS4gSGFyZC1mYWlsaW5nIGhlcmUgbWFrZXMKICAgICAgICAjIHRoZSBgZGVwZW5kc19vbjogY29uc3VsLWluaXQ6IHNlcnZpY2VfY29tcGxldGVkX3N1Y2Nlc3NmdWxseWAgZ2F0ZSBibG9jawogICAgICAgICMgVHJhZWZpayBhbmQgYGNvbXBvc2UgdXBgIHJldHVybiBub24temVybywgaW5zdGVhZCBvZiBUcmFlZmlrIGNvbWluZyB1cCAiVXAiCiAgICAgICAgIyBhbmQgc2VydmluZyA0MDQgZm9yIGV2ZXJ5dGhpbmcgKHN0cm9uZy10bHNAY29uc3VsIHVucmVzb2x2ZWQpLiBUaGUgYm91bmRlZAogICAgICAgICMgcmV0cnkgYWJzb3JicyBhIGNvbnN1bCBsZWFkZXItZWxlY3Rpb24gLyBBQ0wtaW5pdCByYWNlIG9uIGEgY29sZCBib290LgogICAgICAgICMgKCQkVkFSIGlzIGVzY2FwZWQgc28gQ29tcG9zZSBwYXNzZXMgaXQgdGhyb3VnaCBsaXRlcmFsbHkgdG8gdGhlIHNoZWxsLikKICAgICAgICBfcHJvYmVfb2s9MAogICAgICAgIF90cnk9MQogICAgICAgIHdoaWxlIFsgIiQkX3RyeSIgLWxlIDMgXTsgZG8KICAgICAgICAgIGlmIGNvbnN1bCBrdiBwdXQgdHJhZWZpay8uY29uc3VsLWluaXQtd3JpdGVjaGVjayBvayA+IC9kZXYvbnVsbCAyPiYxOyB0aGVuCiAgICAgICAgICAgIF9wcm9iZV9vaz0xCiAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICBmaQogICAgICAgICAgc2xlZXAgMgogICAgICAgICAgX3RyeT0kJCgoX3RyeSArIDEpKQogICAgICAgIGRvbmUKICAgICAgICBpZiBbICIkJF9wcm9iZV9vayIgLW5lIDEgXTsgdGhlbgogICAgICAgICAgZWNobyAiRkFUQUwoY29uc3VsLWluaXQpOiBjYW5ub3Qgd3JpdGUgdHJhZWZpay8gS1Yg4oCUIENPTlNVTF9IVFRQX1RPS0VOIGlzIGVtcHR5IG9yIGxhY2tzIGtleTp3cml0ZSAoNDAzIHVuZGVyIGRlZmF1bHRfcG9saWN5PWRlbnkpLiBUcmFlZmlrIHN0cm9uZy10bHNAY29uc3VsIHdvdWxkIGJlIHVucmVzb2x2ZWQgLT4gaW5ncmVzcyA0MDQuIEFib3J0aW5nICgjMTU1MCkuIiA+JjIKICAgICAgICAgIGV4aXQgMQogICAgICAgIGZpCiAgICAgICAgY29uc3VsIGt2IGRlbGV0ZSB0cmFlZmlrLy5jb25zdWwtaW5pdC13cml0ZWNoZWNrID4gL2Rldi9udWxsIDI+JjEgfHwgdHJ1ZQogICAgICAgICMgSWRlbXBvdGVudDogb25seSB3cml0ZSBlYWNoIGtleSBpZiBpdCBkb2VzIG5vdCBhbHJlYWR5IGV4aXN0LgogICAgICAgICMgVGhpcyBtYWtlcyByZS1kZXBsb3lzIHNhZmUg4oCUIG5vIGRhdGEgaXMgb3ZlcndyaXR0ZW4uCiAgICAgICAgY29uc3VsIGt2IGdldCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvbWluVmVyc2lvbiA+IC9kZXYvbnVsbCAyPiYxIHx8IFwKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL21pblZlcnNpb24gVmVyc2lvblRMUzEyCiAgICAgICAgY29uc3VsIGt2IGdldCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvY2lwaGVyU3VpdGVzLzAgPiAvZGV2L251bGwgMj4mMSB8fCB7CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvdGxzL29wdGlvbnMvc3Ryb25nLXRscy9jaXBoZXJTdWl0ZXMvMCBUTFNfRUNESEVfRUNEU0FfV0lUSF9BRVNfMTI4X0dDTV9TSEEyNTYKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL2NpcGhlclN1aXRlcy8xIFRMU19FQ0RIRV9SU0FfV0lUSF9BRVNfMTI4X0dDTV9TSEEyNTYKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL2NpcGhlclN1aXRlcy8yIFRMU19FQ0RIRV9FQ0RTQV9XSVRIX0FFU18yNTZfR0NNX1NIQTM4NAogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvY2lwaGVyU3VpdGVzLzMgVExTX0VDREhFX1JTQV9XSVRIX0FFU18yNTZfR0NNX1NIQTM4NAogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvY2lwaGVyU3VpdGVzLzQgVExTX0VDREhFX0VDRFNBX1dJVEhfQ0hBQ0hBMjBfUE9MWTEzMDVfU0hBMjU2CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvdGxzL29wdGlvbnMvc3Ryb25nLXRscy9jaXBoZXJTdWl0ZXMvNSBUTFNfRUNESEVfUlNBX1dJVEhfQ0hBQ0hBMjBfUE9MWTEzMDVfU0hBMjU2CiAgICAgICAgfQoKICAgICAgICAjIOKUgOKUgCBiYWNrZW5kLXVuYXZhaWxhYmxlIDUwMyBmYWxsYmFjayAoaXNzdWUgIzEzMzQpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICAgICAgICMgU2VlZCBhIGxpZmVjeWNsZS1pbmRlcGVuZGVudCBUcmFlZmlrIHJvdXRpbmcgZ3JhcGggaW50byBDb25zdWwgS1YgdGhhdAogICAgICAgICMgdHVybnMgYSBkb3duZWQvYWJzZW50IHByb3h5IGJhY2tlbmQgaW50byBhIFJFVFJZQUJMRSA1MDMgaW5zdGVhZCBvZiBhCiAgICAgICAgIyA0MDQuIEJlY2F1c2UgdGhlc2Uga2V5cyBsaXZlIGluIENvbnN1bCBLViAobm90IERvY2tlciBsYWJlbHMpIHRoZXkKICAgICAgICAjIHN1cnZpdmUgdGhlIHByb3h5IGNvbnRhaW5lciBiZWluZyBzdG9wcGVkL3JlbW92ZWQg4oCUIHdoaWNoIGlzIGV4YWN0bHkgdGhlCiAgICAgICAgIyB3aW5kb3cgdGhhdCBwcm9kdWNlZCB0aGUgNDA0IC0+ICJwaWNrIGEgZGlmZmVyZW50IG1vZGVsIiBtaXNmaXJlLgogICAgICAgICMKICAgICAgICAjIElkZW1wb3RlbnQ6IGVhY2gga2V5IGlzIHdyaXR0ZW4gb25seSBpZiBpdCBkb2VzIG5vdCBhbHJlYWR5IGV4aXN0LCBzbwogICAgICAgICMgcmUtZGVwbG95cyBuZXZlciBjbG9iYmVyIG9wZXJhdG9yIG92ZXJyaWRlcy4KICAgICAgICAjCiAgICAgICAgIyBOT1RFOiAkJHtUUkFFRklLX1VOQVZBSUxBQkxFX0JBQ0tFTkRfVVJMfSBpcyBlc2NhcGVkICgkJCkgc28gRG9ja2VyCiAgICAgICAgIyBDb21wb3NlIHBhc3NlcyBpdCB0aHJvdWdoIHRvIHRoZSBzaGVsbCBhcyBhIGxpdGVyYWwgJFZBUiDigJQgdGhlIHZhbHVlIGlzCiAgICAgICAgIyByZWFkIGZyb20gdGhlIGNvbnRhaW5lciBFTlZJUk9OTUVOVCAoc2V0IGFib3ZlKSwgbm90IHN1YnN0aXR1dGVkIGJ5CiAgICAgICAgIyBDb21wb3NlIGF0IHJlbmRlciB0aW1lLgogICAgICAgICMKICAgICAgICAjIDEuIFN0YXRpYyByZXNwb25kZXIgc2VydmljZSAoYWx3YXlzLXVwIHNpZGVjYXIgc2VydmluZyA1MDMgKyBlbnZlbG9wZSkuCiAgICAgICAgIyAgICBUaGUgVVJMIGlzIElORlJBU1RSVUNUVVJFLWRlcml2ZWQgKGl0IHRyYWNrcyB0aGUgbmV0d29ya2luZyBtb2RlOgogICAgICAgICMgICAgaG9zdCAtPiBbOjoxXTo4MDgxLCBicmlkZ2UgLT4gYmFja2VuZC11bmF2YWlsYWJsZTo4MCksIE5PVCBhbiBvcGVyYXRvcgogICAgICAgICMgICAgcHJlZmVyZW5jZSwgc28gd3JpdGUgaXQgRVZFUlkgcnVuLiBUaGlzIHNlbGYtaGVhbHMgdG9wb2xvZ3kgZHJpZnQg4oCUCiAgICAgICAgIyAgICBlLmcuIHN3aXRjaGluZyBiYXNlIChob3N0KSB0by9mcm9tIG5vLW1kbnMgKGJyaWRnZSkgb24gYW4gZXhpc3RpbmcKICAgICAgICAjICAgIENvbnN1bCB2b2x1bWUg4oCUIHdoaWNoIGEgd3JpdGUtaWYtYWJzZW50IGd1YXJkIHdvdWxkIGxlYXZlIHN0YWxlIGFuZAogICAgICAgICMgICAgdW5yZWFjaGFibGUuIFRoZSBtaWRkbGV3YXJlL3JvdXRlciBibG9ja3MgYmVsb3cgYXJlIHN0YXRpYyBkZWZpbml0aW9ucwogICAgICAgICMgICAgYW5kIGtlZXAgdGhlIHdyaXRlLWlmLWFic2VudCBndWFyZCBzbyBvcGVyYXRvciBvdmVycmlkZXMgc3Vydml2ZS4KICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9zZXJ2aWNlcy9iYWNrZW5kLXVuYXZhaWxhYmxlL2xvYWRCYWxhbmNlci9zZXJ2ZXJzLzAvdXJsICIkJHtUUkFFRklLX1VOQVZBSUxBQkxFX0JBQ0tFTkRfVVJMfSIKICAgICAgICAjIDIuIGVycm9ycyBtaWRkbGV3YXJlOiBjYXRjaCBhIGRlYWQtYnV0LXByZXNlbnQgYmFja2VuZCAoNTAyLzUwMy81MDQpIGFuZAogICAgICAgICMgICAgc2VydmUgdGhlIHJlc3BvbmRlciBib2R5LiBxdWVyeT0vIGZldGNoZXMgdGhlIHJlc3BvbmRlcidzIGNhdGNoLWFsbAogICAgICAgICMgICAgNTAzIGVudmVsb3BlIGZvciBldmVyeSBlcnJvci4KICAgICAgICBjb25zdWwga3YgZ2V0IHRyYWVmaWsvaHR0cC9taWRkbGV3YXJlcy9zZXJ2aWNlLXVuYXZhaWxhYmxlL2Vycm9ycy9zdGF0dXMvMCA+IC9kZXYvbnVsbCAyPiYxIHx8IHsKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL21pZGRsZXdhcmVzL3NlcnZpY2UtdW5hdmFpbGFibGUvZXJyb3JzL3N0YXR1cy8wIDUwMgogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvbWlkZGxld2FyZXMvc2VydmljZS11bmF2YWlsYWJsZS9lcnJvcnMvc3RhdHVzLzEgNTAzCiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9taWRkbGV3YXJlcy9zZXJ2aWNlLXVuYXZhaWxhYmxlL2Vycm9ycy9zdGF0dXMvMiA1MDQKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL21pZGRsZXdhcmVzL3NlcnZpY2UtdW5hdmFpbGFibGUvZXJyb3JzL3NlcnZpY2UgYmFja2VuZC11bmF2YWlsYWJsZUBjb25zdWwKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL21pZGRsZXdhcmVzL3NlcnZpY2UtdW5hdmFpbGFibGUvZXJyb3JzL3F1ZXJ5IC8KICAgICAgICB9CiAgICAgICAgIyAzLiBMb3dlc3QtcHJpb3JpdHkgY2F0Y2gtYWxsIHJvdXRlcjogd2hlbiB0aGUgcHJveHktYXBpIERvY2tlciByb3V0ZXIgaGFzCiAgICAgICAgIyAgICBkaXNhcHBlYXJlZCAoY29udGFpbmVyIHJlbW92ZWQpIG5vdGhpbmcgZWxzZSBtYXRjaGVzLCBzbyB0aGlzIHNlcnZlcwogICAgICAgICMgICAgdGhlIHJlc3BvbmRlciBkaXJlY3RseS4gcHJpb3JpdHk9MSBndWFyYW50ZWVzIHRoZSByZWFsIHByb3h5LWFwaQogICAgICAgICMgICAgcm91dGVyIChubyBleHBsaWNpdCBwcmlvcml0eSAtPiByYW5rZWQgYnkgcnVsZSBsZW5ndGgpIGFsd2F5cyB3aW5zCiAgICAgICAgIyAgICB3aGlsZSB0aGUgcHJveHkgaXMgdXAuCiAgICAgICAgY29uc3VsIGt2IGdldCB0cmFlZmlrL2h0dHAvcm91dGVycy9iYWNrZW5kLXVuYXZhaWxhYmxlL3J1bGUgPiAvZGV2L251bGwgMj4mMSB8fCB7CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9yb3V0ZXJzL2JhY2tlbmQtdW5hdmFpbGFibGUvcnVsZSAnUGF0aFByZWZpeChgL2ApJwogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvcm91dGVycy9iYWNrZW5kLXVuYXZhaWxhYmxlL2VudHJ5UG9pbnRzLzAgd2Vic2VjdXJlCiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9yb3V0ZXJzL2JhY2tlbmQtdW5hdmFpbGFibGUvcHJpb3JpdHkgMQogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvcm91dGVycy9iYWNrZW5kLXVuYXZhaWxhYmxlL3NlcnZpY2UgYmFja2VuZC11bmF2YWlsYWJsZUBjb25zdWwKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL3JvdXRlcnMvYmFja2VuZC11bmF2YWlsYWJsZS90bHMvb3B0aW9ucyBzdHJvbmctdGxzCiAgICAgICAgfQoKICAjIOKUgOKUgOKUgCBiYWNrZW5kLXVuYXZhaWxhYmxlIHJlc3BvbmRlciAoaXNzdWUgIzEzMzQpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICMgQWx3YXlzLXVwIHN0YXRpYyBzaWRlY2FyIHRoYXQgYW5zd2VycyBFVkVSWSByZXF1ZXN0IHdpdGggYSByZXRyeWFibGUgSFRUUCA1MDMKICAjIGNhcnJ5aW5nIGEgUmV0cnktQWZ0ZXIgaGVhZGVyIGFuZCBhbiBBbnRocm9waWMgZXJyb3ItZW52ZWxvcGUgYm9keQogICMgKHsidHlwZSI6ImVycm9yIiwiZXJyb3IiOnsidHlwZSI6Im92ZXJsb2FkZWRfZXJyb3IiLC4uLn19KS4gVHJhZWZpayByb3V0ZXMKICAjIGhlcmUgKHZpYSB0aGUgQ29uc3VsIEtWIGNhdGNoLWFsbCByb3V0ZXIgYW5kIHRoZSBzZXJ2aWNlLXVuYXZhaWxhYmxlIGVycm9ycwogICMgbWlkZGxld2FyZSBzZWVkZWQgYnkgY29uc3VsLWluaXQgYWJvdmUpIHdoZW5ldmVyIHRoZSBwcm94eSBiYWNrZW5kIGlzIG9mZmxpbmUsCiAgIyBzbyBDbGF1ZGUgQ29kZS9DTEkgdHJlYXRzIHRoZSBibGlwIGFzIHRyYW5zaWVudCBhbmQgcmV0cmllcyBpbnN0ZWFkIG9mCiAgIyByZWFkaW5nIGEgNDA0IGFzICJtb2RlbCBub3QgZm91bmQgLyBubyBhY2Nlc3MiLgogICMKICAjIFJ1bnMgb24gdGhlIHByb3h5X25ldCBicmlkZ2UgYW5kIHB1Ymxpc2hlcyBpdHMgSFRUUCBwb3J0IG9uIHRoZSBob3N0IHNvIHRoZQogICMgaG9zdC1uZXR3b3JrZWQgVHJhZWZpayByZWFjaGVzIGl0IGF0IFs6OjFdOjgwODEgKG1hdGNoaW5nIHRoZSBXQUYgc2lkZWNhcgogICMgcGF0dGVybikuIExpc3RlbnMgcGxhaW4tSFRUUDsgVExTIHRlcm1pbmF0ZXMgYXQgVHJhZWZpay4KICBiYWNrZW5kLXVuYXZhaWxhYmxlOgogICAgaW1hZ2U6IG5naW54OjEuMjctYWxwaW5lCiAgICByZXN0YXJ0OiB1bmxlc3Mtc3RvcHBlZAogICAgbmV0d29ya3M6CiAgICAgIC0gcHJveHlfbmV0CiAgICBwb3J0czoKICAgICAgIyBCaW5kIHRvIGxvb3BiYWNrIG9ubHkg4oCUIHRoaXMgcmVzcG9uZGVyIGlzIGludGVybmFsIHRvIHRoZSBob3N0IGFuZCBtdXN0CiAgICAgICMgbm90IGJlIGV4cG9zZWQgdG8gdGhlIExBTi4gVHJhZWZpayAobmV0d29ya19tb2RlOiBob3N0KSByZWFjaGVzIGl0IGhlcmUuCiAgICAgIC0gIls6OjFdOjgwODE6ODAiCiAgICB2b2x1bWVzOgogICAgICAtIC4vYmFja2VuZC11bmF2YWlsYWJsZS9kZWZhdWx0LmNvbmY6L2V0Yy9uZ2lueC9jb25mLmQvZGVmYXVsdC5jb25mOnJvCiAgICBoZWFsdGhjaGVjazoKICAgICAgdGVzdDogWyJDTUQtU0hFTEwiLCAid2dldCAtcSAtTyAvZGV2L251bGwgaHR0cDovL2xvY2FsaG9zdC9oZWFsdGh6IHx8IGV4aXQgMSJdCiAgICAgIGludGVydmFsOiAxNXMKICAgICAgdGltZW91dDogNXMKICAgICAgcmV0cmllczogMwogICAgICBzdGFydF9wZXJpb2Q6IDVzCgogIHRyYWVmaWs6CiAgICBpbWFnZTogdHJhZWZpazp2MwogICAgIyBuZXR3b3JrX21vZGU6IGhvc3QgZ2l2ZXMgVHJhZWZpayBkaXJlY3QgYWNjZXNzIHRvIHRoZSBob3N0IG5ldHdvcmsgc3RhY2suCiAgICAjIFRoaXMgaXMgcmVxdWlyZWQgc28gdGhhdCBjbGllbnQgc291cmNlIElQcyBhcmUgcmVhbCAobm90IERvY2tlciBicmlkZ2UgSVBzKS4KICAgICMgV2l0aCBob3N0IG5ldHdvcmtpbmcsIHBvcnQgbWFwcGluZ3MgYXJlIGlycmVsZXZhbnQg4oCUIFRyYWVmaWsgYmluZHMgZGlyZWN0bHkKICAgICMgdG8gdGhlIGhvc3QgaW50ZXJmYWNlcyBvbiB0aGUgcG9ydHMgZGVjbGFyZWQgaW4gZW50cnlwb2ludHMgKFs6Ol06NDQzIGV0Yy4pLgogICAgIyBOb3RlOiBuZXR3b3JrX21vZGU6IGhvc3QgaXMgc3VwcG9ydGVkIG9uIExpbnV4IGFuZCBtYWNPUyAoRG9ja2VyIERlc2t0b3AgNC4zNCsKICAgICMgd2l0aCBob3N0IG5ldHdvcmtpbmcgZW5hYmxlZCDigJQgU2V0dGluZ3Mg4oaSIFJlc291cmNlcyDihpIgTmV0d29yaykuIFRoZSBpbnN0YWxsZXIKICAgICMgZGV0ZWN0cyBhbmQgZ3VpZGVzIGVuYWJsZW1lbnQgYXV0b21hdGljYWxseS4gV2luZG93cyBEb2NrZXIgRGVza3RvcCBkb2VzIG5vdAogICAgIyBzdXBwb3J0IGhvc3QgbmV0d29ya2luZyDigJQgdXNlIFdTTDIgb3IgYSBMaW51eCBob3N0LgogICAgIwogICAgIyBEb2NrZXIgbGFiZWwgZGlzY292ZXJ5IHN0aWxsIHdvcmtzIHdpdGggbmV0d29ya19tb2RlOiBob3N0IGJlY2F1c2UgRG9ja2VyCiAgICAjIHNvY2tldCBhY2Nlc3MgaXMgaW5kZXBlbmRlbnQgb2YgbmV0d29yayBtb2RlLiBUcmFlZmlrIHJlYWRzIGNvbnRhaW5lcgogICAgIyBtZXRhZGF0YSB2aWEgdGhlIERvY2tlciBBUEkgc29ja2V0LCBub3QgdmlhIHRoZSBuZXR3b3JrIHN0YWNrLgogICAgIyBUaGUgcHJveHkgc2VydmljZSBhbHNvIHVzZXMgbmV0d29ya19tb2RlOiBob3N0IChyZXF1aXJlZCBmb3IgbUROUyBtdWx0aWNhc3QpOwogICAgIyBib3RoIFRyYWVmaWsgYW5kIHRoZSBwcm94eSBhcmUgb24gdGhlIGhvc3QgbmV0d29yayBzdGFjayBzbyBUcmFlZmlrIHJvdXRlcwogICAgIyB0byBsb2NhbGhvc3Q6PHBvcnQ+IGRpcmVjdGx5IOKAlCBubyBEb2NrZXIgYnJpZGdlIG5ldHdvcmsgcmVzb2x1dGlvbiBuZWVkZWQuCiAgICBuZXR3b3JrX21vZGU6IGhvc3QKICAgICMgZW52X2ZpbGUgcGFzc2VzIC5lbnYgdmFyaWFibGVzIElOVE8gdGhlIFRyYWVmaWsgY29udGFpbmVyIGVudmlyb25tZW50LgogICAgIyBEb2NrZXIgQ29tcG9zZSAtLWVudi1maWxlIC8gdGhlIC5lbnYgZmlsZSBvbmx5IGZlZWRzIFlBTUwgdmFyaWFibGUKICAgICMgc3Vic3RpdHV0aW9uICgke1ZBUn0pIOKAlCBpdCBkb2VzIE5PVCBwYXNzIHZhcmlhYmxlcyBpbnRvIGNvbnRhaW5lcnMuCiAgICAjIFdpdGhvdXQgZW52X2ZpbGUsIENPTlNVTF9IVFRQX1RPS0VOIGlzIG5ldmVyIHNldCBpbnNpZGUgdGhlIFRyYWVmaWsKICAgICMgcHJvY2Vzcywgc28gYWxsIENvbnN1bCBLViByZWFkcyBmYWlsIHdpdGggNDAzIGFuZCBzdHJvbmctdGxzQGNvbnN1bAogICAgIyBUTFMgb3B0aW9ucyBhcmUgbmV2ZXIgbG9hZGVkLgogICAgZW52X2ZpbGU6CiAgICAgIC0gcGF0aDogLmVudgogICAgICAgIHJlcXVpcmVkOiBmYWxzZQogICAgY29tbWFuZDoKICAgICAgIyBDb25zdWwgS1YgcHJvdmlkZXI6IFRMUyBvcHRpb25zIGFyZSBzZWVkZWQgaW50byBDb25zdWwgYnkgY29uc3VsLWluaXQgKCMyNDApLgogICAgICAjIFRyYWVmaWsgdXNlcyBuZXR3b3JrX21vZGU6IGhvc3QgYW5kIHJlYWNoZXMgQ29uc3VsIGF0IFs6OjFdOjg1MDAgdmlhIHRoZQogICAgICAjIHB1Ymxpc2hlZCBob3N0IHBvcnQuIHJvb3RrZXk9dHJhZWZpayBtYXRjaGVzIHRoZSBLViBwcmVmaXggdXNlZCBieSBjb25zdWwtaW5pdC4KICAgICAgIwogICAgICAjIFN0YXJ0dXAgcmFjZSBub3RlOiBpZiBDb25zdWwgaXMgdW5hdmFpbGFibGUgd2hlbiBUcmFlZmlrIHN0YXJ0cywgVHJhZWZpawogICAgICAjIHdpbGwgbG9hZCBubyBUTFMgb3B0aW9ucyBmcm9tIENvbnN1bCBhbmQgZmFsbCBiYWNrIHRvIGRlZmF1bHRzIChUTFMgMS4wCiAgICAgICMgYWxsb3dlZCkuIFRoZSBkZXBlbmRzX29uOiBjb25zdWwtaW5pdDogc2VydmljZV9jb21wbGV0ZWRfc3VjY2Vzc2Z1bGx5IG9yZGVyaW5nCiAgICAgICMgYmVsb3cgcHJldmVudHMgdGhpcyB1bmRlciBub3JtYWwgb3BlcmF0aW9uLgogICAgICAtICItLXByb3ZpZGVycy5jb25zdWwuZW5kcG9pbnRzPVs6OjFdOjg1MDAiCiAgICAgIC0gIi0tcHJvdmlkZXJzLmNvbnN1bC5yb290a2V5PXRyYWVmaWsiCiAgICAgICMgRG9ja2VyIHByb3ZpZGVyOiBkaXNjb3ZlcnMgcm91dGluZyBjb25maWcgZnJvbSBjb250YWluZXIgbGFiZWxzCiAgICAgIC0gIi0tcHJvdmlkZXJzLmRvY2tlcj10cnVlIgogICAgICAtICItLXByb3ZpZGVycy5kb2NrZXIuZXhwb3NlZEJ5RGVmYXVsdD1mYWxzZSIKICAgICAgIyBGaWxlIHByb3ZpZGVyOiBvcGVyYXRvciBkcm9wLWluIGRpcmVjdG9yeSAoaXNzdWUgIzEzNDApLgogICAgICAjIEEgd2F0Y2hlZCwgcmVhZC1vbmx5IGRpcmVjdG9yeSB3aGVyZSBvcGVyYXRvcnMgbWF5IGRyb3Agc2l0ZS1zcGVjaWZpYwogICAgICAjIFRyYWVmaWsgZHluYW1pYyBjb25maWcgKCoueW1sLyoudG9tbCkg4oCUIGN1c3RvbSByb3V0ZXJzLCBtaWRkbGV3YXJlcywKICAgICAgIyByZWRpcmVjdHMsIGhlYWRlcnMg4oCUIFdJVEhPVVQgbW9kaWZ5aW5nIHRoZSBwcm9kdWN0IHRlbXBsYXRlcy4gRU1QVFkgYnkKICAgICAgIyBkZWZhdWx0OiBhIGNsZWFuIGluc3RhbGwgbG9hZHMgbm90aGluZyBoZXJlLCBzbyBiZWhhdmlvdXIgaXMgdW5jaGFuZ2VkCiAgICAgICMgdW50aWwgYW4gb3BlcmF0b3IgZHJvcHMgYSBmaWxlLiBDb2V4aXN0cyB3aXRoIHRoZSBjb25zdWwgKyBkb2NrZXIKICAgICAgIyBwcm92aWRlcnMgYWJvdmUuIFNlZSBkb2NzL3Rscy1zZXR1cC5tZCAoIk9wZXJhdG9yIFRyYWVmaWsgZHJvcC1pbiIpLgogICAgICAtICItLXByb3ZpZGVycy5maWxlLmRpcmVjdG9yeT0vZXRjL3RyYWVmaWsvZHluYW1pYyIKICAgICAgLSAiLS1wcm92aWRlcnMuZmlsZS53YXRjaD10cnVlIgogICAgICAjIEVudHJ5cG9pbnRzIOKAlCBJUHY2LW9ubHk7IGR1YWwtc3RhY2sgd2hlcmUga2VybmVsIGhhcyBpcHY2IGVuYWJsZWQKICAgICAgLSAiLS1lbnRyeXBvaW50cy53ZWJzZWN1cmUuYWRkcmVzcz1bOjpdOjQ0MyIKICAgICAgLSAiLS1lbnRyeXBvaW50cy5mb3J3YXJkLXByb3h5LmFkZHJlc3M9Wzo6XTo4NDQzIgogICAgICAjIERpc2FibGUgcmVzcG9uc2UgYnVmZmVyaW5nIGZvciBTU0Ugc3RyZWFtaW5nCiAgICAgIC0gIi0tZW50cnlwb2ludHMud2Vic2VjdXJlLnRyYW5zcG9ydC5yZXNwb25kaW5nVGltZW91dHMucmVhZFRpbWVvdXQ9MCIKICAgICAgLSAiLS1lbnRyeXBvaW50cy53ZWJzZWN1cmUudHJhbnNwb3J0LnJlc3BvbmRpbmdUaW1lb3V0cy53cml0ZVRpbWVvdXQ9MCIKICAgICAgLSAiLS1lbnRyeXBvaW50cy53ZWJzZWN1cmUudHJhbnNwb3J0LnJlc3BvbmRpbmdUaW1lb3V0cy5pZGxlVGltZW91dD0xODBzIgogICAgICAjIERhc2hib2FyZCBhbmQgQVBJIGRpc2FibGVkCiAgICAgIC0gIi0tYXBpPWZhbHNlIgogICAgICAjIExpdmVuZXNzIHBpbmcgZW50cnlwb2ludCAoIzE1NTAgLyAjMTU1MSkuIEJhY2tzIHRoZSBjb250YWluZXIgaGVhbHRoY2hlY2sKICAgICAgIyBiZWxvdyBzbyBhIFRyYWVmaWsgcHJvY2VzcyB0aGF0IGNhbm5vdCBzZXJ2ZSBpcyB2aXNpYmx5IFVOSEVBTFRIWSBpbnN0ZWFkCiAgICAgICMgb2Ygc2l0dGluZyAiVXAiIHdoaWxlIHRoZSBpbmdyZXNzIDQwNHMuIG5ldHdvcmtfbW9kZTogaG9zdCBtZWFucwogICAgICAjIDEyNy4wLjAuMTo4MDgzIGJpbmRzIGhvc3QgbG9vcGJhY2sgb25seSDigJQgdW5wdWJsaXNoZWQgYW5kIHVucmVhY2hhYmxlCiAgICAgICMgb2ZmLWhvc3QgKGl0IGFwcGVhcnMgaW4gbm8gYHBvcnRzOmAgbGlzdCkuIFRoaXMgaXMgTElWRU5FU1Mgb25seTsgS1Yvcm91dGUKICAgICAgIyBoZWFsdGggKHN0cm9uZy10bHNAY29uc3VsIHJlc29sdmFibGUpIGlzIGNvdmVyZWQgYnkgY29uc3VsLWt2LXdhdGNoZG9nLgogICAgICAtICItLXBpbmc9dHJ1ZSIKICAgICAgLSAiLS1waW5nLmVudHJ5cG9pbnQ9cGluZyIKICAgICAgLSAiLS1lbnRyeXBvaW50cy5waW5nLmFkZHJlc3M9MTI3LjAuMC4xOjgwODMiCiAgICAgIC0gIi0tbG9nLmxldmVsPUlORk8iCiAgICAgIC0gIi0tYWNjZXNzbG9nPXRydWUiCiAgICB2b2x1bWVzOgogICAgICAjIERvY2tlciBzb2NrZXQgZm9yIGxhYmVsLWJhc2VkIHNlcnZpY2UgZGlzY292ZXJ5CiAgICAgIC0gL3Zhci9ydW4vZG9ja2VyLnNvY2s6L3Zhci9ydW4vZG9ja2VyLnNvY2s6cm8KICAgICAgIyBPcGVyYXRvciBkcm9wLWluIGRpcmVjdG9yeSBmb3IgY3VzdG9tIFRyYWVmaWsgZHluYW1pYyBjb25maWcgKGlzc3VlICMxMzQwKS4KICAgICAgIyBSZWFkLW9ubHk6IFRyYWVmaWsgb25seSB3YXRjaGVzL3JlYWRzIGl0LCBuZXZlciB3cml0ZXMuIFJlbGF0aXZlIHRvIHRoaXMKICAgICAgIyBjb21wb3NlIGZpbGUsIHNvIGl0IHJlc29sdmVzIHRvIDxpbnN0YWxsLWRpcj4vZG9ja2VyL3RyYWVmaWstZHluYW1pYy8uCiAgICAgICMgQ3JlYXRlZCBlbXB0eSBieSBpbnN0YWxsLnNoIGFuZCBwcmVzZXJ2ZWQgKG5ldmVyIHdpcGVkKSBvbiB1cGdyYWRlLgogICAgICAtIC4vdHJhZWZpay1keW5hbWljOi9ldGMvdHJhZWZpay9keW5hbWljOnJvCiAgICBoZWFsdGhjaGVjazoKICAgICAgIyBMaXZlbmVzcyAoIzE1NTAgLyAjMTU1MSk6IHByb3ZlcyB0aGUgVHJhZWZpayBwcm9jZXNzIGlzIHVwIGFuZCBpdHMgcGluZwogICAgICAjIGVudHJ5cG9pbnQgcmVzcG9uZHMuIHRyYWVmaWs6djMgaXMgZGlzdHJvbGVzcyAobm8gY3VybC93Z2V0KSwgc28gdXNlIHRoZQogICAgICAjIGJ1aWx0LWluIGB0cmFlZmlrIGhlYWx0aGNoZWNrYCBzdWJjb21tYW5kLiBJdCBydW5zIGFzIGEgU0VQQVJBVEUgcHJvY2VzcwogICAgICAjIHRoYXQgZG9lcyBOT1QgaW5oZXJpdCB0aGUgbWFpbiBjb21tYW5kJ3MgQ0xJIGZsYWdzLCBzbyB0aGUgcGluZyBjb25maWcgaXMKICAgICAgIyByZXBlYXRlZCBoZXJlIHNvIGl0IHJlc29sdmVzIDEyNy4wLjAuMTo4MDgzL3BpbmcgcmVnYXJkbGVzcyBvZiBjb25maWcgc291cmNlLgogICAgICB0ZXN0OiBbIkNNRCIsICJ0cmFlZmlrIiwgImhlYWx0aGNoZWNrIiwgIi0tcGluZyIsICItLXBpbmcuZW50cnlwb2ludD1waW5nIiwgIi0tZW50cnlwb2ludHMucGluZy5hZGRyZXNzPTEyNy4wLjAuMTo4MDgzIl0KICAgICAgaW50ZXJ2YWw6IDEwcwogICAgICB0aW1lb3V0OiA1cwogICAgICByZXRyaWVzOiAzCiAgICAgIHN0YXJ0X3BlcmlvZDogMTVzCiAgICBkZXBlbmRzX29uOgogICAgICAjIGNvbnN1bC1pbml0IG11c3QgY29tcGxldGUgYmVmb3JlIFRyYWVmaWsgc3RhcnRzIOKAlCBlbnN1cmVzIFRMUyBvcHRpb25zIEtWCiAgICAgICMgZW50cmllcyBhcmUgcHJlc2VudCBiZWZvcmUgVHJhZWZpayByZWFkcyBpdHMgQ29uc3VsIEtWIHByb3ZpZGVyIGNvbmZpZy4KICAgICAgY29uc3VsLWluaXQ6CiAgICAgICAgY29uZGl0aW9uOiBzZXJ2aWNlX2NvbXBsZXRlZF9zdWNjZXNzZnVsbHkKICAgICAgcHJveHk6CiAgICAgICAgY29uZGl0aW9uOiBzZXJ2aWNlX3N0YXJ0ZWQKICAgICAgIyBiYWNrZW5kLXVuYXZhaWxhYmxlIG11c3QgYmUgdXAgc28gdGhlIDUwMyBmYWxsYmFjayByZXNwb25kZXIgaXMgcmVhY2hhYmxlCiAgICAgICMgdGhlIG1vbWVudCBUcmFlZmlrIHN0YXJ0cyByb3V0aW5nIChpc3N1ZSAjMTMzNCkuCiAgICAgIGJhY2tlbmQtdW5hdmFpbGFibGU6CiAgICAgICAgY29uZGl0aW9uOiBzZXJ2aWNlX3N0YXJ0ZWQKCiAgIyDilIDilIDilIAgY29uc3VsLWt2LXdhdGNoZG9nICgjMTU1MCAvICMxNTUxKSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAjIFJ1bnRpbWUgS1YtZHJpZnQgZGV0ZWN0b3I6IGEgdGlueSBzaWRlY2FyIChyZXVzZXMgdGhlIGNvbnN1bCBpbWFnZSDigJQgbm8gbmV3CiAgIyBpbWFnZSkgd2hvc2UgaGVhbHRoY2hlY2sgUkVBRFMgdGhlIHN0cm9uZy10bHMgVExTIG9wdGlvbiB0aGF0IFRyYWVmaWsncyBjb25zdWwKICAjIHByb3ZpZGVyIGRlcGVuZHMgb24uIElmIHRoZSB0b2tlbiBpcyByZXZva2VkL2V4cGlyZXMgb3IgdGhlIEtWIGlzIHdpcGVkLCB0aGUKICAjIHJlYWQgZmFpbHMgYW5kIHRoaXMgY29udGFpbmVyIGdvZXMgVU5IRUFMVEhZIOKAlCB0dXJuaW5nIGEgc2lsZW50IGluZ3Jlc3MgNDA0CiAgIyBpbnRvIGEgdmlzaWJsZSBzaWduYWwgdGhhdCBtb25pdG9yaW5nIC8gYGRvY2tlciBjb21wb3NlIHBzYCBjYXRjaGVzLgogICMKICAjIExJTUlUQVRJT04gKGRvY3VtZW50ZWQg4oCUIGRvIE5PVCBvdmVyLXRydXN0IGEgZ3JlZW4gd2F0Y2hkb2cpOiBpbiB0aGUgaW5zdGFsbGVyCiAgIyBiYXNlIHN0YWNrIFRyYWVmaWsgaXMgbmV0d29ya19tb2RlOiBob3N0IGFuZCByZWFjaGVzIENvbnN1bCBhdCBbOjoxXTo4NTAwLAogICMgd2hpbGUgdGhpcyBzaWRlY2FyIHJlYWNoZXMgaXQgb3ZlciB0aGUgYnJpZGdlIGF0IGNvbnN1bDo4NTAwLiBJdCB0aGVyZWZvcmUKICAjIGRldGVjdHMgQUNML3Rva2VuL0tWIGRyaWZ0IGJ1dCBOT1QgaG9zdC1sb29wYmFjay9OQVQgbmV0d29ya2luZyBkcmlmdCBvbgogICMgVHJhZWZpaydzIG93biBwYXRoIChhIGNsYXNzIHRoaXMgcmVwbyBoYXMgaGl0IGJlZm9yZSDigJQgaW5zdGFsbGVyIGJyaWRnZS1OQVQgIzE1NDYpLgogIGNvbnN1bC1rdi13YXRjaGRvZzoKICAgIGltYWdlOiBoYXNoaWNvcnAvY29uc3VsOjEuMjIKICAgIHJlc3RhcnQ6IHVubGVzcy1zdG9wcGVkCiAgICBkZXBlbmRzX29uOgogICAgICBjb25zdWwtaW5pdDoKICAgICAgICBjb25kaXRpb246IHNlcnZpY2VfY29tcGxldGVkX3N1Y2Nlc3NmdWxseQogICAgbmV0d29ya3M6CiAgICAgIC0gcHJveHlfbmV0CiAgICBlbnZpcm9ubWVudDoKICAgICAgQ09OU1VMX0hUVFBfQUREUjogaHR0cDovL2NvbnN1bDo4NTAwCiAgICAgICMgU2FtZSB0b2tlbiBhcyBjb25zdWwtaW5pdC9UcmFlZmlrIChjb25zdWwtaW5pdC1ydzoga2V5X3ByZWZpeCAidHJhZWZpay8iCiAgICAgICMgd3JpdGUg4oeSIHJlYWQgYWxsb3dlZCkuIFN0YW5kYXJkIGNvbnRhaW5lci1lbnYgaW5qZWN0aW9uLCBub3QgYSByZW5kZXItdGltZQogICAgICAjIGNvbW1hbmQgc3Vic3RpdHV0aW9uIOKAlCBubyBzZWNyZXQgcmVhY2hlcyB0aGUgcmVuZGVyZWQgY29tcG9zZS9jb21tYW5kLgogICAgICBDT05TVUxfSFRUUF9UT0tFTjogJHtDT05TVUxfSFRUUF9UT0tFTjotfQogICAgIyBJZGxlIGZvcmV2ZXI7IGFsbCB0aGUgc2lnbmFsIGlzIGluIHRoZSBoZWFsdGhjaGVjay4KICAgIGVudHJ5cG9pbnQ6IFsiL2Jpbi9zaCIsICItYyIsICJ3aGlsZSB0cnVlOyBkbyBzbGVlcCAzNjAwOyBkb25lIl0KICAgIGhlYWx0aGNoZWNrOgogICAgICAjIFJlYWQgdGhlIGV4YWN0IEtWIFRyYWVmaWsncyBjb25zdWwgcHJvdmlkZXIgbmVlZHMuIEEgNDAzIChyZXZva2VkIHRva2VuKQogICAgICAjIG9yIGEgbWlzc2luZyBrZXkgbWFrZXMgYGNvbnN1bCBrdiBnZXRgIGV4aXQgbm9uLXplcm8g4oaSIHVuaGVhbHRoeS4KICAgICAgdGVzdDogWyJDTUQtU0hFTEwiLCAiY29uc3VsIGt2IGdldCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvbWluVmVyc2lvbiA+L2Rldi9udWxsIDI+JjEgfHwgZXhpdCAxIl0KICAgICAgaW50ZXJ2YWw6IDMwcwogICAgICB0aW1lb3V0OiA1cwogICAgICByZXRyaWVzOiAzCiAgICAgIHN0YXJ0X3BlcmlvZDogMjBzCgogIHByb3h5OgogICAgaW1hZ2U6ICR7UFJPWFlfU0VSVkVSX0lNQUdFOi1naGNyLmlvL2xsbS1hcGktcHJveHkvc2VydmVyOiR7UFJPWFlfVkVSU0lPTjotZWRnZX19CiAgICAjIOKUgOKUgCBtRE5TIG5ldHdvcmtpbmcg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIG1ETlMgKFJGQyA2NzYyLzY3NjMpIHVzZXMgbGluay1sb2NhbCBtdWx0aWNhc3QgKElQdjQ6IDIyNC4wLjAuMjUxOjUzNTMsCiAgICAjIElQdjY6IGZmMDI6OmZiOjUzNTMpLiBNdWx0aWNhc3QgZG9lcyBOT1QgY3Jvc3MgRG9ja2VyIGJyaWRnZSBuZXR3b3Jrcy4KICAgICMgbmV0d29ya19tb2RlOiBob3N0IGlzIFJFUVVJUkVEIG9uIExpbnV4IHNvIHRoZSBwcm94eSBjYW4gc2VuZCBhbmQgcmVjZWl2ZQogICAgIyBtRE5TIGFubm91bmNlbWVudHMgb24gdGhlIGhvc3QgTEFOLgogICAgIwogICAgIyBOT1RFOiBEb2NrZXIgRGVza3RvcCBvbiBtYWNPUyBzdXBwb3J0cyBob3N0IG5ldHdvcmtpbmcgc2luY2UgdmVyc2lvbiA0LjM0CiAgICAjIChvcHQtaW4gZmVhdHVyZSDigJQgZW5hYmxlIGluIFNldHRpbmdzIOKGkiBSZXNvdXJjZXMg4oaSIE5ldHdvcmspLiBUaGUgaW5zdGFsbGVyCiAgICAjIGRldGVjdHMgYW5kIGd1aWRlcyBlbmFibGVtZW50IGF1dG9tYXRpY2FsbHkuIG1ETlMgcmVtYWlucyBkaXNhYmxlZCBvbiBtYWNPUwogICAgIyAobXVsdGljYXN0IGRvZXNuJ3QgY3Jvc3MgdGhlIERvY2tlciBEZXNrdG9wIFZNIGJvdW5kYXJ5KS4KICAgICMgRm9yIERvY2tlciBEZXNrdG9wIDwgNC4zNCBvciBXaW5kb3dzLCB1c2UgdGhlIG5vLW1kbnMgb3ZlcnJpZGU6CiAgICAjICAgZG9ja2VyIGNvbXBvc2UgLWYgZG9ja2VyLWNvbXBvc2UueW1sIC1mIGRvY2tlci1jb21wb3NlLm5vLW1kbnMueW1sIHVwIC1kCiAgICAjCiAgICAjIOKUgOKUgCBQb3J0IGNvbmZsaWN0IHdhcm5pbmcg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIFdpdGggbmV0d29ya19tb2RlOiBob3N0LCB0aGUgcHJveHkgYmluZHMgRElSRUNUTFkgdG8gdGhlIGhvc3QgaW50ZXJmYWNlcy4KICAgICMgUG9ydHMgMzAwMCBhbmQgMzAwMSBhcmUgY29tbW9ubHkgdXNlZCDigJQgaWYgdGhleSBjb25mbGljdCB3aXRoIG90aGVyIHNlcnZpY2VzCiAgICAjIG9uIHlvdXIgaG9zdCwgY2hhbmdlIHRoZW0gdmlhIGVudmlyb25tZW50IHZhcmlhYmxlcyBCRUZPUkUgc3RhcnRpbmcgdGhlIHN0YWNrOgogICAgIyAgIFBST1hZX0xJU1RFTl9QT1JUPTMwMDAgICAgICAgIChyZXZlcnNlIHByb3h5ICsgbWFuYWdlbWVudCBBUEksIGRlZmF1bHQgMzAwMCkKICAgICMgICBQUk9YWV9GT1JXQVJEX1BST1hZX19QT1JUPTMwMDEgKGZvcndhcmQgcHJveHkgLyBDT05ORUNUIG1vZGUsIGRlZmF1bHQgMzAwMSkKICAgICMgU2V0IHRoZXNlIGluIGRvY2tlci8uZW52IG9yIGV4cG9ydCB0aGVtIGluIHlvdXIgc2hlbGwgYmVmb3JlIHJ1bm5pbmcgY29tcG9zZS4KICAgICMKICAgICMg4pSA4pSAIERBVEFCQVNFX1VSTCB3aXRoIGhvc3QgbmV0d29ya2luZyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICMgV2l0aCBuZXR3b3JrX21vZGU6IGhvc3QsIHRoZSBwcm94eSBpcyBvbiB0aGUgaG9zdCBuZXR3b3JrIHN0YWNrLiBUaW1lc2NhbGVEQgogICAgIyBwdWJsaXNoZXMgaXRzIHBvcnQgb24gdGhlIGhvc3QgbG9vcGJhY2sgdmlhICJwb3J0czogWzo6MV06NTQzMjo1NDMyIiwgc28gdGhlCiAgICAjIGNvcnJlY3QgYWRkcmVzcyBpcyBsb2NhbGhvc3Q6NTQzMiAobm90IHRoZSBEb2NrZXIgYnJpZGdlIGhvc3RuYW1lCiAgICAjICJ0aW1lc2NhbGVkYiIpLiBUaGUgaG9zdC1uZXR3b3JrZWQgcHJveHkgcmVhY2hlcyBpdCBvdmVyIGxvb3BiYWNrLgogICAgbmV0d29ya19tb2RlOiBob3N0CiAgICBlbnZfZmlsZToKICAgICAgLSBwYXRoOiAuZW52CiAgICAgICAgcmVxdWlyZWQ6IGZhbHNlCiAgICBlbnZpcm9ubWVudDoKICAgICAgIyBQYXNzLXRocm91Z2ggc28gb3BlcmF0b3JzIGNhbiBjdXN0b21pc2UgYmluZCBwb3J0cyB3aXRob3V0IGVkaXRpbmcgY29tcG9zZS4KICAgICAgIyBEZWZhdWx0IDMwMDAg4oCUIGNoYW5nZSBpZiB0aGUgcG9ydCBjb25mbGljdHMgd2l0aCBhbm90aGVyIHNlcnZpY2Ugb24gdGhlIGhvc3QuCiAgICAgIFBST1hZX0xJU1RFTl9QT1JUOiAke1BST1hZX0xJU1RFTl9QT1JUOi0zMDAwfQogICAgICAjIERlZmF1bHQgMzAwMSDigJQgY2hhbmdlIGlmIHRoZSBwb3J0IGNvbmZsaWN0cyB3aXRoIGFub3RoZXIgc2VydmljZSBvbiB0aGUgaG9zdC4KICAgICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVDogJHtQUk9YWV9GT1JXQVJEX1BST1hZX19QT1JUOi0zMDAxfQogICAgICAjIFdpdGggaG9zdCBuZXR3b3JraW5nLCBUaW1lc2NhbGVEQiBpcyByZWFjaGFibGUgYXQgbG9jYWxob3N0OjU0MzIKICAgICAgIyAocHVibGlzaGVkIHZpYSAicG9ydHM6IFs6OjFdOjU0MzI6NTQzMiIgb24gdGhlIHRpbWVzY2FsZWRiIHNlcnZpY2UpLgogICAgICBEQVRBQkFTRV9VUkw6IHBvc3RncmVzOi8vJHtQT1NUR1JFU19VU0VSOi1wcm94eX06JHtQT1NUR1JFU19QQVNTV09SRDotcHJveHlfZGV2X3Bhc3N3b3JkfUBsb2NhbGhvc3Q6NTQzMi8ke1BPU1RHUkVTX0RCOi1sbG1fcHJveHl9CiAgICAgICMgQXV0aCAvIGVuY3J5cHRpb24g4oCUIHBvcHVsYXRlZCBieSB0aGUgaW5zdGFsbGVyIGluIC5lbnYKICAgICAgUFJPWFlfSldUX1NFQ1JFVDogJHtQUk9YWV9KV1RfU0VDUkVUOi19CiAgICAgIFBST1hZX0tFS19WQUxVRTogJHtQUk9YWV9LRUtfVkFMVUU6LX0KICAgICAgUFJPWFlfS0VLX1BBU1NQSFJBU0U6ICR7UFJPWFlfS0VLX1BBU1NQSFJBU0U6LX0KICAgICAgUFJPWFlfQUxMT1dfRklSU1RSVU5fV0laQVJEOiAke1BST1hZX0FMTE9XX0ZJUlNUUlVOX1dJWkFSRDotdHJ1ZX0KICAgICAgIyBDb25zdWwgS1Yg4oCUIGhvc3QgbmV0d29ya2luZyBtZWFucyBjb25zdWwgaXMgYXQgbG9jYWxob3N0CiAgICAgIENPTlNVTF9IVFRQX0FERFI6IGh0dHA6Ly9sb2NhbGhvc3Q6ODUwMAogICAgICBDT05TVUxfSFRUUF9UT0tFTjogJHtQUk9YWV9DT05TVUxfVE9LRU46LX0KICAgIGRlcGVuZHNfb246CiAgICAgIGNvbnN1bDoKICAgICAgICBjb25kaXRpb246IHNlcnZpY2VfaGVhbHRoeQogICAgbGFiZWxzOgogICAgICAtIHRyYWVmaWsuZW5hYmxlPXRydWUKICAgICAgIyBIVFRQIHJvdXRlciDigJQgaGFuZGxlcyBhbGwgSFRUUFMgcmVxdWVzdHMgdmlhIHRoZSB3ZWJzZWN1cmUgZW50cnlwb2ludAogICAgICAtICJ0cmFlZmlrLmh0dHAucm91dGVycy5wcm94eS1hcGkucnVsZT1QYXRoUHJlZml4KGAvYCkiCiAgICAgIC0gdHJhZWZpay5odHRwLnJvdXRlcnMucHJveHktYXBpLmVudHJ5cG9pbnRzPXdlYnNlY3VyZQogICAgICAtIHRyYWVmaWsuaHR0cC5yb3V0ZXJzLnByb3h5LWFwaS5zZXJ2aWNlPXByb3h5LWJhY2tlbmQKICAgICAgIyBzZXJ2aWNlLXVuYXZhaWxhYmxlQGNvbnN1bCBpcyB0aGUgZXJyb3JzIG1pZGRsZXdhcmUgc2VlZGVkIGludG8gQ29uc3VsIEtWCiAgICAgICMgYnkgY29uc3VsLWluaXQgKGlzc3VlICMxMzM0KS4gSXQgY2F0Y2hlcyBhIGRlYWQtYnV0LXByZXNlbnQgYmFja2VuZAogICAgICAjICg1MDIvNTAzLzUwNCkgYW5kIHNlcnZlcyB0aGUgcmV0cnlhYmxlIGJhY2tlbmQtdW5hdmFpbGFibGUgNTAzIGVudmVsb3BlIHNvCiAgICAgICMgQ2xhdWRlIENMSSByZXRyaWVzIGluc3RlYWQgb2YgdHJlYXRpbmcgdGhlIGJsaXAgYXMgYSBtb2RlbC1hY2Nlc3MgZXJyb3IuCiAgICAgICMgTk8gbGFyZ2UtYm9keUBkb2NrZXIgaGVyZSAoaXNzdWUgIzE0NzQpOiBUcmFlZmlrJ3MgYGJ1ZmZlcmluZ2AgbWlkZGxld2FyZQogICAgICAjIHJlYWRzIHRoZSBFTlRJUkUgcmVzcG9uc2UgaW50byBtZW1vcnkgYmVmb3JlIGZvcndhcmRpbmcgaXQg4oCUIHRoZXJlIGlzIE5PCiAgICAgICMgImJ1ZmZlcmluZyBvZmYiIHRvZ2dsZSwgYW5kIGBtYXhSZXNwb25zZUJvZHlCeXRlcz0wYCBvbmx5IGRpc2FibGVzIHRoZQogICAgICAjIHJlc3BvbnNlIFNJWkUgTElNSVQsIG5vdCB0aGUgYnVmZmVyaW5nIGl0c2VsZi4gQXR0YWNoaW5nIGl0IHRvIHRoaXMgcm91dGVyCiAgICAgICMgdGhlcmVmb3JlIGJyZWFrcyBTU0Ugc3RyZWFtaW5nOiB0aGUgY2xpZW50IHJlY2VpdmVzIHRoZSB3aG9sZSBzdHJlYW0gYXMgb25lCiAgICAgICMgYnVyc3QgYXQgdGhlIGVuZCAobWVhc3VyZWQ6IHRpbWVfc3RhcnR0cmFuc2ZlciA9PSB0aW1lX3RvdGFsKS4gVGhlIHByb3h5CiAgICAgICMgc3RyZWFtcyBsaXZlIG9uIGl0cyBvd24gKHZlcmlmaWVkIGRpcmVjdC10by1iYWNrZW5kOiBUVEZCIDw8IHRvdGFsKSwgc28gdGhlCiAgICAgICMgZGF0YSBwbGFuZSBtdXN0IE5PVCBiZSB3cmFwcGVkIGluIGEgcmVzcG9uc2UtYnVmZmVyaW5nIG1pZGRsZXdhcmUuIFJlcXVlc3QKICAgICAgIyBib2R5LXNpemUgbGltaXRzIGFyZSBlbmZvcmNlZCBieSB0aGUgcHJveHkgaXRzZWxmIChyZWplY3RfcmVxdWVzdF9ieXRlcyksIHNvCiAgICAgICMgZHJvcHBpbmcgVHJhZWZpaydzIHJlcXVlc3QgY2FwIGhlcmUgaXMgc2FmZS4gKGxhcmdlLWJvZHkgcmVtYWlucyBhdmFpbGFibGUKICAgICAgIyBmb3Igbm9uLXN0cmVhbWluZyByb3V0ZXMgbGlrZSBncmFmYW5hL3Byb21ldGhldXMg4oCUIHNlZSBkb2NrZXItY29tcG9zZS5tb25pdG9yaW5nLnltbC4pCiAgICAgIC0gdHJhZWZpay5odHRwLnJvdXRlcnMucHJveHktYXBpLm1pZGRsZXdhcmVzPXNlcnZpY2UtdW5hdmFpbGFibGVAY29uc3VsLGhzdHNAZG9ja2VyCiAgICAgIC0gdHJhZWZpay5odHRwLnJvdXRlcnMucHJveHktYXBpLnRscy5jZXJ0cmVzb2x2ZXI9Y2xvdWRmbGFyZQogICAgICAjIFRMUyBvcHRpb25zIHJlZmVyZW5jZSB0aGUgQ29uc3VsIEtWIHByb3ZpZGVyIChzZWUgaXNzdWUgIzI0MiDigJQgQ29uc3VsIEtWIG11c3QgYmUKICAgICAgIyBhY3RpdmUgZm9yIHRoaXMgdG8gdGFrZSBlZmZlY3Q7IGZhbGxzIGJhY2sgdG8gZGVmYXVsdCBUTFMgb3B0aW9ucyBvdGhlcndpc2UpLgogICAgICAjIFVzZXMgQGNvbnN1bCBzdWZmaXggKG1pZ3JhdGVkIGZyb20gQGZpbGUgcHJvdmlkZXIgaW4gaXNzdWUgIzI0MSkuCiAgICAgICMgV2l0aG91dCBAY29uc3VsLCBUcmFlZmlrIHVzZXMgZGVmYXVsdCBUTFMgb3B0aW9ucyAoVExTIDEuMCBhbGxvd2VkLCB3ZWFrIGNpcGhlcnMpCiAgICAgICMgZXZlbiBpZiBDb25zdWwgS1YgaGFzIHRoZSBvcHRpb25zIHNlZWRlZC4gUmVxdWlyZXMgaXNzdWUgIzI0MiB0byBiZSBtZXJnZWQuCiAgICAgIC0gdHJhZWZpay5odHRwLnJvdXRlcnMucHJveHktYXBpLnRscy5vcHRpb25zPXN0cm9uZy10bHNAY29uc3VsCiAgICAgICMgSFNUUyBtaWRkbGV3YXJlIOKAlCBmb3JjZXMgSFRUUFMgYnkgaW5zdHJ1Y3RpbmcgYnJvd3NlcnMgdG8gbmV2ZXIgY29ubmVjdCBvdmVyIEhUVFAuCiAgICAgICMgT1BFUkFUT1IgV0FSTklORzogc3RzSW5jbHVkZVN1YmRvbWFpbnM6IHRydWUgbWVhbnMgQUxMIHN1YmRvbWFpbnMgb2YgdGhlIGRvbWFpbgogICAgICAjIHdpbGwgYmUgcmVxdWlyZWQgdG8gc2VydmUgSFRUUFMgb25jZSBhIGJyb3dzZXIgY2FjaGVzIHRoaXMgaGVhZGVyLgogICAgICAjIHN0c1ByZWxvYWQ6IGZhbHNlIGlzIHRoZSBzYWZlIGRlZmF1bHQg4oCUIGVuYWJsaW5nIHByZWxvYWQgaXMgYSBuZWFyLXBlcm1hbmVudAogICAgICAjIGNvbW1pdG1lbnQgZm9yIHRoZSBlbnRpcmUgZG9tYWluIHRyZWUgdmlhIGJyb3dzZXIgcHJlbG9hZCBsaXN0cy4KICAgICAgIyBPcGVyYXRvcnMgd2hvIHVuZGVyc3RhbmQgdGhlIGltcGxpY2F0aW9ucyBtYXkgb3ZlcnJpZGUgdmlhIGRvY2tlci1jb21wb3NlLm92ZXJyaWRlLnltbC4KICAgICAgLSB0cmFlZmlrLmh0dHAubWlkZGxld2FyZXMuaHN0cy5oZWFkZXJzLnN0c1NlY29uZHM9MzE1MzYwMDAKICAgICAgLSB0cmFlZmlrLmh0dHAubWlkZGxld2FyZXMuaHN0cy5oZWFkZXJzLnN0c0luY2x1ZGVTdWJkb21haW5zPXRydWUKICAgICAgLSAidHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmhzdHMuaGVhZGVycy5zdHNQcmVsb2FkPWZhbHNlIgogICAgICAtIHRyYWVmaWsuaHR0cC5taWRkbGV3YXJlcy5oc3RzLmhlYWRlcnMuZm9yY2VTVFNIZWFkZXI9dHJ1ZQogICAgICAjIEJvZHkgc2l6ZSBtaWRkbGV3YXJlIOKAlCBhbGxvd3MgdXAgdG8gMSBHaUIgcmVxdWVzdHMuCiAgICAgICMgV0FSTklORyAoaXNzdWUgIzE0NzQpOiBhIFRyYWVmaWsgYGJ1ZmZlcmluZ2AgbWlkZGxld2FyZSBBTFdBWVMgYnVmZmVycyB0aGUKICAgICAgIyBmdWxsIFJFU1BPTlNFIGJvZHkgYmVmb3JlIGZvcndhcmRpbmcgaXQg4oCUIGBtYXhSZXNwb25zZUJvZHlCeXRlcz0wYCBvbmx5CiAgICAgICMgZGlzYWJsZXMgdGhlIHJlc3BvbnNlIHNpemUgTElNSVQgKG5vIDUwMCBvbiBhIGxhcmdlIHJlc3BvbnNlKSwgaXQgZG9lcyBOT1QKICAgICAgIyB0dXJuIHJlc3BvbnNlIGJ1ZmZlcmluZyBvZmYgKHRoZXJlIGlzIG5vIHN1Y2ggdG9nZ2xlKS4gTkVWRVIgYXR0YWNoIHRoaXMKICAgICAgIyBtaWRkbGV3YXJlIHRvIGEgc3RyZWFtaW5nL1NTRSByb3V0ZSAodGhlIHByb3h5LWFwaSByb3V0ZXIgYWJvdmUpIG9yIHRoZQogICAgICAjIGNsaWVudCBnZXRzIHRoZSB3aG9sZSBzdHJlYW0gaW4gb25lIHRlcm1pbmFsIGJ1cnN0LiBJdCBpcyBkZWZpbmVkIGhlcmUgKG9uCiAgICAgICMgdGhlIHByb3h5IGNvbnRhaW5lciwgdGhlIGNhbm9uaWNhbCBvd25lciBvZiBzaGFyZWQgbWlkZGxld2FyZXMpIGFuZCB1c2VkCiAgICAgICMgT05MWSBieSB0aGUgbm9uLXN0cmVhbWluZyBncmFmYW5hL3Byb21ldGhldXMgcm91dGVycyBpbgogICAgICAjIGRvY2tlci1jb21wb3NlLm1vbml0b3JpbmcueW1sLiBUaGUgcHJveHkgZW5mb3JjZXMgaXRzIG93biByZXF1ZXN0LWJvZHkgY2FwCiAgICAgICMgKHJlamVjdF9yZXF1ZXN0X2J5dGVzKSwgc28gdGhlIGRhdGEgcGxhbmUgbmVlZHMgbm8gVHJhZWZpayByZXF1ZXN0IGxpbWl0LgogICAgICAjIG1lbVJlcXVlc3RCb2R5Qnl0ZXM9MTA0ODU3NjogcmVxdWVzdCBib2RpZXMg4omkMSBNaUIgc3RheSBpbiBtZW1vcnk7IGxhcmdlciBzcGlsbCB0bwogICAgICAjIHRoZSBjb250YWluZXIgZmlsZXN5c3RlbSByYXRoZXIgdGhhbiBleGhhdXN0aW5nIHRoZSA1MTIgTWlCIFRyYWVmaWsgbWVtb3J5IGxpbWl0LgogICAgICAtICJ0cmFlZmlrLmh0dHAubWlkZGxld2FyZXMubGFyZ2UtYm9keS5idWZmZXJpbmcubWF4UmVxdWVzdEJvZHlCeXRlcz0xMDczNzQxODI0IgogICAgICAtICJ0cmFlZmlrLmh0dHAubWlkZGxld2FyZXMubGFyZ2UtYm9keS5idWZmZXJpbmcubWF4UmVzcG9uc2VCb2R5Qnl0ZXM9MCIKICAgICAgLSAidHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmxhcmdlLWJvZHkuYnVmZmVyaW5nLm1lbVJlcXVlc3RCb2R5Qnl0ZXM9MTA0ODU3NiIKICAgICAgIyBIVFRQIHNlcnZpY2Ug4oCUIGJvdGggVHJhZWZpayBhbmQgdGhlIHByb3h5IHVzZSBuZXR3b3JrX21vZGU6IGhvc3QsIHNvIGJvdGgKICAgICAgIyBhcmUgb24gdGhlIGhvc3QgbmV0d29yayBzdGFjay4gVHJhZWZpayByZWFjaGVzIHRoZSBwcm94eSBhdCBsb2NhbGhvc3Qgb24KICAgICAgIyBQUk9YWV9MSVNURU5fUE9SVCAoZGVmYXVsdCAzMDAwKS4gTm8gRG9ja2VyIGJyaWRnZSBuZXR3b3JrIHJlc29sdXRpb24gbmVlZGVkLgogICAgICAjIHRyYWVmaWsuZG9ja2VyLm5ldHdvcmsgaXMgTk9UIHNldCAocHJveHkgaXMgbm90IG9uIGEgRG9ja2VyIGJyaWRnZSBuZXR3b3JrKS4KICAgICAgLSAidHJhZWZpay5odHRwLnNlcnZpY2VzLnByb3h5LWJhY2tlbmQubG9hZGJhbGFuY2VyLnNlcnZlci51cmw9aHR0cDovL2xvY2FsaG9zdDoke1BST1hZX0xJU1RFTl9QT1JUOi0zMDAwfSIKICAgICAgIyBEaXNhYmxlIGJ1ZmZlcmluZyBmb3IgU1NFIHN0cmVhbWluZyBzdXBwb3J0CiAgICAgIC0gdHJhZWZpay5odHRwLnNlcnZpY2VzLnByb3h5LWJhY2tlbmQubG9hZGJhbGFuY2VyLnJlc3BvbnNlRm9yd2FyZGluZy5mbHVzaEludGVydmFsPTFtcwogICAgICAjIFRDUCByb3V0ZXIg4oCUIHBhc3N0aHJvdWdoIGZvciB0aGUgZm9yd2FyZCBwcm94eSAoQ09OTkVDVCBtb2RlIC8gVExTIGludGVyY2VwdGlvbikuCiAgICAgICMgSFNUUyBhbmQgVExTIG9wdGlvbnMgYXJlIEhUVFAtbGF5ZXIgY29uY2VybnMgYW5kIGRvIE5PVCBhcHBseSB0byB0aGUgVENQIHJvdXRlci4KICAgICAgLSAidHJhZWZpay50Y3Aucm91dGVycy5mb3J3YXJkLXByb3h5LnJ1bGU9SG9zdFNOSShgKmApIgogICAgICAtIHRyYWVmaWsudGNwLnJvdXRlcnMuZm9yd2FyZC1wcm94eS5lbnRyeXBvaW50cz1mb3J3YXJkLXByb3h5CiAgICAgIC0gdHJhZWZpay50Y3Aucm91dGVycy5mb3J3YXJkLXByb3h5LnNlcnZpY2U9cHJveHktZm9yd2FyZAogICAgICAjIFRDUCBzZXJ2aWNlIOKAlCBUcmFlZmlrIGluIGhvc3QgbW9kZSByZWFjaGVzIHRoZSBwcm94eSB2aWEgbG9jYWxob3N0LgogICAgICAjIERlZmF1bHQgcG9ydCAzMDAxOyBjaGFuZ2UgUFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVCBpZiBpdCBjb25mbGljdHMuCiAgICAgIC0gInRyYWVmaWsudGNwLnNlcnZpY2VzLnByb3h5LWZvcndhcmQubG9hZGJhbGFuY2VyLnNlcnZlci5wb3J0PSR7UFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVDotMzAwMX0iCgpuZXR3b3JrczoKICBwcm94eV9uZXQ6CiAgICAjIElQdjYtZW5hYmxlZCBpbnRlcm5hbCBuZXR3b3JrIGZvciBzZXJ2aWNlLXRvLXNlcnZpY2UgY29tbXVuaWNhdGlvbi4KICAgICMgVUxBIHByZWZpeCAoZmMwMDo6LzcpIOKAlCBub3Qgcm91dGFibGUgb24gdGhlIHB1YmxpYyBpbnRlcm5ldC4KICAgICMgRHVhbC1zdGFjazogRG9ja2VyIGFsc28gYXNzaWducyBhbiBJUHY0IHN1Ym5ldCBvbiB0aGlzIGJyaWRnZSBieSBkZWZhdWx0LgogICAgZW5hYmxlX2lwdjY6IHRydWUKICAgIGlwYW06CiAgICAgIGNvbmZpZzoKICAgICAgICAtIHN1Ym5ldDogImZkMDA6ZWRkZTphY2RjOjovNDgiCgp2b2x1bWVzOgogIHRpbWVzY2FsZWRiX2RhdGE6CiAgY29uc3VsX2RhdGE6Cg=="
+EMBED_docker_compose_yml="c2VydmljZXM6CiAgdGltZXNjYWxlZGI6CiAgICAjIFBJTk5FRCAoIzEzMjUpOiBhIGNvbmNyZXRlIFRpbWVzY2FsZURCK3BnMTggdGFnIHdpdGggaXRzIGRpZ2VzdCwgbm90IHRoZQogICAgIyBmbG9hdGluZyBgbGF0ZXN0LXBnMThgLiBBIGZsb2F0aW5nIHRhZyBtZWFucyB0d28gaW5zdGFsbHMgZGF5cyBhcGFydCBjYW4KICAgICMgbGFuZCBvbiBkaWZmZXJlbnQgUG9zdGdyZXMgYnVpbGRzLCBhbmQgYW4gYHVwZ3JhZGVgIHRoYXQgcHJlc2VydmVzIHRoZSBkYXRhCiAgICAjIHZvbHVtZSBjYW4gcHVsbCBhbiBpbWFnZSBpbmNvbXBhdGlibGUgd2l0aCB0aGUgb24tZGlzayBkYXRhIGRpcmVjdG9yeS4KICAgICMgQnVtcCBkZWxpYmVyYXRlbHkgKGFuZCB2ZXJpZnkgZGF0YS12b2x1bWUgY29tcGF0aWJpbGl0eSkgd2hlbiB1cGRhdGluZy4KICAgIGltYWdlOiB0aW1lc2NhbGUvdGltZXNjYWxlZGI6Mi4yNy4yLXBnMThAc2hhMjU2OjQwNTFlYzZlMmM2YzViMzFmZTc4OWNmMmNkODc5OTFlZTE0OTBiMzEyYjc3ZmUwMmVmYWY1MWJlYzg0Yjg5YjcKICAgICMg4pSA4pSAIENvbm5lY3Rpb24gYnVkZ2V0IChpc3N1ZSAjMTI4OCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIFJhaXNlIG1heF9jb25uZWN0aW9ucyB0byAxMDAgc28gdGhlIHByb3h5J3MgY29ubmVjdGlvbiBidWRnZXQgKGNvbnRyb2wKICAgICMgcG9vbCArIGRhdGEgcG9vbCkgcGx1cyBoZWFkcm9vbSBmb3IgbWlncmF0aW9ucywgcHNxbCwgYW5kIGJhY2tncm91bmQKICAgICMgdG9vbGluZyBuZXZlciBzYXR1cmF0ZXMgdGhlIHNlcnZlci4gaW5zdGFsbC5zaCBhdXRvLXNpemVzIHRoZSB0d28gcG9vbHMKICAgICMgZnJvbSB0aGUgaG9zdCBDUFUgY291bnQgKCMxNDE2KSwgY2xhbXBlZCBzbyB0aGVpciBzdW0gc3RheXMgd2VsbCBiZWxvdyB0aGlzCiAgICAjIGNlaWxpbmcgKHdvcnN0IGNhc2UgMzIgKyA1NiA9IDg4LCBsZWF2aW5nIDEyIGZyZWUpLiBUaGUgcHJldmlvdXMgZGVwbG95bWVudCByYW4KICAgICMgdGhlIFBvc3RncmVzIGRlZmF1bHQgb2YgMjUsIHdoaWNoIHRoZSBhcHAgcG9vbCBhbG9uZSBjb3VsZCBleGhhdXN0IGR1cmluZwogICAgIyB0aGUgcG9zdC1kZXBsb3kgYmFja2dyb3VuZCB3cml0ZSBzdG9ybSwgc3RhcnZpbmcgdGhlIHJlcXVlc3QgcGF0aCBhbmQKICAgICMgcHJvZHVjaW5nIGEgYnJpZWYgSFRUUCA1MDAgYnVyc3Qgb24gZXZlcnkgZGVwbG95LgogICAgIwogICAgIyBSZWxhdGlvbnNoaXAgdG8gdGhlIGFwcCBwb29sIChzZWUgY29uZmlnLmV4YW1wbGUudG9tbCBbZGF0YWJhc2VdKToKICAgICMgICBtYXhfY29ubmVjdGlvbnMgKDEwMCkgID4+ICBjb250cm9sX3Bvb2xfc2l6ZSAoNSkgKyBkYXRhX3Bvb2xfc2l6ZSAoMjApCiAgICAjIEFkanVzdCBQUk9YWV9EQVRBQkFTRV9fQ09OVFJPTF9QT09MX1NJWkUgLyBfX0RBVEFfUE9PTF9TSVpFIHRvZ2V0aGVyIHdpdGgKICAgICMgdGhpcyB2YWx1ZSBpZiB5b3UgdHVuZSB0aGUgYXBwIHBvb2w7IGtlZXAgdGhlaXIgc3VtIHdlbGwgYmVsb3cgaXQuCiAgICAjCiAgICAjIOKUgOKUgCBPcHRpb25hbCBQb3N0Z3JlcyBSQU0gdHVuaW5nIChpc3N1ZSAjMTMwNSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIHRpbWVzY2FsZWRiLXR1bmUgcnVucyBPTkNFIG9uIGZpcnN0IGluaXQgYW5kIHdyaXRlcyBzaGFyZWRfYnVmZmVycyAvCiAgICAjIGVmZmVjdGl2ZV9jYWNoZV9zaXplIGludG8gdGhlIGRhdGEgdm9sdW1lJ3MgcG9zdGdyZXNxbC5jb25mLiBSYWlzaW5nIHRoZQogICAgIyBjb250YWluZXIgbWVtb3J5IGxpbWl0IGFsb25lIGRvZXMgTk9UIHJldHVuZSBhbiBleGlzdGluZyB2b2x1bWUsIHNvIHRoZXNlCiAgICAjIGAtY2AgZmxhZ3MgbGV0IGFuIG9wZXJhdG9yIG92ZXJyaWRlIHRoZSBzdG9yZWQgdmFsdWVzIGZvciBhbiBFWElTVElORyBEQi4KICAgICMKICAgICMgU0FGRVRZIOKAlCBkZWZhdWx0cyBwcmVzZXJ2ZSBjdXJyZW50IGJlaGF2aW91ciBFWEFDVExZOgogICAgIyAgIFdoZW4gVElNRVNDQUxFREJfU0hBUkVEX0JVRkZFUlMgLyBfRUZGRUNUSVZFX0NBQ0hFX1NJWkUgLyBfV09SS19NRU0gYXJlCiAgICAjICAgdW5zZXQsIHRoZSBgJHtWQVI6Ky4uLn1gIHN1YnN0aXR1dGlvbnMgY29sbGFwc2UgdG8gbm90aGluZyBhbmQgdGhlCiAgICAjICAgcmVuZGVyZWQgY29tbWFuZCBpcyBieXRlLWlkZW50aWNhbCB0byAicG9zdGdyZXMgLWMgbWF4X2Nvbm5lY3Rpb25zPTEwMCIuCiAgICAjICAgTm8gYC1jIHNoYXJlZF9idWZmZXJzPS4uLmAgZmxhZyBpcyBlbWl0dGVkLCBzbyB0aGUgdmFsdWVzIHN0b3JlZCBpbiB0aGUKICAgICMgICBleGlzdGluZyB2b2x1bWUncyBwb3N0Z3Jlc3FsLmNvbmYgKGUuZy4gdGltZXNjYWxlZGItdHVuZSdzKSBhcmUgdW50b3VjaGVkLgogICAgIyAgIEFuIGVtcHR5IGAtYyBzaGFyZWRfYnVmZmVycz1gIHZhbHVlIGlzIEZBVEFMIHRvIFBvc3RncmVzLCB3aGljaCBpcyB3aHkgdGhlCiAgICAjICAgZmxhZyBtdXN0IGJlIG9taXR0ZWQgZW50aXJlbHkgKG5vdCBkZWZhdWx0ZWQgdG8gYW4gZW1wdHkgc3RyaW5nKSB3aGVuIHVuc2V0LgogICAgIwogICAgIyBJTVBPUlRBTlQ6IHRoaXMgaXMgdGhlIFNIRUxMIChzdHJpbmcpIGZvcm0gb2YgYGNvbW1hbmQ6YCBvbiBwdXJwb3NlIOKAlCBpdAogICAgIyBsZXRzIHRoZSBjb25kaXRpb25hbCBgJHtWQVI6Ky4uLn1gIHRva2VucyB3b3JkLXNwbGl0IGludG8gc2VwYXJhdGUgYXJncyBhbmQKICAgICMgdmFuaXNoIGNsZWFubHkgd2hlbiB1bnNldC4gS2VlcCBpdCBhIHNpbmdsZSBsaW5lLiBUaGUgaW1hZ2UncwogICAgIyBzaGFyZWRfcHJlbG9hZF9saWJyYXJpZXM9dGltZXNjYWxlZGIgKHNldCBieSB0aGUgZW50cnlwb2ludCBpbgogICAgIyBwb3N0Z3Jlc3FsLmNvbmYpIGlzIE5PVCB0b3VjaGVkIGJ5IHRoZXNlIGZsYWdzIGFuZCByZW1haW5zIGFjdGl2ZS4KICAgICMKICAgICMgRXhhbXBsZSAob3BlcmF0b3Igb3B0cyBpbiB2aWEgZG9ja2VyLy5lbnYpOgogICAgIyAgIFRJTUVTQ0FMRURCX1NIQVJFRF9CVUZGRVJTPTRHQgogICAgIyAgIFRJTUVTQ0FMRURCX0VGRkVDVElWRV9DQUNIRV9TSVpFPThHQgogICAgIyAgIFRJTUVTQ0FMRURCX1dPUktfTUVNPTY0TUIKICAgICMKICAgICMg4pSA4pSAIENvbHVtbnN0b3JlIGFsbG9jYXRpb24gZ3VhcmQgKGlzc3VlICMxNzY1KSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICMgQSBjb2x1bW5zdG9yZSBiYXRjaCBtYXRlcmlhbGlzZXMgb25lIGFycmF5IHBlciBjb2x1bW4gYWNyb3NzIHRoZSB3aG9sZQogICAgIyBiYXRjaCwgYW5kIFBvc3RncmVTUUwgcmVmdXNlcyBhbnkgc2luZ2xlIGFsbG9jYXRpb24gb2YgMSBHQiBvciBtb3JlCiAgICAjIChNYXhBbGxvY1NpemUpLiBXaXRoIHRoZSBvbGQgMiBNaUIgcGVyLWJvZHkgY2FwdHVyZSBjYXAgdGhlCiAgICAjIHJlcXVlc3RfcGF5bG9hZHNfdjIgcG9saWN5IGpvYiBjcmFzaGVkIG9uIDMxIG9mIGl0cyA0MSBwcm9kdWN0aW9uIHJ1bnMKICAgICMgd2l0aCBgaW52YWxpZCBtZW1vcnkgYWxsb2MgcmVxdWVzdCBzaXplIDE0NDQxNTgzOTZgLgogICAgIwogICAgIyBlbmFibGVfY29tcHJlc3Nvcl9iYXRjaF9saW1pdCBpcyBBREFQVElWRSDigJQgaXQgc2hyaW5rcyBvbmx5IGEgYmF0Y2ggdGhhdAogICAgIyB3b3VsZCBleGNlZWQgdGhlIGxpbWl0IOKAlCBzbyBpdCBpcyBzYWZlIHRvIHNldCBzZXJ2ZXItd2lkZSBhbmQgY29zdHMKICAgICMgbm90aGluZyBvbiB0YWJsZXMgdGhhdCBuZXZlciBhcHByb2FjaCBpdC4gVmVyaWZpZWQgcHJlc2VudCBhbmQgc2V0dGFibGUgb24KICAgICMgdGhlIHBpbm5lZCBpbWFnZSBhYm92ZSAoVGltZXNjYWxlREIgMi4yNy4yLXBnMTg6IGBTSE9XYCByZXR1cm5zIGBvbmAsIHRoZQogICAgIyBzZXJ2ZXIgc3RhcnRzIGNsZWFuKS4KICAgICMKICAgICMgTk9UIHNldCBoZXJlOiB0aW1lc2NhbGVkYi5jb21wcmVzc2lvbl9iYXRjaF9zaXplX2xpbWl0LiBUaGF0IG9uZSBpcyBhCiAgICAjIGZpeGVkIGNhcCwgYW5kIHJlcXVlc3RfbG9nIGNvbXByZXNzZXMgNzQgb2YgaXRzIDgyIGNodW5rcyBwZXJmZWN0bHkgd2VsbAogICAgIyBhdCB0aGUgZGVmYXVsdCAxMDAwIOKAlCBjYXBwaW5nIHRoZSB3aG9sZSBzZXJ2ZXIgd291bGQgcGVybWFuZW50bHkgZGVncmFkZQogICAgIyBpdC4gTWlncmF0aW9uIDAxMDggc2NvcGVzIHRoZSB0cmFuc2l0aW9uYWwgY2FwIHRvIHRoZSBMTEFQIGRhdGFiYXNlIHdpdGgKICAgICMgQUxURVIgREFUQUJBU0UgaW5zdGVhZC4gU2VlCiAgICAjIGRvY3MvcnVuYm9va3MvcmVxdWVzdC1wYXlsb2FkLXN0b3JhZ2UtY29udGFpbm1lbnQubWQuCiAgICBjb21tYW5kOiAtYyBtYXhfY29ubmVjdGlvbnM9MTAwIC1jIHRpbWVzY2FsZWRiLmVuYWJsZV9jb21wcmVzc29yX2JhdGNoX2xpbWl0PW9uICR7VElNRVNDQUxFREJfU0hBUkVEX0JVRkZFUlM6Ky1jIHNoYXJlZF9idWZmZXJzPSR7VElNRVNDQUxFREJfU0hBUkVEX0JVRkZFUlN9fSAke1RJTUVTQ0FMRURCX0VGRkVDVElWRV9DQUNIRV9TSVpFOistYyBlZmZlY3RpdmVfY2FjaGVfc2l6ZT0ke1RJTUVTQ0FMRURCX0VGRkVDVElWRV9DQUNIRV9TSVpFfX0gJHtUSU1FU0NBTEVEQl9XT1JLX01FTTorLWMgd29ya19tZW09JHtUSU1FU0NBTEVEQl9XT1JLX01FTX19CiAgICBlbnZpcm9ubWVudDoKICAgICAgUE9TVEdSRVNfREI6ICR7UE9TVEdSRVNfREI6LWxsbV9wcm94eX0KICAgICAgUE9TVEdSRVNfVVNFUjogJHtQT1NUR1JFU19VU0VSOi1wcm94eX0KICAgICAgUE9TVEdSRVNfUEFTU1dPUkQ6ICR7UE9TVEdSRVNfUEFTU1dPUkQ6LXByb3h5X2Rldl9wYXNzd29yZH0KICAgIHBvcnRzOgogICAgICAjIExPT1BCQUNLLU9OTFk6IHB1Ymxpc2ggb24gWzo6MV0gc28gUG9zdGdyZXMgaXMgcmVhY2hhYmxlIGJ5IHRoZQogICAgICAjIGhvc3QtbmV0d29ya2VkIHByb3h5IGF0IGxvY2FsaG9zdDo1NDMyIGJ1dCBOT1Qgb24gYW55IHB1YmxpYyBpbnRlcmZhY2UuCiAgICAgICMKICAgICAgIyBTRUNVUklUWSAoIzEzMjQpOiBEb2NrZXIgcHVibGlzaGVzIHBvcnRzIHZpYSBhIEROQVQgcnVsZSB0aGF0IEJZUEFTU0VTCiAgICAgICMgdGhlIGhvc3QgbmZ0YWJsZXMvaXB0YWJsZXMgSU5QVVQgY2hhaW4sIHNvIGEgYFs6Ol1gIC8gYDAuMC4wLjBgIGJpbmQKICAgICAgIyB3b3VsZCBleHBvc2UgUG9zdGdyZXMgdG8gdGhlIGludGVybmV0IG9uIGEgYm94IHdpdGggYSBwdWJsaWMgSVAsCiAgICAgICMgcmVnYXJkbGVzcyBvZiB0aGUgZmlyZXdhbGwgdGhlIGluc3RhbGxlciBjb25maWd1cmVzLiBCaW5kaW5nIFs6OjFdIGtlZXBzCiAgICAgICMgdGhlIERCIHByaXZhdGUuIEludGVyLWNvbnRhaW5lciB0cmFmZmljIHVzZXMgdGhlIHByb3h5X25ldCBkb2NrZXIgbmV0d29yawogICAgICAjIChzZXJ2aWNlIG5hbWUgYHRpbWVzY2FsZWRiYCksIG5vdCB0aGlzIHB1Ymxpc2hlZCBwb3J0LCBzbyB0aGlzIGlzIHNhZmUuCiAgICAgIC0gIls6OjFdOjU0MzI6NTQzMiIKICAgIHZvbHVtZXM6CiAgICAgICMg4pSA4pSAIE9wdGlvbmFsIFNTRCBiaW5kLW1vdW50IGZvciB0aGUgREIgZGF0YSBkaXIgKGlzc3VlICMxMzA1KSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICAgIyBERUZBVUxUIChUSU1FU0NBTEVEQl9EQVRBX1BBVEggdW5zZXQpOiB0aGUgbmFtZWQgdm9sdW1lIHRpbWVzY2FsZWRiX2RhdGEKICAgICAgIyBtb3VudGVkIGF0IHRoZSBwZzE4IGltYWdlJ3MgUEdEQVRBIOKAlCBieXRlLWlkZW50aWNhbCB0byBwcmlvciByZWxlYXNlcywgc28KICAgICAgIyBhbiBgdXBncmFkZWAgKHdoaWNoIG92ZXJ3cml0ZXMgY29tcG9zZSBidXQgcHJlc2VydmVzIGRvY2tlci8uZW52KSBmaW5kcyB0aGUKICAgICAgIyBleGlzdGluZyBkYXRhIGluIHRoZSBleGFjdCBzYW1lIHBsYWNlLiBaZXJvIGRhdGEtbG9zcyByaXNrLgogICAgICAjCiAgICAgICMgT1BULUlOIChUSU1FU0NBTEVEQl9EQVRBX1BBVEg9L21udC9zc2QvcGdkYXRhKTogY29tcG9zZSByZW5kZXJzIGEgYmluZAogICAgICAjIG1vdW50IHRvIHRoYXQgaG9zdCBwYXRoIGluc3RlYWQuIFRoaXMgZG9lcyBOT1QgbWlncmF0ZSBleGlzdGluZyBkYXRhIOKAlCBpdAogICAgICAjIG9ubHkgcG9pbnRzIHRoZSBjb250YWluZXIgYXQgdGhlIHBhdGguIE1vdmluZyB0byBTU0QgcmVxdWlyZXMgdGhlIG9wZXJhdG9yCiAgICAgICMgdG8gY29weS9yZXN0b3JlIHRoZSBkYXRhIGludG8gdGhlIG5ldyBwYXRoIEZJUlNUIChzZWUgZG9ja2VyL3Rscy5lbnYuZXhhbXBsZSkuCiAgICAgICMgVGhlIHRhcmdldCBwYXRoIC92YXIvbGliL3Bvc3RncmVzcWwvMTgvZG9ja2VyIGlzIHVuY2hhbmdlZCBpbiBib3RoIG1vZGVzLgogICAgICAtICR7VElNRVNDQUxFREJfREFUQV9QQVRIOi10aW1lc2NhbGVkYl9kYXRhfTovdmFyL2xpYi9wb3N0Z3Jlc3FsLzE4L2RvY2tlcgogICAgbmV0d29ya3M6CiAgICAgIC0gcHJveHlfbmV0CiAgICBoZWFsdGhjaGVjazoKICAgICAgdGVzdDogWyJDTUQtU0hFTEwiLCAicGdfaXNyZWFkeSAtVSBwcm94eSAtZCBsbG1fcHJveHkiXQogICAgICBpbnRlcnZhbDogMTBzCiAgICAgIHRpbWVvdXQ6IDVzCiAgICAgIHJldHJpZXM6IDUKCiAgY29uc3VsOgogICAgaW1hZ2U6IGhhc2hpY29ycC9jb25zdWw6MS4yMgogICAgIyBTaW5nbGUtbm9kZSBzZXJ2ZXIgd2l0aCBwZXJzaXN0ZW50IHN0b3JhZ2UuCiAgICAjIFByZXZpb3VzIHZlcnNpb25zIHVzZWQgLWRldiBtb2RlIChpbi1tZW1vcnkpLCB3aGljaCBjYXVzZWQgY29tcGxldGUgVHJhZWZpawogICAgIyByb3V0aW5nIGZhaWx1cmUgb24gYW55IENvbnN1bCByZXN0YXJ0IOKAlCBhbGwgS1YgZGF0YSAoaW5jbHVkaW5nIFRMUyBvcHRpb25zCiAgICAjIHNlZWRlZCBieSBjb25zdWwtaW5pdCkgd2FzIGxvc3QsIGFuZCBUcmFlZmlrJ3MgcHJveHktYXBpIHJvdXRlciBmYWlsZWQgd2l0aAogICAgIyAidW5rbm93biBUTFMgb3B0aW9uczogc3Ryb25nLXRsc0Bjb25zdWwiLiBTZWUgaXNzdWUgIzMzNS4KICAgICMgLWNsaWVudD1bOjpdIGJpbmRzIHRoZSBhZ2VudCdzIEhUVFAgQVBJIHRvIGFsbCBJUHY2IGludGVyZmFjZXMgSU5TSURFIHRoZQogICAgIyBjb250YWluZXI7IHRoZSBwdWJsaXNoZWQgaG9zdCBwb3J0IGJlbG93IGlzIHdoYXQgY29udHJvbHMgZXh0ZXJuYWwgcmVhY2guCiAgICAjIFRyYWVmaWsgdXNlcyBuZXR3b3JrX21vZGU6IGhvc3QgYW5kIHJlYWNoZXMgQ29uc3VsIGF0IFs6OjFdOjg1MDAgdmlhIHRoZQogICAgIyBsb29wYmFjay1vbmx5IHB1Ymxpc2hlZCBob3N0IHBvcnQgYmVsb3cuCiAgICBjb21tYW5kOgogICAgICAtICJjb25zdWwiCiAgICAgIC0gImFnZW50IgogICAgICAtICItc2VydmVyIgogICAgICAtICItYm9vdHN0cmFwLWV4cGVjdD0xIgogICAgICAtICItY2xpZW50PVs6Ol0iCiAgICAgIC0gIi1kYXRhLWRpcj0vY29uc3VsL2RhdGEiCiAgICBwb3J0czoKICAgICAgIyBMT09QQkFDSy1PTkxZOiBwdWJsaXNoIG9uIFs6OjFdIHNvIGhvc3QtbmV0d29ya2VkIFRyYWVmaWsgY2FuIHJlYWNoIHRoZQogICAgICAjIEhUVFAgQVBJIGF0IFs6OjFdOjg1MDAgYnV0IHRoZSBDb25zdWwgQVBJIGlzIE5PVCBleHBvc2VkIHB1YmxpY2x5LgogICAgICAjCiAgICAgICMgU0VDVVJJVFkgKCMxMzI0KTogRG9ja2VyJ3MgYC1wYCBETkFUIGJ5cGFzc2VzIHRoZSBob3N0IGZpcmV3YWxsIElOUFVUCiAgICAgICMgY2hhaW4sIHNvIGEgYFs6Ol1gIC8gYDAuMC4wLjBgIGJpbmQgd291bGQgZXhwb3NlIHRoZSBDb25zdWwgS1YvQVBJCiAgICAgICMgKHdoaWNoIGNhcnJpZXMgVHJhZWZpayBUTFMgY29uZmlnKSB0byB0aGUgaW50ZXJuZXQgb24gYSBwdWJsaWMgYm94LgogICAgICAjIGNvbnN1bC1pbml0IHJlYWNoZXMgQ29uc3VsIG92ZXIgdGhlIHByb3h5X25ldCBkb2NrZXIgbmV0d29yaywgc28gdGhpcwogICAgICAjIGxvb3BiYWNrIGJpbmQgZG9lcyBub3QgYWZmZWN0IGludGVyLWNvbnRhaW5lciBpbml0LgogICAgICAtICJbOjoxXTo4NTAwOjg1MDAiCiAgICB2b2x1bWVzOgogICAgICAtIGNvbnN1bF9kYXRhOi9jb25zdWwvZGF0YQogICAgbmV0d29ya3M6CiAgICAgIC0gcHJveHlfbmV0CiAgICBoZWFsdGhjaGVjazoKICAgICAgIyBVc2UgdGhlIEhUVFAgQVBJIHN0YXR1cyBlbmRwb2ludCDigJQgaXQgaXMgcmVhZHkgb25seSBhZnRlciB0aGUgYWdlbnQgaXMKICAgICAgIyBmdWxseSBpbml0aWFsaXNlZC4gYGNvbnN1bCBtZW1iZXJzYCBmaXJlcyBlYXJsaWVyIGFuZCBpcyBub3Qgc3VmZmljaWVudC4KICAgICAgdGVzdDogWyJDTUQtU0hFTEwiLCAiY3VybCAtc2YgaHR0cDovL1s6OjFdOjg1MDAvdjEvc3RhdHVzL2xlYWRlciJdCiAgICAgIGludGVydmFsOiAxMHMKICAgICAgdGltZW91dDogNXMKICAgICAgcmV0cmllczogNQogICAgICBzdGFydF9wZXJpb2Q6IDVzCgogICMg4pSA4pSA4pSAIENvbnN1bCBLViBpbml0IChvbmUtc2hvdCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgIyBTZWVkcyBUcmFlZmlrIFRMUyBvcHRpb25zIGludG8gQ29uc3VsIEtWIGJlZm9yZSBUcmFlZmlrIHN0YXJ0cy4KICAjIE11c3QgcnVuIGFmdGVyIENvbnN1bCBpcyBoZWFsdGh5IGFuZCBtdXN0IGNvbXBsZXRlIHN1Y2Nlc3NmdWxseSBiZWZvcmUKICAjIFRyYWVmaWsgaXMgYWxsb3dlZCB0byBzdGFydCAoc2VlIHRyYWVmaWsuZGVwZW5kc19vbiBiZWxvdykuCiAgIwogICMgUmVxdWlyZXMgRG9ja2VyIENvbXBvc2UgdjIuMSsgZm9yIHNlcnZpY2VfY29tcGxldGVkX3N1Y2Nlc3NmdWxseSBjb25kaXRpb24uCiAgIwogICMgSW4gdGhlIGJhc2UgKGRldikgY29tcG9zZSwgQ29uc3VsIGlzIHJlYWNoYWJsZSBhdCBjb25zdWw6ODUwMCB2aWEgRG9ja2VyCiAgIyBicmlkZ2UgRE5TIHNpbmNlIGNvbnN1bC1pbml0IHJ1bnMgb24gcHJveHlfbmV0IGFsb25nc2lkZSBjb25zdWwuCiAgY29uc3VsLWluaXQ6CiAgICBpbWFnZTogaGFzaGljb3JwL2NvbnN1bDoxLjIyCiAgICAjIHJlc3RhcnQ6ICJubyIg4oCUIG9uZS1zaG90IGluaXQgY29udGFpbmVyOyBtdXN0IG5vdCBiZSByZXN0YXJ0ZWQgYWZ0ZXIgZXhpdC4KICAgIHJlc3RhcnQ6ICJubyIKICAgIGRlcGVuZHNfb246CiAgICAgIGNvbnN1bDoKICAgICAgICBjb25kaXRpb246IHNlcnZpY2VfaGVhbHRoeQogICAgbmV0d29ya3M6CiAgICAgIC0gcHJveHlfbmV0CiAgICBlbnZpcm9ubWVudDoKICAgICAgQ09OU1VMX0hUVFBfQUREUjogaHR0cDovL2NvbnN1bDo4NTAwCiAgICAgICMgQ09OU1VMX0hUVFBfVE9LRU4gbXVzdCBiZSB0aGUgYm9vdHN0cmFwIHRva2VuIHdyaXR0ZW4gdG8gLmVudiBieSB0aGUKICAgICAgIyBpbnN0YWxsZXIncyBBQ0wgYm9vdHN0cmFwIHN0ZXAuIFdpdGhvdXQgaXQsIGFsbCBjb25zdWwga3YgcHV0IGNhbGxzCiAgICAgICMgZmFpbCB3aXRoIDQwMyAoZGVmYXVsdF9wb2xpY3k6IGRlbnkpIGFuZCBUcmFlZmlrIGhhcyBubyBUTFMgb3B0aW9ucy4KICAgICAgQ09OU1VMX0hUVFBfVE9LRU46ICR7Q09OU1VMX0hUVFBfVE9LRU46LX0KICAgICAgIyBiYWNrZW5kLXVuYXZhaWxhYmxlIHJlc3BvbmRlciBVUkwgKGlzc3VlICMxMzM0KS4gSW4gdGhlIGJhc2UgY29tcG9zZSBib3RoCiAgICAgICMgVHJhZWZpayBhbmQgdGhlIHJlc3BvbmRlciBhcmUgcmVhY2hlZCBvdmVyIHRoZSBob3N0IG5ldHdvcmsgc3RhY2ssIHNvCiAgICAgICMgVHJhZWZpayByZWFjaGVzIHRoZSByZXNwb25kZXIgYXQgdGhlIHB1Ymxpc2hlZCBob3N0IHBvcnQgWzo6MV06ODA4MS4KICAgICAgVFJBRUZJS19VTkFWQUlMQUJMRV9CQUNLRU5EX1VSTDogJHtUUkFFRklLX1VOQVZBSUxBQkxFX0JBQ0tFTkRfVVJMOi1odHRwOi8vWzo6MV06ODA4MX0KICAgIGVudHJ5cG9pbnQ6CiAgICAgIC0gL2Jpbi9zaAogICAgICAtIC1jCiAgICAgIC0gfAogICAgICAgIHNldCAtZQogICAgICAgICMg4pSA4pSAIEZhaWwtbG91ZCBBQ0wgd3JpdGUgZ2F0ZSAoIzE1NTAgLyAjMTU1MSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAgICAgIyBBTFdBWVMgcHJvYmUgdGhhdCB3ZSBjYW4gV1JJVEUgdGhlIHRyYWVmaWsvIEtWIHByZWZpeCBiZWZvcmUgc2VlZGluZy4KICAgICAgICAjIFRoZSBXUklURSBSRVNVTFQgaXMgdGhlIGRpc2NyaW1pbmF0b3IsIE5PVCB0b2tlbiBwcmVzZW5jZToKICAgICAgICAjICAgKiBBQ0xzIG9mZiAoYmFzZS9kZXYg4oCUIGFub255bW91cyB3cml0ZXMgYWxsb3dlZCkg4oaSIHByb2JlIHN1Y2NlZWRzIOKGkiBjb250aW51ZS4KICAgICAgICAjICAgKiBBQ0xzIG9uIHdpdGggYW4gZW1wdHkvaW52YWxpZCB0b2tlbiAodGhlICMxNTUwIGluY2lkZW50KSDihpIgNDAzIOKGkiBGQVRBTC4KICAgICAgICAjIEEgdG9rZW4tcHJlc2VuY2UgZ3VhcmQgY2Fubm90IHRlbGwgdGhlc2UgYXBhcnQg4oCUIHRoZSBpbmNpZGVudCB0b2tlbiB3YXMKICAgICAgICAjIEFMU08gZW1wdHkg4oCUIHNvIHRoZSBwcm9iZSBtdXN0IHJ1biB1bmNvbmRpdGlvbmFsbHkuIEhhcmQtZmFpbGluZyBoZXJlIG1ha2VzCiAgICAgICAgIyB0aGUgYGRlcGVuZHNfb246IGNvbnN1bC1pbml0OiBzZXJ2aWNlX2NvbXBsZXRlZF9zdWNjZXNzZnVsbHlgIGdhdGUgYmxvY2sKICAgICAgICAjIFRyYWVmaWsgYW5kIGBjb21wb3NlIHVwYCByZXR1cm4gbm9uLXplcm8sIGluc3RlYWQgb2YgVHJhZWZpayBjb21pbmcgdXAgIlVwIgogICAgICAgICMgYW5kIHNlcnZpbmcgNDA0IGZvciBldmVyeXRoaW5nIChzdHJvbmctdGxzQGNvbnN1bCB1bnJlc29sdmVkKS4gVGhlIGJvdW5kZWQKICAgICAgICAjIHJldHJ5IGFic29yYnMgYSBjb25zdWwgbGVhZGVyLWVsZWN0aW9uIC8gQUNMLWluaXQgcmFjZSBvbiBhIGNvbGQgYm9vdC4KICAgICAgICAjICgkJFZBUiBpcyBlc2NhcGVkIHNvIENvbXBvc2UgcGFzc2VzIGl0IHRocm91Z2ggbGl0ZXJhbGx5IHRvIHRoZSBzaGVsbC4pCiAgICAgICAgX3Byb2JlX29rPTAKICAgICAgICBfdHJ5PTEKICAgICAgICB3aGlsZSBbICIkJF90cnkiIC1sZSAzIF07IGRvCiAgICAgICAgICBpZiBjb25zdWwga3YgcHV0IHRyYWVmaWsvLmNvbnN1bC1pbml0LXdyaXRlY2hlY2sgb2sgPiAvZGV2L251bGwgMj4mMTsgdGhlbgogICAgICAgICAgICBfcHJvYmVfb2s9MQogICAgICAgICAgICBicmVhawogICAgICAgICAgZmkKICAgICAgICAgIHNsZWVwIDIKICAgICAgICAgIF90cnk9JCQoKF90cnkgKyAxKSkKICAgICAgICBkb25lCiAgICAgICAgaWYgWyAiJCRfcHJvYmVfb2siIC1uZSAxIF07IHRoZW4KICAgICAgICAgIGVjaG8gIkZBVEFMKGNvbnN1bC1pbml0KTogY2Fubm90IHdyaXRlIHRyYWVmaWsvIEtWIOKAlCBDT05TVUxfSFRUUF9UT0tFTiBpcyBlbXB0eSBvciBsYWNrcyBrZXk6d3JpdGUgKDQwMyB1bmRlciBkZWZhdWx0X3BvbGljeT1kZW55KS4gVHJhZWZpayBzdHJvbmctdGxzQGNvbnN1bCB3b3VsZCBiZSB1bnJlc29sdmVkIC0+IGluZ3Jlc3MgNDA0LiBBYm9ydGluZyAoIzE1NTApLiIgPiYyCiAgICAgICAgICBleGl0IDEKICAgICAgICBmaQogICAgICAgIGNvbnN1bCBrdiBkZWxldGUgdHJhZWZpay8uY29uc3VsLWluaXQtd3JpdGVjaGVjayA+IC9kZXYvbnVsbCAyPiYxIHx8IHRydWUKICAgICAgICAjIElkZW1wb3RlbnQ6IG9ubHkgd3JpdGUgZWFjaCBrZXkgaWYgaXQgZG9lcyBub3QgYWxyZWFkeSBleGlzdC4KICAgICAgICAjIFRoaXMgbWFrZXMgcmUtZGVwbG95cyBzYWZlIOKAlCBubyBkYXRhIGlzIG92ZXJ3cml0dGVuLgogICAgICAgIGNvbnN1bCBrdiBnZXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL21pblZlcnNpb24gPiAvZGV2L251bGwgMj4mMSB8fCBcCiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvdGxzL29wdGlvbnMvc3Ryb25nLXRscy9taW5WZXJzaW9uIFZlcnNpb25UTFMxMgogICAgICAgIGNvbnN1bCBrdiBnZXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL2NpcGhlclN1aXRlcy8wID4gL2Rldi9udWxsIDI+JjEgfHwgewogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvY2lwaGVyU3VpdGVzLzAgVExTX0VDREhFX0VDRFNBX1dJVEhfQUVTXzEyOF9HQ01fU0hBMjU2CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvdGxzL29wdGlvbnMvc3Ryb25nLXRscy9jaXBoZXJTdWl0ZXMvMSBUTFNfRUNESEVfUlNBX1dJVEhfQUVTXzEyOF9HQ01fU0hBMjU2CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvdGxzL29wdGlvbnMvc3Ryb25nLXRscy9jaXBoZXJTdWl0ZXMvMiBUTFNfRUNESEVfRUNEU0FfV0lUSF9BRVNfMjU2X0dDTV9TSEEzODQKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL2NpcGhlclN1aXRlcy8zIFRMU19FQ0RIRV9SU0FfV0lUSF9BRVNfMjU2X0dDTV9TSEEzODQKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL2NpcGhlclN1aXRlcy80IFRMU19FQ0RIRV9FQ0RTQV9XSVRIX0NIQUNIQTIwX1BPTFkxMzA1X1NIQTI1NgogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL3Rscy9vcHRpb25zL3N0cm9uZy10bHMvY2lwaGVyU3VpdGVzLzUgVExTX0VDREhFX1JTQV9XSVRIX0NIQUNIQTIwX1BPTFkxMzA1X1NIQTI1NgogICAgICAgIH0KCiAgICAgICAgIyDilIDilIAgYmFja2VuZC11bmF2YWlsYWJsZSA1MDMgZmFsbGJhY2sgKGlzc3VlICMxMzM0KSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICAgICAjIFNlZWQgYSBsaWZlY3ljbGUtaW5kZXBlbmRlbnQgVHJhZWZpayByb3V0aW5nIGdyYXBoIGludG8gQ29uc3VsIEtWIHRoYXQKICAgICAgICAjIHR1cm5zIGEgZG93bmVkL2Fic2VudCBwcm94eSBiYWNrZW5kIGludG8gYSBSRVRSWUFCTEUgNTAzIGluc3RlYWQgb2YgYQogICAgICAgICMgNDA0LiBCZWNhdXNlIHRoZXNlIGtleXMgbGl2ZSBpbiBDb25zdWwgS1YgKG5vdCBEb2NrZXIgbGFiZWxzKSB0aGV5CiAgICAgICAgIyBzdXJ2aXZlIHRoZSBwcm94eSBjb250YWluZXIgYmVpbmcgc3RvcHBlZC9yZW1vdmVkIOKAlCB3aGljaCBpcyBleGFjdGx5IHRoZQogICAgICAgICMgd2luZG93IHRoYXQgcHJvZHVjZWQgdGhlIDQwNCAtPiAicGljayBhIGRpZmZlcmVudCBtb2RlbCIgbWlzZmlyZS4KICAgICAgICAjCiAgICAgICAgIyBJZGVtcG90ZW50OiBlYWNoIGtleSBpcyB3cml0dGVuIG9ubHkgaWYgaXQgZG9lcyBub3QgYWxyZWFkeSBleGlzdCwgc28KICAgICAgICAjIHJlLWRlcGxveXMgbmV2ZXIgY2xvYmJlciBvcGVyYXRvciBvdmVycmlkZXMuCiAgICAgICAgIwogICAgICAgICMgTk9URTogJCR7VFJBRUZJS19VTkFWQUlMQUJMRV9CQUNLRU5EX1VSTH0gaXMgZXNjYXBlZCAoJCQpIHNvIERvY2tlcgogICAgICAgICMgQ29tcG9zZSBwYXNzZXMgaXQgdGhyb3VnaCB0byB0aGUgc2hlbGwgYXMgYSBsaXRlcmFsICRWQVIg4oCUIHRoZSB2YWx1ZSBpcwogICAgICAgICMgcmVhZCBmcm9tIHRoZSBjb250YWluZXIgRU5WSVJPTk1FTlQgKHNldCBhYm92ZSksIG5vdCBzdWJzdGl0dXRlZCBieQogICAgICAgICMgQ29tcG9zZSBhdCByZW5kZXIgdGltZS4KICAgICAgICAjCiAgICAgICAgIyAxLiBTdGF0aWMgcmVzcG9uZGVyIHNlcnZpY2UgKGFsd2F5cy11cCBzaWRlY2FyIHNlcnZpbmcgNTAzICsgZW52ZWxvcGUpLgogICAgICAgICMgICAgVGhlIFVSTCBpcyBJTkZSQVNUUlVDVFVSRS1kZXJpdmVkIChpdCB0cmFja3MgdGhlIG5ldHdvcmtpbmcgbW9kZToKICAgICAgICAjICAgIGhvc3QgLT4gWzo6MV06ODA4MSwgYnJpZGdlIC0+IGJhY2tlbmQtdW5hdmFpbGFibGU6ODApLCBOT1QgYW4gb3BlcmF0b3IKICAgICAgICAjICAgIHByZWZlcmVuY2UsIHNvIHdyaXRlIGl0IEVWRVJZIHJ1bi4gVGhpcyBzZWxmLWhlYWxzIHRvcG9sb2d5IGRyaWZ0IOKAlAogICAgICAgICMgICAgZS5nLiBzd2l0Y2hpbmcgYmFzZSAoaG9zdCkgdG8vZnJvbSBuby1tZG5zIChicmlkZ2UpIG9uIGFuIGV4aXN0aW5nCiAgICAgICAgIyAgICBDb25zdWwgdm9sdW1lIOKAlCB3aGljaCBhIHdyaXRlLWlmLWFic2VudCBndWFyZCB3b3VsZCBsZWF2ZSBzdGFsZSBhbmQKICAgICAgICAjICAgIHVucmVhY2hhYmxlLiBUaGUgbWlkZGxld2FyZS9yb3V0ZXIgYmxvY2tzIGJlbG93IGFyZSBzdGF0aWMgZGVmaW5pdGlvbnMKICAgICAgICAjICAgIGFuZCBrZWVwIHRoZSB3cml0ZS1pZi1hYnNlbnQgZ3VhcmQgc28gb3BlcmF0b3Igb3ZlcnJpZGVzIHN1cnZpdmUuCiAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvc2VydmljZXMvYmFja2VuZC11bmF2YWlsYWJsZS9sb2FkQmFsYW5jZXIvc2VydmVycy8wL3VybCAiJCR7VFJBRUZJS19VTkFWQUlMQUJMRV9CQUNLRU5EX1VSTH0iCiAgICAgICAgIyAyLiBlcnJvcnMgbWlkZGxld2FyZTogY2F0Y2ggYSBkZWFkLWJ1dC1wcmVzZW50IGJhY2tlbmQgKDUwMi81MDMvNTA0KSBhbmQKICAgICAgICAjICAgIHNlcnZlIHRoZSByZXNwb25kZXIgYm9keS4gcXVlcnk9LyBmZXRjaGVzIHRoZSByZXNwb25kZXIncyBjYXRjaC1hbGwKICAgICAgICAjICAgIDUwMyBlbnZlbG9wZSBmb3IgZXZlcnkgZXJyb3IuCiAgICAgICAgY29uc3VsIGt2IGdldCB0cmFlZmlrL2h0dHAvbWlkZGxld2FyZXMvc2VydmljZS11bmF2YWlsYWJsZS9lcnJvcnMvc3RhdHVzLzAgPiAvZGV2L251bGwgMj4mMSB8fCB7CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9taWRkbGV3YXJlcy9zZXJ2aWNlLXVuYXZhaWxhYmxlL2Vycm9ycy9zdGF0dXMvMCA1MDIKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL21pZGRsZXdhcmVzL3NlcnZpY2UtdW5hdmFpbGFibGUvZXJyb3JzL3N0YXR1cy8xIDUwMwogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvbWlkZGxld2FyZXMvc2VydmljZS11bmF2YWlsYWJsZS9lcnJvcnMvc3RhdHVzLzIgNTA0CiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9taWRkbGV3YXJlcy9zZXJ2aWNlLXVuYXZhaWxhYmxlL2Vycm9ycy9zZXJ2aWNlIGJhY2tlbmQtdW5hdmFpbGFibGVAY29uc3VsCiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9taWRkbGV3YXJlcy9zZXJ2aWNlLXVuYXZhaWxhYmxlL2Vycm9ycy9xdWVyeSAvCiAgICAgICAgfQogICAgICAgICMgMy4gTG93ZXN0LXByaW9yaXR5IGNhdGNoLWFsbCByb3V0ZXI6IHdoZW4gdGhlIHByb3h5LWFwaSBEb2NrZXIgcm91dGVyIGhhcwogICAgICAgICMgICAgZGlzYXBwZWFyZWQgKGNvbnRhaW5lciByZW1vdmVkKSBub3RoaW5nIGVsc2UgbWF0Y2hlcywgc28gdGhpcyBzZXJ2ZXMKICAgICAgICAjICAgIHRoZSByZXNwb25kZXIgZGlyZWN0bHkuIHByaW9yaXR5PTEgZ3VhcmFudGVlcyB0aGUgcmVhbCBwcm94eS1hcGkKICAgICAgICAjICAgIHJvdXRlciAobm8gZXhwbGljaXQgcHJpb3JpdHkgLT4gcmFua2VkIGJ5IHJ1bGUgbGVuZ3RoKSBhbHdheXMgd2lucwogICAgICAgICMgICAgd2hpbGUgdGhlIHByb3h5IGlzIHVwLgogICAgICAgIGNvbnN1bCBrdiBnZXQgdHJhZWZpay9odHRwL3JvdXRlcnMvYmFja2VuZC11bmF2YWlsYWJsZS9ydWxlID4gL2Rldi9udWxsIDI+JjEgfHwgewogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvcm91dGVycy9iYWNrZW5kLXVuYXZhaWxhYmxlL3J1bGUgJ1BhdGhQcmVmaXgoYC9gKScKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL3JvdXRlcnMvYmFja2VuZC11bmF2YWlsYWJsZS9lbnRyeVBvaW50cy8wIHdlYnNlY3VyZQogICAgICAgICAgY29uc3VsIGt2IHB1dCB0cmFlZmlrL2h0dHAvcm91dGVycy9iYWNrZW5kLXVuYXZhaWxhYmxlL3ByaW9yaXR5IDEKICAgICAgICAgIGNvbnN1bCBrdiBwdXQgdHJhZWZpay9odHRwL3JvdXRlcnMvYmFja2VuZC11bmF2YWlsYWJsZS9zZXJ2aWNlIGJhY2tlbmQtdW5hdmFpbGFibGVAY29uc3VsCiAgICAgICAgICBjb25zdWwga3YgcHV0IHRyYWVmaWsvaHR0cC9yb3V0ZXJzL2JhY2tlbmQtdW5hdmFpbGFibGUvdGxzL29wdGlvbnMgc3Ryb25nLXRscwogICAgICAgIH0KCiAgIyDilIDilIDilIAgYmFja2VuZC11bmF2YWlsYWJsZSByZXNwb25kZXIgKGlzc3VlICMxMzM0KSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAjIEFsd2F5cy11cCBzdGF0aWMgc2lkZWNhciB0aGF0IGFuc3dlcnMgRVZFUlkgcmVxdWVzdCB3aXRoIGEgcmV0cnlhYmxlIEhUVFAgNTAzCiAgIyBjYXJyeWluZyBhIFJldHJ5LUFmdGVyIGhlYWRlciBhbmQgYW4gQW50aHJvcGljIGVycm9yLWVudmVsb3BlIGJvZHkKICAjICh7InR5cGUiOiJlcnJvciIsImVycm9yIjp7InR5cGUiOiJvdmVybG9hZGVkX2Vycm9yIiwuLi59fSkuIFRyYWVmaWsgcm91dGVzCiAgIyBoZXJlICh2aWEgdGhlIENvbnN1bCBLViBjYXRjaC1hbGwgcm91dGVyIGFuZCB0aGUgc2VydmljZS11bmF2YWlsYWJsZSBlcnJvcnMKICAjIG1pZGRsZXdhcmUgc2VlZGVkIGJ5IGNvbnN1bC1pbml0IGFib3ZlKSB3aGVuZXZlciB0aGUgcHJveHkgYmFja2VuZCBpcyBvZmZsaW5lLAogICMgc28gQ2xhdWRlIENvZGUvQ0xJIHRyZWF0cyB0aGUgYmxpcCBhcyB0cmFuc2llbnQgYW5kIHJldHJpZXMgaW5zdGVhZCBvZgogICMgcmVhZGluZyBhIDQwNCBhcyAibW9kZWwgbm90IGZvdW5kIC8gbm8gYWNjZXNzIi4KICAjCiAgIyBSdW5zIG9uIHRoZSBwcm94eV9uZXQgYnJpZGdlIGFuZCBwdWJsaXNoZXMgaXRzIEhUVFAgcG9ydCBvbiB0aGUgaG9zdCBzbyB0aGUKICAjIGhvc3QtbmV0d29ya2VkIFRyYWVmaWsgcmVhY2hlcyBpdCBhdCBbOjoxXTo4MDgxIChtYXRjaGluZyB0aGUgV0FGIHNpZGVjYXIKICAjIHBhdHRlcm4pLiBMaXN0ZW5zIHBsYWluLUhUVFA7IFRMUyB0ZXJtaW5hdGVzIGF0IFRyYWVmaWsuCiAgYmFja2VuZC11bmF2YWlsYWJsZToKICAgIGltYWdlOiBuZ2lueDoxLjI3LWFscGluZQogICAgcmVzdGFydDogdW5sZXNzLXN0b3BwZWQKICAgIG5ldHdvcmtzOgogICAgICAtIHByb3h5X25ldAogICAgcG9ydHM6CiAgICAgICMgQmluZCB0byBsb29wYmFjayBvbmx5IOKAlCB0aGlzIHJlc3BvbmRlciBpcyBpbnRlcm5hbCB0byB0aGUgaG9zdCBhbmQgbXVzdAogICAgICAjIG5vdCBiZSBleHBvc2VkIHRvIHRoZSBMQU4uIFRyYWVmaWsgKG5ldHdvcmtfbW9kZTogaG9zdCkgcmVhY2hlcyBpdCBoZXJlLgogICAgICAtICJbOjoxXTo4MDgxOjgwIgogICAgdm9sdW1lczoKICAgICAgLSAuL2JhY2tlbmQtdW5hdmFpbGFibGUvZGVmYXVsdC5jb25mOi9ldGMvbmdpbngvY29uZi5kL2RlZmF1bHQuY29uZjpybwogICAgaGVhbHRoY2hlY2s6CiAgICAgIHRlc3Q6IFsiQ01ELVNIRUxMIiwgIndnZXQgLXEgLU8gL2Rldi9udWxsIGh0dHA6Ly9sb2NhbGhvc3QvaGVhbHRoeiB8fCBleGl0IDEiXQogICAgICBpbnRlcnZhbDogMTVzCiAgICAgIHRpbWVvdXQ6IDVzCiAgICAgIHJldHJpZXM6IDMKICAgICAgc3RhcnRfcGVyaW9kOiA1cwoKICB0cmFlZmlrOgogICAgaW1hZ2U6IHRyYWVmaWs6djMKICAgICMgbmV0d29ya19tb2RlOiBob3N0IGdpdmVzIFRyYWVmaWsgZGlyZWN0IGFjY2VzcyB0byB0aGUgaG9zdCBuZXR3b3JrIHN0YWNrLgogICAgIyBUaGlzIGlzIHJlcXVpcmVkIHNvIHRoYXQgY2xpZW50IHNvdXJjZSBJUHMgYXJlIHJlYWwgKG5vdCBEb2NrZXIgYnJpZGdlIElQcykuCiAgICAjIFdpdGggaG9zdCBuZXR3b3JraW5nLCBwb3J0IG1hcHBpbmdzIGFyZSBpcnJlbGV2YW50IOKAlCBUcmFlZmlrIGJpbmRzIGRpcmVjdGx5CiAgICAjIHRvIHRoZSBob3N0IGludGVyZmFjZXMgb24gdGhlIHBvcnRzIGRlY2xhcmVkIGluIGVudHJ5cG9pbnRzIChbOjpdOjQ0MyBldGMuKS4KICAgICMgTm90ZTogbmV0d29ya19tb2RlOiBob3N0IGlzIHN1cHBvcnRlZCBvbiBMaW51eCBhbmQgbWFjT1MgKERvY2tlciBEZXNrdG9wIDQuMzQrCiAgICAjIHdpdGggaG9zdCBuZXR3b3JraW5nIGVuYWJsZWQg4oCUIFNldHRpbmdzIOKGkiBSZXNvdXJjZXMg4oaSIE5ldHdvcmspLiBUaGUgaW5zdGFsbGVyCiAgICAjIGRldGVjdHMgYW5kIGd1aWRlcyBlbmFibGVtZW50IGF1dG9tYXRpY2FsbHkuIFdpbmRvd3MgRG9ja2VyIERlc2t0b3AgZG9lcyBub3QKICAgICMgc3VwcG9ydCBob3N0IG5ldHdvcmtpbmcg4oCUIHVzZSBXU0wyIG9yIGEgTGludXggaG9zdC4KICAgICMKICAgICMgRG9ja2VyIGxhYmVsIGRpc2NvdmVyeSBzdGlsbCB3b3JrcyB3aXRoIG5ldHdvcmtfbW9kZTogaG9zdCBiZWNhdXNlIERvY2tlcgogICAgIyBzb2NrZXQgYWNjZXNzIGlzIGluZGVwZW5kZW50IG9mIG5ldHdvcmsgbW9kZS4gVHJhZWZpayByZWFkcyBjb250YWluZXIKICAgICMgbWV0YWRhdGEgdmlhIHRoZSBEb2NrZXIgQVBJIHNvY2tldCwgbm90IHZpYSB0aGUgbmV0d29yayBzdGFjay4KICAgICMgVGhlIHByb3h5IHNlcnZpY2UgYWxzbyB1c2VzIG5ldHdvcmtfbW9kZTogaG9zdCAocmVxdWlyZWQgZm9yIG1ETlMgbXVsdGljYXN0KTsKICAgICMgYm90aCBUcmFlZmlrIGFuZCB0aGUgcHJveHkgYXJlIG9uIHRoZSBob3N0IG5ldHdvcmsgc3RhY2sgc28gVHJhZWZpayByb3V0ZXMKICAgICMgdG8gbG9jYWxob3N0Ojxwb3J0PiBkaXJlY3RseSDigJQgbm8gRG9ja2VyIGJyaWRnZSBuZXR3b3JrIHJlc29sdXRpb24gbmVlZGVkLgogICAgbmV0d29ya19tb2RlOiBob3N0CiAgICAjIGVudl9maWxlIHBhc3NlcyAuZW52IHZhcmlhYmxlcyBJTlRPIHRoZSBUcmFlZmlrIGNvbnRhaW5lciBlbnZpcm9ubWVudC4KICAgICMgRG9ja2VyIENvbXBvc2UgLS1lbnYtZmlsZSAvIHRoZSAuZW52IGZpbGUgb25seSBmZWVkcyBZQU1MIHZhcmlhYmxlCiAgICAjIHN1YnN0aXR1dGlvbiAoJHtWQVJ9KSDigJQgaXQgZG9lcyBOT1QgcGFzcyB2YXJpYWJsZXMgaW50byBjb250YWluZXJzLgogICAgIyBXaXRob3V0IGVudl9maWxlLCBDT05TVUxfSFRUUF9UT0tFTiBpcyBuZXZlciBzZXQgaW5zaWRlIHRoZSBUcmFlZmlrCiAgICAjIHByb2Nlc3MsIHNvIGFsbCBDb25zdWwgS1YgcmVhZHMgZmFpbCB3aXRoIDQwMyBhbmQgc3Ryb25nLXRsc0Bjb25zdWwKICAgICMgVExTIG9wdGlvbnMgYXJlIG5ldmVyIGxvYWRlZC4KICAgIGVudl9maWxlOgogICAgICAtIHBhdGg6IC5lbnYKICAgICAgICByZXF1aXJlZDogZmFsc2UKICAgIGNvbW1hbmQ6CiAgICAgICMgQ29uc3VsIEtWIHByb3ZpZGVyOiBUTFMgb3B0aW9ucyBhcmUgc2VlZGVkIGludG8gQ29uc3VsIGJ5IGNvbnN1bC1pbml0ICgjMjQwKS4KICAgICAgIyBUcmFlZmlrIHVzZXMgbmV0d29ya19tb2RlOiBob3N0IGFuZCByZWFjaGVzIENvbnN1bCBhdCBbOjoxXTo4NTAwIHZpYSB0aGUKICAgICAgIyBwdWJsaXNoZWQgaG9zdCBwb3J0LiByb290a2V5PXRyYWVmaWsgbWF0Y2hlcyB0aGUgS1YgcHJlZml4IHVzZWQgYnkgY29uc3VsLWluaXQuCiAgICAgICMKICAgICAgIyBTdGFydHVwIHJhY2Ugbm90ZTogaWYgQ29uc3VsIGlzIHVuYXZhaWxhYmxlIHdoZW4gVHJhZWZpayBzdGFydHMsIFRyYWVmaWsKICAgICAgIyB3aWxsIGxvYWQgbm8gVExTIG9wdGlvbnMgZnJvbSBDb25zdWwgYW5kIGZhbGwgYmFjayB0byBkZWZhdWx0cyAoVExTIDEuMAogICAgICAjIGFsbG93ZWQpLiBUaGUgZGVwZW5kc19vbjogY29uc3VsLWluaXQ6IHNlcnZpY2VfY29tcGxldGVkX3N1Y2Nlc3NmdWxseSBvcmRlcmluZwogICAgICAjIGJlbG93IHByZXZlbnRzIHRoaXMgdW5kZXIgbm9ybWFsIG9wZXJhdGlvbi4KICAgICAgLSAiLS1wcm92aWRlcnMuY29uc3VsLmVuZHBvaW50cz1bOjoxXTo4NTAwIgogICAgICAtICItLXByb3ZpZGVycy5jb25zdWwucm9vdGtleT10cmFlZmlrIgogICAgICAjIERvY2tlciBwcm92aWRlcjogZGlzY292ZXJzIHJvdXRpbmcgY29uZmlnIGZyb20gY29udGFpbmVyIGxhYmVscwogICAgICAtICItLXByb3ZpZGVycy5kb2NrZXI9dHJ1ZSIKICAgICAgLSAiLS1wcm92aWRlcnMuZG9ja2VyLmV4cG9zZWRCeURlZmF1bHQ9ZmFsc2UiCiAgICAgICMgRmlsZSBwcm92aWRlcjogb3BlcmF0b3IgZHJvcC1pbiBkaXJlY3RvcnkgKGlzc3VlICMxMzQwKS4KICAgICAgIyBBIHdhdGNoZWQsIHJlYWQtb25seSBkaXJlY3Rvcnkgd2hlcmUgb3BlcmF0b3JzIG1heSBkcm9wIHNpdGUtc3BlY2lmaWMKICAgICAgIyBUcmFlZmlrIGR5bmFtaWMgY29uZmlnICgqLnltbC8qLnRvbWwpIOKAlCBjdXN0b20gcm91dGVycywgbWlkZGxld2FyZXMsCiAgICAgICMgcmVkaXJlY3RzLCBoZWFkZXJzIOKAlCBXSVRIT1VUIG1vZGlmeWluZyB0aGUgcHJvZHVjdCB0ZW1wbGF0ZXMuIEVNUFRZIGJ5CiAgICAgICMgZGVmYXVsdDogYSBjbGVhbiBpbnN0YWxsIGxvYWRzIG5vdGhpbmcgaGVyZSwgc28gYmVoYXZpb3VyIGlzIHVuY2hhbmdlZAogICAgICAjIHVudGlsIGFuIG9wZXJhdG9yIGRyb3BzIGEgZmlsZS4gQ29leGlzdHMgd2l0aCB0aGUgY29uc3VsICsgZG9ja2VyCiAgICAgICMgcHJvdmlkZXJzIGFib3ZlLiBTZWUgZG9jcy90bHMtc2V0dXAubWQgKCJPcGVyYXRvciBUcmFlZmlrIGRyb3AtaW4iKS4KICAgICAgLSAiLS1wcm92aWRlcnMuZmlsZS5kaXJlY3Rvcnk9L2V0Yy90cmFlZmlrL2R5bmFtaWMiCiAgICAgIC0gIi0tcHJvdmlkZXJzLmZpbGUud2F0Y2g9dHJ1ZSIKICAgICAgIyBFbnRyeXBvaW50cyDigJQgSVB2Ni1vbmx5OyBkdWFsLXN0YWNrIHdoZXJlIGtlcm5lbCBoYXMgaXB2NiBlbmFibGVkCiAgICAgIC0gIi0tZW50cnlwb2ludHMud2Vic2VjdXJlLmFkZHJlc3M9Wzo6XTo0NDMiCiAgICAgIC0gIi0tZW50cnlwb2ludHMuZm9yd2FyZC1wcm94eS5hZGRyZXNzPVs6Ol06ODQ0MyIKICAgICAgIyBEaXNhYmxlIHJlc3BvbnNlIGJ1ZmZlcmluZyBmb3IgU1NFIHN0cmVhbWluZwogICAgICAtICItLWVudHJ5cG9pbnRzLndlYnNlY3VyZS50cmFuc3BvcnQucmVzcG9uZGluZ1RpbWVvdXRzLnJlYWRUaW1lb3V0PTAiCiAgICAgIC0gIi0tZW50cnlwb2ludHMud2Vic2VjdXJlLnRyYW5zcG9ydC5yZXNwb25kaW5nVGltZW91dHMud3JpdGVUaW1lb3V0PTAiCiAgICAgIC0gIi0tZW50cnlwb2ludHMud2Vic2VjdXJlLnRyYW5zcG9ydC5yZXNwb25kaW5nVGltZW91dHMuaWRsZVRpbWVvdXQ9MTgwcyIKICAgICAgIyBEYXNoYm9hcmQgYW5kIEFQSSBkaXNhYmxlZAogICAgICAtICItLWFwaT1mYWxzZSIKICAgICAgIyBMaXZlbmVzcyBwaW5nIGVudHJ5cG9pbnQgKCMxNTUwIC8gIzE1NTEpLiBCYWNrcyB0aGUgY29udGFpbmVyIGhlYWx0aGNoZWNrCiAgICAgICMgYmVsb3cgc28gYSBUcmFlZmlrIHByb2Nlc3MgdGhhdCBjYW5ub3Qgc2VydmUgaXMgdmlzaWJseSBVTkhFQUxUSFkgaW5zdGVhZAogICAgICAjIG9mIHNpdHRpbmcgIlVwIiB3aGlsZSB0aGUgaW5ncmVzcyA0MDRzLiBuZXR3b3JrX21vZGU6IGhvc3QgbWVhbnMKICAgICAgIyAxMjcuMC4wLjE6ODA4MyBiaW5kcyBob3N0IGxvb3BiYWNrIG9ubHkg4oCUIHVucHVibGlzaGVkIGFuZCB1bnJlYWNoYWJsZQogICAgICAjIG9mZi1ob3N0IChpdCBhcHBlYXJzIGluIG5vIGBwb3J0czpgIGxpc3QpLiBUaGlzIGlzIExJVkVORVNTIG9ubHk7IEtWL3JvdXRlCiAgICAgICMgaGVhbHRoIChzdHJvbmctdGxzQGNvbnN1bCByZXNvbHZhYmxlKSBpcyBjb3ZlcmVkIGJ5IGNvbnN1bC1rdi13YXRjaGRvZy4KICAgICAgLSAiLS1waW5nPXRydWUiCiAgICAgIC0gIi0tcGluZy5lbnRyeXBvaW50PXBpbmciCiAgICAgIC0gIi0tZW50cnlwb2ludHMucGluZy5hZGRyZXNzPTEyNy4wLjAuMTo4MDgzIgogICAgICAtICItLWxvZy5sZXZlbD1JTkZPIgogICAgICAtICItLWFjY2Vzc2xvZz10cnVlIgogICAgdm9sdW1lczoKICAgICAgIyBEb2NrZXIgc29ja2V0IGZvciBsYWJlbC1iYXNlZCBzZXJ2aWNlIGRpc2NvdmVyeQogICAgICAtIC92YXIvcnVuL2RvY2tlci5zb2NrOi92YXIvcnVuL2RvY2tlci5zb2NrOnJvCiAgICAgICMgT3BlcmF0b3IgZHJvcC1pbiBkaXJlY3RvcnkgZm9yIGN1c3RvbSBUcmFlZmlrIGR5bmFtaWMgY29uZmlnIChpc3N1ZSAjMTM0MCkuCiAgICAgICMgUmVhZC1vbmx5OiBUcmFlZmlrIG9ubHkgd2F0Y2hlcy9yZWFkcyBpdCwgbmV2ZXIgd3JpdGVzLiBSZWxhdGl2ZSB0byB0aGlzCiAgICAgICMgY29tcG9zZSBmaWxlLCBzbyBpdCByZXNvbHZlcyB0byA8aW5zdGFsbC1kaXI+L2RvY2tlci90cmFlZmlrLWR5bmFtaWMvLgogICAgICAjIENyZWF0ZWQgZW1wdHkgYnkgaW5zdGFsbC5zaCBhbmQgcHJlc2VydmVkIChuZXZlciB3aXBlZCkgb24gdXBncmFkZS4KICAgICAgLSAuL3RyYWVmaWstZHluYW1pYzovZXRjL3RyYWVmaWsvZHluYW1pYzpybwogICAgaGVhbHRoY2hlY2s6CiAgICAgICMgTGl2ZW5lc3MgKCMxNTUwIC8gIzE1NTEpOiBwcm92ZXMgdGhlIFRyYWVmaWsgcHJvY2VzcyBpcyB1cCBhbmQgaXRzIHBpbmcKICAgICAgIyBlbnRyeXBvaW50IHJlc3BvbmRzLiB0cmFlZmlrOnYzIGlzIGRpc3Ryb2xlc3MgKG5vIGN1cmwvd2dldCksIHNvIHVzZSB0aGUKICAgICAgIyBidWlsdC1pbiBgdHJhZWZpayBoZWFsdGhjaGVja2Agc3ViY29tbWFuZC4gSXQgcnVucyBhcyBhIFNFUEFSQVRFIHByb2Nlc3MKICAgICAgIyB0aGF0IGRvZXMgTk9UIGluaGVyaXQgdGhlIG1haW4gY29tbWFuZCdzIENMSSBmbGFncywgc28gdGhlIHBpbmcgY29uZmlnIGlzCiAgICAgICMgcmVwZWF0ZWQgaGVyZSBzbyBpdCByZXNvbHZlcyAxMjcuMC4wLjE6ODA4My9waW5nIHJlZ2FyZGxlc3Mgb2YgY29uZmlnIHNvdXJjZS4KICAgICAgdGVzdDogWyJDTUQiLCAidHJhZWZpayIsICJoZWFsdGhjaGVjayIsICItLXBpbmciLCAiLS1waW5nLmVudHJ5cG9pbnQ9cGluZyIsICItLWVudHJ5cG9pbnRzLnBpbmcuYWRkcmVzcz0xMjcuMC4wLjE6ODA4MyJdCiAgICAgIGludGVydmFsOiAxMHMKICAgICAgdGltZW91dDogNXMKICAgICAgcmV0cmllczogMwogICAgICBzdGFydF9wZXJpb2Q6IDE1cwogICAgZGVwZW5kc19vbjoKICAgICAgIyBjb25zdWwtaW5pdCBtdXN0IGNvbXBsZXRlIGJlZm9yZSBUcmFlZmlrIHN0YXJ0cyDigJQgZW5zdXJlcyBUTFMgb3B0aW9ucyBLVgogICAgICAjIGVudHJpZXMgYXJlIHByZXNlbnQgYmVmb3JlIFRyYWVmaWsgcmVhZHMgaXRzIENvbnN1bCBLViBwcm92aWRlciBjb25maWcuCiAgICAgIGNvbnN1bC1pbml0OgogICAgICAgIGNvbmRpdGlvbjogc2VydmljZV9jb21wbGV0ZWRfc3VjY2Vzc2Z1bGx5CiAgICAgIHByb3h5OgogICAgICAgIGNvbmRpdGlvbjogc2VydmljZV9zdGFydGVkCiAgICAgICMgYmFja2VuZC11bmF2YWlsYWJsZSBtdXN0IGJlIHVwIHNvIHRoZSA1MDMgZmFsbGJhY2sgcmVzcG9uZGVyIGlzIHJlYWNoYWJsZQogICAgICAjIHRoZSBtb21lbnQgVHJhZWZpayBzdGFydHMgcm91dGluZyAoaXNzdWUgIzEzMzQpLgogICAgICBiYWNrZW5kLXVuYXZhaWxhYmxlOgogICAgICAgIGNvbmRpdGlvbjogc2VydmljZV9zdGFydGVkCgogICMg4pSA4pSA4pSAIGNvbnN1bC1rdi13YXRjaGRvZyAoIzE1NTAgLyAjMTU1MSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgIyBSdW50aW1lIEtWLWRyaWZ0IGRldGVjdG9yOiBhIHRpbnkgc2lkZWNhciAocmV1c2VzIHRoZSBjb25zdWwgaW1hZ2Ug4oCUIG5vIG5ldwogICMgaW1hZ2UpIHdob3NlIGhlYWx0aGNoZWNrIFJFQURTIHRoZSBzdHJvbmctdGxzIFRMUyBvcHRpb24gdGhhdCBUcmFlZmlrJ3MgY29uc3VsCiAgIyBwcm92aWRlciBkZXBlbmRzIG9uLiBJZiB0aGUgdG9rZW4gaXMgcmV2b2tlZC9leHBpcmVzIG9yIHRoZSBLViBpcyB3aXBlZCwgdGhlCiAgIyByZWFkIGZhaWxzIGFuZCB0aGlzIGNvbnRhaW5lciBnb2VzIFVOSEVBTFRIWSDigJQgdHVybmluZyBhIHNpbGVudCBpbmdyZXNzIDQwNAogICMgaW50byBhIHZpc2libGUgc2lnbmFsIHRoYXQgbW9uaXRvcmluZyAvIGBkb2NrZXIgY29tcG9zZSBwc2AgY2F0Y2hlcy4KICAjCiAgIyBMSU1JVEFUSU9OIChkb2N1bWVudGVkIOKAlCBkbyBOT1Qgb3Zlci10cnVzdCBhIGdyZWVuIHdhdGNoZG9nKTogaW4gdGhlIGluc3RhbGxlcgogICMgYmFzZSBzdGFjayBUcmFlZmlrIGlzIG5ldHdvcmtfbW9kZTogaG9zdCBhbmQgcmVhY2hlcyBDb25zdWwgYXQgWzo6MV06ODUwMCwKICAjIHdoaWxlIHRoaXMgc2lkZWNhciByZWFjaGVzIGl0IG92ZXIgdGhlIGJyaWRnZSBhdCBjb25zdWw6ODUwMC4gSXQgdGhlcmVmb3JlCiAgIyBkZXRlY3RzIEFDTC90b2tlbi9LViBkcmlmdCBidXQgTk9UIGhvc3QtbG9vcGJhY2svTkFUIG5ldHdvcmtpbmcgZHJpZnQgb24KICAjIFRyYWVmaWsncyBvd24gcGF0aCAoYSBjbGFzcyB0aGlzIHJlcG8gaGFzIGhpdCBiZWZvcmUg4oCUIGluc3RhbGxlciBicmlkZ2UtTkFUICMxNTQ2KS4KICBjb25zdWwta3Ytd2F0Y2hkb2c6CiAgICBpbWFnZTogaGFzaGljb3JwL2NvbnN1bDoxLjIyCiAgICByZXN0YXJ0OiB1bmxlc3Mtc3RvcHBlZAogICAgZGVwZW5kc19vbjoKICAgICAgY29uc3VsLWluaXQ6CiAgICAgICAgY29uZGl0aW9uOiBzZXJ2aWNlX2NvbXBsZXRlZF9zdWNjZXNzZnVsbHkKICAgIG5ldHdvcmtzOgogICAgICAtIHByb3h5X25ldAogICAgZW52aXJvbm1lbnQ6CiAgICAgIENPTlNVTF9IVFRQX0FERFI6IGh0dHA6Ly9jb25zdWw6ODUwMAogICAgICAjIFNhbWUgdG9rZW4gYXMgY29uc3VsLWluaXQvVHJhZWZpayAoY29uc3VsLWluaXQtcnc6IGtleV9wcmVmaXggInRyYWVmaWsvIgogICAgICAjIHdyaXRlIOKHkiByZWFkIGFsbG93ZWQpLiBTdGFuZGFyZCBjb250YWluZXItZW52IGluamVjdGlvbiwgbm90IGEgcmVuZGVyLXRpbWUKICAgICAgIyBjb21tYW5kIHN1YnN0aXR1dGlvbiDigJQgbm8gc2VjcmV0IHJlYWNoZXMgdGhlIHJlbmRlcmVkIGNvbXBvc2UvY29tbWFuZC4KICAgICAgQ09OU1VMX0hUVFBfVE9LRU46ICR7Q09OU1VMX0hUVFBfVE9LRU46LX0KICAgICMgSWRsZSBmb3JldmVyOyBhbGwgdGhlIHNpZ25hbCBpcyBpbiB0aGUgaGVhbHRoY2hlY2suCiAgICBlbnRyeXBvaW50OiBbIi9iaW4vc2giLCAiLWMiLCAid2hpbGUgdHJ1ZTsgZG8gc2xlZXAgMzYwMDsgZG9uZSJdCiAgICBoZWFsdGhjaGVjazoKICAgICAgIyBSZWFkIHRoZSBleGFjdCBLViBUcmFlZmlrJ3MgY29uc3VsIHByb3ZpZGVyIG5lZWRzLiBBIDQwMyAocmV2b2tlZCB0b2tlbikKICAgICAgIyBvciBhIG1pc3Npbmcga2V5IG1ha2VzIGBjb25zdWwga3YgZ2V0YCBleGl0IG5vbi16ZXJvIOKGkiB1bmhlYWx0aHkuCiAgICAgIHRlc3Q6IFsiQ01ELVNIRUxMIiwgImNvbnN1bCBrdiBnZXQgdHJhZWZpay90bHMvb3B0aW9ucy9zdHJvbmctdGxzL21pblZlcnNpb24gPi9kZXYvbnVsbCAyPiYxIHx8IGV4aXQgMSJdCiAgICAgIGludGVydmFsOiAzMHMKICAgICAgdGltZW91dDogNXMKICAgICAgcmV0cmllczogMwogICAgICBzdGFydF9wZXJpb2Q6IDIwcwoKICBwcm94eToKICAgIGltYWdlOiAke1BST1hZX1NFUlZFUl9JTUFHRTotZ2hjci5pby9sbG0tYXBpLXByb3h5L3NlcnZlcjoke1BST1hZX1ZFUlNJT046LWVkZ2V9fQogICAgIyDilIDilIAgbUROUyBuZXR3b3JraW5nIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICAgIyBtRE5TIChSRkMgNjc2Mi82NzYzKSB1c2VzIGxpbmstbG9jYWwgbXVsdGljYXN0IChJUHY0OiAyMjQuMC4wLjI1MTo1MzUzLAogICAgIyBJUHY2OiBmZjAyOjpmYjo1MzUzKS4gTXVsdGljYXN0IGRvZXMgTk9UIGNyb3NzIERvY2tlciBicmlkZ2UgbmV0d29ya3MuCiAgICAjIG5ldHdvcmtfbW9kZTogaG9zdCBpcyBSRVFVSVJFRCBvbiBMaW51eCBzbyB0aGUgcHJveHkgY2FuIHNlbmQgYW5kIHJlY2VpdmUKICAgICMgbUROUyBhbm5vdW5jZW1lbnRzIG9uIHRoZSBob3N0IExBTi4KICAgICMKICAgICMgTk9URTogRG9ja2VyIERlc2t0b3Agb24gbWFjT1Mgc3VwcG9ydHMgaG9zdCBuZXR3b3JraW5nIHNpbmNlIHZlcnNpb24gNC4zNAogICAgIyAob3B0LWluIGZlYXR1cmUg4oCUIGVuYWJsZSBpbiBTZXR0aW5ncyDihpIgUmVzb3VyY2VzIOKGkiBOZXR3b3JrKS4gVGhlIGluc3RhbGxlcgogICAgIyBkZXRlY3RzIGFuZCBndWlkZXMgZW5hYmxlbWVudCBhdXRvbWF0aWNhbGx5LiBtRE5TIHJlbWFpbnMgZGlzYWJsZWQgb24gbWFjT1MKICAgICMgKG11bHRpY2FzdCBkb2Vzbid0IGNyb3NzIHRoZSBEb2NrZXIgRGVza3RvcCBWTSBib3VuZGFyeSkuCiAgICAjIEZvciBEb2NrZXIgRGVza3RvcCA8IDQuMzQgb3IgV2luZG93cywgdXNlIHRoZSBuby1tZG5zIG92ZXJyaWRlOgogICAgIyAgIGRvY2tlciBjb21wb3NlIC1mIGRvY2tlci1jb21wb3NlLnltbCAtZiBkb2NrZXItY29tcG9zZS5uby1tZG5zLnltbCB1cCAtZAogICAgIwogICAgIyDilIDilIAgUG9ydCBjb25mbGljdCB3YXJuaW5nIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAogICAgIyBXaXRoIG5ldHdvcmtfbW9kZTogaG9zdCwgdGhlIHByb3h5IGJpbmRzIERJUkVDVExZIHRvIHRoZSBob3N0IGludGVyZmFjZXMuCiAgICAjIFBvcnRzIDMwMDAgYW5kIDMwMDEgYXJlIGNvbW1vbmx5IHVzZWQg4oCUIGlmIHRoZXkgY29uZmxpY3Qgd2l0aCBvdGhlciBzZXJ2aWNlcwogICAgIyBvbiB5b3VyIGhvc3QsIGNoYW5nZSB0aGVtIHZpYSBlbnZpcm9ubWVudCB2YXJpYWJsZXMgQkVGT1JFIHN0YXJ0aW5nIHRoZSBzdGFjazoKICAgICMgICBQUk9YWV9MSVNURU5fUE9SVD0zMDAwICAgICAgICAocmV2ZXJzZSBwcm94eSArIG1hbmFnZW1lbnQgQVBJLCBkZWZhdWx0IDMwMDApCiAgICAjICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVD0zMDAxIChmb3J3YXJkIHByb3h5IC8gQ09OTkVDVCBtb2RlLCBkZWZhdWx0IDMwMDEpCiAgICAjIFNldCB0aGVzZSBpbiBkb2NrZXIvLmVudiBvciBleHBvcnQgdGhlbSBpbiB5b3VyIHNoZWxsIGJlZm9yZSBydW5uaW5nIGNvbXBvc2UuCiAgICAjCiAgICAjIOKUgOKUgCBEQVRBQkFTRV9VUkwgd2l0aCBob3N0IG5ldHdvcmtpbmcg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAjIFdpdGggbmV0d29ya19tb2RlOiBob3N0LCB0aGUgcHJveHkgaXMgb24gdGhlIGhvc3QgbmV0d29yayBzdGFjay4gVGltZXNjYWxlREIKICAgICMgcHVibGlzaGVzIGl0cyBwb3J0IG9uIHRoZSBob3N0IGxvb3BiYWNrIHZpYSAicG9ydHM6IFs6OjFdOjU0MzI6NTQzMiIsIHNvIHRoZQogICAgIyBjb3JyZWN0IGFkZHJlc3MgaXMgbG9jYWxob3N0OjU0MzIgKG5vdCB0aGUgRG9ja2VyIGJyaWRnZSBob3N0bmFtZQogICAgIyAidGltZXNjYWxlZGIiKS4gVGhlIGhvc3QtbmV0d29ya2VkIHByb3h5IHJlYWNoZXMgaXQgb3ZlciBsb29wYmFjay4KICAgIG5ldHdvcmtfbW9kZTogaG9zdAogICAgZW52X2ZpbGU6CiAgICAgIC0gcGF0aDogLmVudgogICAgICAgIHJlcXVpcmVkOiBmYWxzZQogICAgZW52aXJvbm1lbnQ6CiAgICAgICMgUGFzcy10aHJvdWdoIHNvIG9wZXJhdG9ycyBjYW4gY3VzdG9taXNlIGJpbmQgcG9ydHMgd2l0aG91dCBlZGl0aW5nIGNvbXBvc2UuCiAgICAgICMgRGVmYXVsdCAzMDAwIOKAlCBjaGFuZ2UgaWYgdGhlIHBvcnQgY29uZmxpY3RzIHdpdGggYW5vdGhlciBzZXJ2aWNlIG9uIHRoZSBob3N0LgogICAgICBQUk9YWV9MSVNURU5fUE9SVDogJHtQUk9YWV9MSVNURU5fUE9SVDotMzAwMH0KICAgICAgIyBEZWZhdWx0IDMwMDEg4oCUIGNoYW5nZSBpZiB0aGUgcG9ydCBjb25mbGljdHMgd2l0aCBhbm90aGVyIHNlcnZpY2Ugb24gdGhlIGhvc3QuCiAgICAgIFBST1hZX0ZPUldBUkRfUFJPWFlfX1BPUlQ6ICR7UFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVDotMzAwMX0KICAgICAgIyBXaXRoIGhvc3QgbmV0d29ya2luZywgVGltZXNjYWxlREIgaXMgcmVhY2hhYmxlIGF0IGxvY2FsaG9zdDo1NDMyCiAgICAgICMgKHB1Ymxpc2hlZCB2aWEgInBvcnRzOiBbOjoxXTo1NDMyOjU0MzIiIG9uIHRoZSB0aW1lc2NhbGVkYiBzZXJ2aWNlKS4KICAgICAgREFUQUJBU0VfVVJMOiBwb3N0Z3JlczovLyR7UE9TVEdSRVNfVVNFUjotcHJveHl9OiR7UE9TVEdSRVNfUEFTU1dPUkQ6LXByb3h5X2Rldl9wYXNzd29yZH1AbG9jYWxob3N0OjU0MzIvJHtQT1NUR1JFU19EQjotbGxtX3Byb3h5fQogICAgICAjIEF1dGggLyBlbmNyeXB0aW9uIOKAlCBwb3B1bGF0ZWQgYnkgdGhlIGluc3RhbGxlciBpbiAuZW52CiAgICAgIFBST1hZX0pXVF9TRUNSRVQ6ICR7UFJPWFlfSldUX1NFQ1JFVDotfQogICAgICBQUk9YWV9LRUtfVkFMVUU6ICR7UFJPWFlfS0VLX1ZBTFVFOi19CiAgICAgIFBST1hZX0tFS19QQVNTUEhSQVNFOiAke1BST1hZX0tFS19QQVNTUEhSQVNFOi19CiAgICAgIFBST1hZX0FMTE9XX0ZJUlNUUlVOX1dJWkFSRDogJHtQUk9YWV9BTExPV19GSVJTVFJVTl9XSVpBUkQ6LXRydWV9CiAgICAgICMgQ29uc3VsIEtWIOKAlCBob3N0IG5ldHdvcmtpbmcgbWVhbnMgY29uc3VsIGlzIGF0IGxvY2FsaG9zdAogICAgICBDT05TVUxfSFRUUF9BRERSOiBodHRwOi8vbG9jYWxob3N0Ojg1MDAKICAgICAgQ09OU1VMX0hUVFBfVE9LRU46ICR7UFJPWFlfQ09OU1VMX1RPS0VOOi19CiAgICBkZXBlbmRzX29uOgogICAgICBjb25zdWw6CiAgICAgICAgY29uZGl0aW9uOiBzZXJ2aWNlX2hlYWx0aHkKICAgIGxhYmVsczoKICAgICAgLSB0cmFlZmlrLmVuYWJsZT10cnVlCiAgICAgICMgSFRUUCByb3V0ZXIg4oCUIGhhbmRsZXMgYWxsIEhUVFBTIHJlcXVlc3RzIHZpYSB0aGUgd2Vic2VjdXJlIGVudHJ5cG9pbnQKICAgICAgLSAidHJhZWZpay5odHRwLnJvdXRlcnMucHJveHktYXBpLnJ1bGU9UGF0aFByZWZpeChgL2ApIgogICAgICAtIHRyYWVmaWsuaHR0cC5yb3V0ZXJzLnByb3h5LWFwaS5lbnRyeXBvaW50cz13ZWJzZWN1cmUKICAgICAgLSB0cmFlZmlrLmh0dHAucm91dGVycy5wcm94eS1hcGkuc2VydmljZT1wcm94eS1iYWNrZW5kCiAgICAgICMgc2VydmljZS11bmF2YWlsYWJsZUBjb25zdWwgaXMgdGhlIGVycm9ycyBtaWRkbGV3YXJlIHNlZWRlZCBpbnRvIENvbnN1bCBLVgogICAgICAjIGJ5IGNvbnN1bC1pbml0IChpc3N1ZSAjMTMzNCkuIEl0IGNhdGNoZXMgYSBkZWFkLWJ1dC1wcmVzZW50IGJhY2tlbmQKICAgICAgIyAoNTAyLzUwMy81MDQpIGFuZCBzZXJ2ZXMgdGhlIHJldHJ5YWJsZSBiYWNrZW5kLXVuYXZhaWxhYmxlIDUwMyBlbnZlbG9wZSBzbwogICAgICAjIENsYXVkZSBDTEkgcmV0cmllcyBpbnN0ZWFkIG9mIHRyZWF0aW5nIHRoZSBibGlwIGFzIGEgbW9kZWwtYWNjZXNzIGVycm9yLgogICAgICAjIE5PIGxhcmdlLWJvZHlAZG9ja2VyIGhlcmUgKGlzc3VlICMxNDc0KTogVHJhZWZpaydzIGBidWZmZXJpbmdgIG1pZGRsZXdhcmUKICAgICAgIyByZWFkcyB0aGUgRU5USVJFIHJlc3BvbnNlIGludG8gbWVtb3J5IGJlZm9yZSBmb3J3YXJkaW5nIGl0IOKAlCB0aGVyZSBpcyBOTwogICAgICAjICJidWZmZXJpbmcgb2ZmIiB0b2dnbGUsIGFuZCBgbWF4UmVzcG9uc2VCb2R5Qnl0ZXM9MGAgb25seSBkaXNhYmxlcyB0aGUKICAgICAgIyByZXNwb25zZSBTSVpFIExJTUlULCBub3QgdGhlIGJ1ZmZlcmluZyBpdHNlbGYuIEF0dGFjaGluZyBpdCB0byB0aGlzIHJvdXRlcgogICAgICAjIHRoZXJlZm9yZSBicmVha3MgU1NFIHN0cmVhbWluZzogdGhlIGNsaWVudCByZWNlaXZlcyB0aGUgd2hvbGUgc3RyZWFtIGFzIG9uZQogICAgICAjIGJ1cnN0IGF0IHRoZSBlbmQgKG1lYXN1cmVkOiB0aW1lX3N0YXJ0dHJhbnNmZXIgPT0gdGltZV90b3RhbCkuIFRoZSBwcm94eQogICAgICAjIHN0cmVhbXMgbGl2ZSBvbiBpdHMgb3duICh2ZXJpZmllZCBkaXJlY3QtdG8tYmFja2VuZDogVFRGQiA8PCB0b3RhbCksIHNvIHRoZQogICAgICAjIGRhdGEgcGxhbmUgbXVzdCBOT1QgYmUgd3JhcHBlZCBpbiBhIHJlc3BvbnNlLWJ1ZmZlcmluZyBtaWRkbGV3YXJlLiBSZXF1ZXN0CiAgICAgICMgYm9keS1zaXplIGxpbWl0cyBhcmUgZW5mb3JjZWQgYnkgdGhlIHByb3h5IGl0c2VsZiAocmVqZWN0X3JlcXVlc3RfYnl0ZXMpLCBzbwogICAgICAjIGRyb3BwaW5nIFRyYWVmaWsncyByZXF1ZXN0IGNhcCBoZXJlIGlzIHNhZmUuIChsYXJnZS1ib2R5IHJlbWFpbnMgYXZhaWxhYmxlCiAgICAgICMgZm9yIG5vbi1zdHJlYW1pbmcgcm91dGVzIGxpa2UgZ3JhZmFuYS9wcm9tZXRoZXVzIOKAlCBzZWUgZG9ja2VyLWNvbXBvc2UubW9uaXRvcmluZy55bWwuKQogICAgICAtIHRyYWVmaWsuaHR0cC5yb3V0ZXJzLnByb3h5LWFwaS5taWRkbGV3YXJlcz1zZXJ2aWNlLXVuYXZhaWxhYmxlQGNvbnN1bCxoc3RzQGRvY2tlcgogICAgICAtIHRyYWVmaWsuaHR0cC5yb3V0ZXJzLnByb3h5LWFwaS50bHMuY2VydHJlc29sdmVyPWNsb3VkZmxhcmUKICAgICAgIyBUTFMgb3B0aW9ucyByZWZlcmVuY2UgdGhlIENvbnN1bCBLViBwcm92aWRlciAoc2VlIGlzc3VlICMyNDIg4oCUIENvbnN1bCBLViBtdXN0IGJlCiAgICAgICMgYWN0aXZlIGZvciB0aGlzIHRvIHRha2UgZWZmZWN0OyBmYWxscyBiYWNrIHRvIGRlZmF1bHQgVExTIG9wdGlvbnMgb3RoZXJ3aXNlKS4KICAgICAgIyBVc2VzIEBjb25zdWwgc3VmZml4IChtaWdyYXRlZCBmcm9tIEBmaWxlIHByb3ZpZGVyIGluIGlzc3VlICMyNDEpLgogICAgICAjIFdpdGhvdXQgQGNvbnN1bCwgVHJhZWZpayB1c2VzIGRlZmF1bHQgVExTIG9wdGlvbnMgKFRMUyAxLjAgYWxsb3dlZCwgd2VhayBjaXBoZXJzKQogICAgICAjIGV2ZW4gaWYgQ29uc3VsIEtWIGhhcyB0aGUgb3B0aW9ucyBzZWVkZWQuIFJlcXVpcmVzIGlzc3VlICMyNDIgdG8gYmUgbWVyZ2VkLgogICAgICAtIHRyYWVmaWsuaHR0cC5yb3V0ZXJzLnByb3h5LWFwaS50bHMub3B0aW9ucz1zdHJvbmctdGxzQGNvbnN1bAogICAgICAjIEhTVFMgbWlkZGxld2FyZSDigJQgZm9yY2VzIEhUVFBTIGJ5IGluc3RydWN0aW5nIGJyb3dzZXJzIHRvIG5ldmVyIGNvbm5lY3Qgb3ZlciBIVFRQLgogICAgICAjIE9QRVJBVE9SIFdBUk5JTkc6IHN0c0luY2x1ZGVTdWJkb21haW5zOiB0cnVlIG1lYW5zIEFMTCBzdWJkb21haW5zIG9mIHRoZSBkb21haW4KICAgICAgIyB3aWxsIGJlIHJlcXVpcmVkIHRvIHNlcnZlIEhUVFBTIG9uY2UgYSBicm93c2VyIGNhY2hlcyB0aGlzIGhlYWRlci4KICAgICAgIyBzdHNQcmVsb2FkOiBmYWxzZSBpcyB0aGUgc2FmZSBkZWZhdWx0IOKAlCBlbmFibGluZyBwcmVsb2FkIGlzIGEgbmVhci1wZXJtYW5lbnQKICAgICAgIyBjb21taXRtZW50IGZvciB0aGUgZW50aXJlIGRvbWFpbiB0cmVlIHZpYSBicm93c2VyIHByZWxvYWQgbGlzdHMuCiAgICAgICMgT3BlcmF0b3JzIHdobyB1bmRlcnN0YW5kIHRoZSBpbXBsaWNhdGlvbnMgbWF5IG92ZXJyaWRlIHZpYSBkb2NrZXItY29tcG9zZS5vdmVycmlkZS55bWwuCiAgICAgIC0gdHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmhzdHMuaGVhZGVycy5zdHNTZWNvbmRzPTMxNTM2MDAwCiAgICAgIC0gdHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmhzdHMuaGVhZGVycy5zdHNJbmNsdWRlU3ViZG9tYWlucz10cnVlCiAgICAgIC0gInRyYWVmaWsuaHR0cC5taWRkbGV3YXJlcy5oc3RzLmhlYWRlcnMuc3RzUHJlbG9hZD1mYWxzZSIKICAgICAgLSB0cmFlZmlrLmh0dHAubWlkZGxld2FyZXMuaHN0cy5oZWFkZXJzLmZvcmNlU1RTSGVhZGVyPXRydWUKICAgICAgIyBCb2R5IHNpemUgbWlkZGxld2FyZSDigJQgYWxsb3dzIHVwIHRvIDEgR2lCIHJlcXVlc3RzLgogICAgICAjIFdBUk5JTkcgKGlzc3VlICMxNDc0KTogYSBUcmFlZmlrIGBidWZmZXJpbmdgIG1pZGRsZXdhcmUgQUxXQVlTIGJ1ZmZlcnMgdGhlCiAgICAgICMgZnVsbCBSRVNQT05TRSBib2R5IGJlZm9yZSBmb3J3YXJkaW5nIGl0IOKAlCBgbWF4UmVzcG9uc2VCb2R5Qnl0ZXM9MGAgb25seQogICAgICAjIGRpc2FibGVzIHRoZSByZXNwb25zZSBzaXplIExJTUlUIChubyA1MDAgb24gYSBsYXJnZSByZXNwb25zZSksIGl0IGRvZXMgTk9UCiAgICAgICMgdHVybiByZXNwb25zZSBidWZmZXJpbmcgb2ZmICh0aGVyZSBpcyBubyBzdWNoIHRvZ2dsZSkuIE5FVkVSIGF0dGFjaCB0aGlzCiAgICAgICMgbWlkZGxld2FyZSB0byBhIHN0cmVhbWluZy9TU0Ugcm91dGUgKHRoZSBwcm94eS1hcGkgcm91dGVyIGFib3ZlKSBvciB0aGUKICAgICAgIyBjbGllbnQgZ2V0cyB0aGUgd2hvbGUgc3RyZWFtIGluIG9uZSB0ZXJtaW5hbCBidXJzdC4gSXQgaXMgZGVmaW5lZCBoZXJlIChvbgogICAgICAjIHRoZSBwcm94eSBjb250YWluZXIsIHRoZSBjYW5vbmljYWwgb3duZXIgb2Ygc2hhcmVkIG1pZGRsZXdhcmVzKSBhbmQgdXNlZAogICAgICAjIE9OTFkgYnkgdGhlIG5vbi1zdHJlYW1pbmcgZ3JhZmFuYS9wcm9tZXRoZXVzIHJvdXRlcnMgaW4KICAgICAgIyBkb2NrZXItY29tcG9zZS5tb25pdG9yaW5nLnltbC4gVGhlIHByb3h5IGVuZm9yY2VzIGl0cyBvd24gcmVxdWVzdC1ib2R5IGNhcAogICAgICAjIChyZWplY3RfcmVxdWVzdF9ieXRlcyksIHNvIHRoZSBkYXRhIHBsYW5lIG5lZWRzIG5vIFRyYWVmaWsgcmVxdWVzdCBsaW1pdC4KICAgICAgIyBtZW1SZXF1ZXN0Qm9keUJ5dGVzPTEwNDg1NzY6IHJlcXVlc3QgYm9kaWVzIOKJpDEgTWlCIHN0YXkgaW4gbWVtb3J5OyBsYXJnZXIgc3BpbGwgdG8KICAgICAgIyB0aGUgY29udGFpbmVyIGZpbGVzeXN0ZW0gcmF0aGVyIHRoYW4gZXhoYXVzdGluZyB0aGUgNTEyIE1pQiBUcmFlZmlrIG1lbW9yeSBsaW1pdC4KICAgICAgLSAidHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmxhcmdlLWJvZHkuYnVmZmVyaW5nLm1heFJlcXVlc3RCb2R5Qnl0ZXM9MTA3Mzc0MTgyNCIKICAgICAgLSAidHJhZWZpay5odHRwLm1pZGRsZXdhcmVzLmxhcmdlLWJvZHkuYnVmZmVyaW5nLm1heFJlc3BvbnNlQm9keUJ5dGVzPTAiCiAgICAgIC0gInRyYWVmaWsuaHR0cC5taWRkbGV3YXJlcy5sYXJnZS1ib2R5LmJ1ZmZlcmluZy5tZW1SZXF1ZXN0Qm9keUJ5dGVzPTEwNDg1NzYiCiAgICAgICMgSFRUUCBzZXJ2aWNlIOKAlCBib3RoIFRyYWVmaWsgYW5kIHRoZSBwcm94eSB1c2UgbmV0d29ya19tb2RlOiBob3N0LCBzbyBib3RoCiAgICAgICMgYXJlIG9uIHRoZSBob3N0IG5ldHdvcmsgc3RhY2suIFRyYWVmaWsgcmVhY2hlcyB0aGUgcHJveHkgYXQgbG9jYWxob3N0IG9uCiAgICAgICMgUFJPWFlfTElTVEVOX1BPUlQgKGRlZmF1bHQgMzAwMCkuIE5vIERvY2tlciBicmlkZ2UgbmV0d29yayByZXNvbHV0aW9uIG5lZWRlZC4KICAgICAgIyB0cmFlZmlrLmRvY2tlci5uZXR3b3JrIGlzIE5PVCBzZXQgKHByb3h5IGlzIG5vdCBvbiBhIERvY2tlciBicmlkZ2UgbmV0d29yaykuCiAgICAgIC0gInRyYWVmaWsuaHR0cC5zZXJ2aWNlcy5wcm94eS1iYWNrZW5kLmxvYWRiYWxhbmNlci5zZXJ2ZXIudXJsPWh0dHA6Ly9sb2NhbGhvc3Q6JHtQUk9YWV9MSVNURU5fUE9SVDotMzAwMH0iCiAgICAgICMgRGlzYWJsZSBidWZmZXJpbmcgZm9yIFNTRSBzdHJlYW1pbmcgc3VwcG9ydAogICAgICAtIHRyYWVmaWsuaHR0cC5zZXJ2aWNlcy5wcm94eS1iYWNrZW5kLmxvYWRiYWxhbmNlci5yZXNwb25zZUZvcndhcmRpbmcuZmx1c2hJbnRlcnZhbD0xbXMKICAgICAgIyBUQ1Agcm91dGVyIOKAlCBwYXNzdGhyb3VnaCBmb3IgdGhlIGZvcndhcmQgcHJveHkgKENPTk5FQ1QgbW9kZSAvIFRMUyBpbnRlcmNlcHRpb24pLgogICAgICAjIEhTVFMgYW5kIFRMUyBvcHRpb25zIGFyZSBIVFRQLWxheWVyIGNvbmNlcm5zIGFuZCBkbyBOT1QgYXBwbHkgdG8gdGhlIFRDUCByb3V0ZXIuCiAgICAgIC0gInRyYWVmaWsudGNwLnJvdXRlcnMuZm9yd2FyZC1wcm94eS5ydWxlPUhvc3RTTkkoYCpgKSIKICAgICAgLSB0cmFlZmlrLnRjcC5yb3V0ZXJzLmZvcndhcmQtcHJveHkuZW50cnlwb2ludHM9Zm9yd2FyZC1wcm94eQogICAgICAtIHRyYWVmaWsudGNwLnJvdXRlcnMuZm9yd2FyZC1wcm94eS5zZXJ2aWNlPXByb3h5LWZvcndhcmQKICAgICAgIyBUQ1Agc2VydmljZSDigJQgVHJhZWZpayBpbiBob3N0IG1vZGUgcmVhY2hlcyB0aGUgcHJveHkgdmlhIGxvY2FsaG9zdC4KICAgICAgIyBEZWZhdWx0IHBvcnQgMzAwMTsgY2hhbmdlIFBST1hZX0ZPUldBUkRfUFJPWFlfX1BPUlQgaWYgaXQgY29uZmxpY3RzLgogICAgICAtICJ0cmFlZmlrLnRjcC5zZXJ2aWNlcy5wcm94eS1mb3J3YXJkLmxvYWRiYWxhbmNlci5zZXJ2ZXIucG9ydD0ke1BST1hZX0ZPUldBUkRfUFJPWFlfX1BPUlQ6LTMwMDF9IgoKbmV0d29ya3M6CiAgcHJveHlfbmV0OgogICAgIyBJUHY2LWVuYWJsZWQgaW50ZXJuYWwgbmV0d29yayBmb3Igc2VydmljZS10by1zZXJ2aWNlIGNvbW11bmljYXRpb24uCiAgICAjIFVMQSBwcmVmaXggKGZjMDA6Oi83KSDigJQgbm90IHJvdXRhYmxlIG9uIHRoZSBwdWJsaWMgaW50ZXJuZXQuCiAgICAjIER1YWwtc3RhY2s6IERvY2tlciBhbHNvIGFzc2lnbnMgYW4gSVB2NCBzdWJuZXQgb24gdGhpcyBicmlkZ2UgYnkgZGVmYXVsdC4KICAgIGVuYWJsZV9pcHY2OiB0cnVlCiAgICBpcGFtOgogICAgICBjb25maWc6CiAgICAgICAgLSBzdWJuZXQ6ICJmZDAwOmVkZGU6YWNkYzo6LzQ4IgoKdm9sdW1lczoKICB0aW1lc2NhbGVkYl9kYXRhOgogIGNvbnN1bF9kYXRhOgo="
 # FILE: docker/docker-compose.hardened.yml
 EMBED_docker_compose_hardened_yml="IyBkb2NrZXIvZG9ja2VyLWNvbXBvc2UuaGFyZGVuZWQueW1sIOKAlCBTZWN1cml0eSBoYXJkZW5pbmcgb3ZlcmxheS4KIwojIEFsd2F5cyBpbmNsdWRlZCBieSB0aGUgaW5zdGFsbGVyLiBBZGRzIHNlY3VyaXR5IHJlc3RyaWN0aW9ucywgcmVzb3VyY2UKIyBsaW1pdHMsIGxvZyByb3RhdGlvbiwgYW5kIENvbnN1bCBBQ0wgZW5mb3JjZW1lbnQgdG8gYWxsIHNlcnZpY2VzLgojCiMgVXNhZ2UgKGFsd2F5cyBsYXllciBvbiB0b3Agb2YgYmFzZSBjb21wb3NlKToKIyAgIGRvY2tlciBjb21wb3NlIC1mIGRvY2tlci1jb21wb3NlLnltbCAtZiBkb2NrZXItY29tcG9zZS5oYXJkZW5lZC55bWwgdXAgLWQKCnNlcnZpY2VzOgogIHRpbWVzY2FsZWRiOgogICAgc2VjdXJpdHlfb3B0OgogICAgICAtIG5vLW5ldy1wcml2aWxlZ2VzOnRydWUKICAgIGNhcF9kcm9wOgogICAgICAtIEFMTAogICAgY2FwX2FkZDoKICAgICAgIyBQb3N0Z3JlU1FMIG5lZWRzIHRoZXNlIGNhcGFiaWxpdGllcwogICAgICAtIENIT1dOCiAgICAgIC0gREFDX09WRVJSSURFCiAgICAgIC0gRk9XTkVSCiAgICAgIC0gU0VUR0lECiAgICAgIC0gU0VUVUlECiAgICBkZXBsb3k6CiAgICAgIHJlc291cmNlczoKICAgICAgICBsaW1pdHM6CiAgICAgICAgICBjcHVzOiAiJHtUSU1FU0NBTEVEQl9DUFVfTElNSVQ6LTIuMH0iCiAgICAgICAgICAjIOKUgOKUgCBDb25maWd1cmFibGUgREIgbWVtb3J5IGxpbWl0IChpc3N1ZSAjMTMwNSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICAgICAgICAjIERFRkFVTFQgMmcg4oCUIGJ5dGUtaWRlbnRpY2FsIHRvIHByaW9yIHJlbGVhc2VzLCBzbyBleGlzdGluZyBpbnN0YWxscwogICAgICAgICAgIyBhcmUgdW5jaGFuZ2VkIG9uIHVwZ3JhZGUuIFJhaXNlIHZpYSBkb2NrZXIvLmVudiAoZS5nLgogICAgICAgICAgIyBUSU1FU0NBTEVEQl9NRU1PUllfTElNSVQ9OGcpIHRvIGdpdmUgdGhlIERCIG1vcmUgUkFNOyBwYWlyIGl0IHdpdGgKICAgICAgICAgICMgdGhlIFRJTUVTQ0FMRURCX1NIQVJFRF9CVUZGRVJTIC8gX0VGRkVDVElWRV9DQUNIRV9TSVpFIHR1bmluZyBmbGFncwogICAgICAgICAgIyBpbiB0aGUgYmFzZSBjb21wb3NlIHNvIGFuIEVYSVNUSU5HIHZvbHVtZSBhY3R1YWxseSB1c2VzIHRoZSBSQU0KICAgICAgICAgICMgKHRpbWVzY2FsZWRiLXR1bmUgb25seSByZXR1bmVzIG9uIGZpcnN0IGluaXQpLgogICAgICAgICAgbWVtb3J5OiAke1RJTUVTQ0FMRURCX01FTU9SWV9MSU1JVDotMmd9CiAgICAgICAgcmVzZXJ2YXRpb25zOgogICAgICAgICAgY3B1czogIjAuMjUiCiAgICAgICAgICBtZW1vcnk6IDI1Nm0KICAgIGxvZ2dpbmc6CiAgICAgIGRyaXZlcjoganNvbi1maWxlCiAgICAgIG9wdGlvbnM6CiAgICAgICAgbWF4LXNpemU6ICI1MG0iCiAgICAgICAgbWF4LWZpbGU6ICI1IgoKICBjb25zdWw6CiAgICAjIEVuYWJsZSBBQ0xzIHdpdGggZGVueS1ieS1kZWZhdWx0IHBvbGljeS4KICAgICMgVG9rZW5zIG11c3QgYmUgcHJvdmlzaW9uZWQgYmVmb3JlIGFueSBLViBvcGVyYXRpb25zIHN1Y2NlZWQuCiAgICAjIENvbnN1bCAxLjIyKyByZW1vdmVkIC1hY2wtKiBDTEkgZmxhZ3Mg4oCUIHVzZSBDT05TVUxfTE9DQUxfQ09ORklHIEpTT04uCiAgICAjIFRoZSBlbnRyeXBvaW50IHdyaXRlcyB0aGlzIHRvIC9jb25zdWwvY29uZmlnL2xvY2FsLmpzb24gc28gdGhhdCBwYXRoCiAgICAjIG11c3QgYmUgd3JpdGFibGUgKHRtcGZzIHNhdGlzZmllcyB0aGlzIHdoaWxlIGtlZXBpbmcgdGhlIGNvbnRhaW5lcgogICAgIyBvdGhlcndpc2UgcmVhZC1vbmx5KS4KICAgICMgSW5oZXJpdHMgc2VydmVyIG1vZGUgKyBwZXJzaXN0ZW50IHN0b3JhZ2UgZnJvbSBiYXNlIGNvbXBvc2UuCiAgICAjIFRoZSBjb21tYW5kIG92ZXJyaWRlIGhlcmUgYWRkcyBBQ0wgY29uZmlnIGRpciB0byB0aGUgYmFzZSBjb21tYW5kIGFyZ3MuCiAgICAjIFNlZSBiYXNlIGRvY2tlci1jb21wb3NlLnltbCBmb3IgdGhlIGZ1bGwgY29tbWFuZCBhbmQgIzMzNSBmb3Igd2h5IC1kZXYgd2FzIHJlbW92ZWQuCiAgICBjb21tYW5kOgogICAgICAtICJjb25zdWwiCiAgICAgIC0gImFnZW50IgogICAgICAtICItc2VydmVyIgogICAgICAtICItYm9vdHN0cmFwLWV4cGVjdD0xIgogICAgICAtICItY2xpZW50PVs6Ol0iCiAgICAgIC0gIi1kYXRhLWRpcj0vY29uc3VsL2RhdGEiCiAgICAgIC0gIi1jb25maWctZGlyPS9jb25zdWwvY29uZmlnIgogICAgZW52aXJvbm1lbnQ6CiAgICAgIENPTlNVTF9MT0NBTF9DT05GSUc6ICd7ImFjbCI6eyJlbmFibGVkIjp0cnVlLCJkZWZhdWx0X3BvbGljeSI6ImRlbnkifX0nCiAgICB0bXBmczoKICAgICAgLSAvY29uc3VsL2NvbmZpZzptb2RlPTA3NTUKICAgIHNlY3VyaXR5X29wdDoKICAgICAgLSBuby1uZXctcHJpdmlsZWdlczp0cnVlCiAgICBjYXBfZHJvcDoKICAgICAgLSBBTEwKICAgIGNhcF9hZGQ6CiAgICAgICMgQ29uc3VsIGVudHJ5cG9pbnQgY2hvd25zIC9jb25zdWwgZGlycywgdGhlbiBzdS1leGVjIHN3aXRjaGVzIHVzZXIKICAgICAgLSBDSE9XTgogICAgICAtIFNFVEdJRAogICAgICAtIFNFVFVJRAogICAgZGVwbG95OgogICAgICByZXNvdXJjZXM6CiAgICAgICAgbGltaXRzOgogICAgICAgICAgY3B1czogIjAuNSIKICAgICAgICAgIG1lbW9yeTogMjU2bQogICAgICAgIHJlc2VydmF0aW9uczoKICAgICAgICAgIGNwdXM6ICIwLjEiCiAgICAgICAgICBtZW1vcnk6IDY0bQogICAgbG9nZ2luZzoKICAgICAgZHJpdmVyOiBqc29uLWZpbGUKICAgICAgb3B0aW9uczoKICAgICAgICBtYXgtc2l6ZTogIjUwbSIKICAgICAgICBtYXgtZmlsZTogIjUiCgogIGNvbnN1bC1pbml0OgogICAgIyBXaXRoIEFDTHMgZW5hYmxlZCwgY29uc3VsLWluaXQgbmVlZHMgdGhlIENPTlNVTF9IVFRQX1RPS0VOIHRvIHdyaXRlCiAgICAjIHRvIENvbnN1bCBLVi4gT24gZmlyc3QgZGVwbG95IHRoaXMgdG9rZW4gZG9lc24ndCBleGlzdCB5ZXQg4oCUCiAgICAjIGNvbnN1bC1pbml0IHdpbGwgZmFpbCBhbmQgdGhlIGluc3RhbGxlciByZS1ydW5zIGl0IGFmdGVyIEFDTCBib290c3RyYXAuCiAgICByZXN0YXJ0OiAibm8iCiAgICBlbnZpcm9ubWVudDoKICAgICAgQ09OU1VMX0hUVFBfVE9LRU46ICR7Q09OU1VMX0hUVFBfVE9LRU46LX0KICAgIGxvZ2dpbmc6CiAgICAgIGRyaXZlcjoganNvbi1maWxlCiAgICAgIG9wdGlvbnM6CiAgICAgICAgbWF4LXNpemU6ICIxMG0iCiAgICAgICAgbWF4LWZpbGU6ICIzIgoKICAjIFJ1bnRpbWUgS1YtZHJpZnQgZGV0ZWN0b3IgKCMxNTUwIC8gIzE1NTEpIOKAlCB0aW55IGlkbGUgc2lkZWNhcjsgY2FwIGl0IGFuZAogICMgYm91bmQgaXRzIGxvZ3MgbGlrZSB0aGUgcmVzdCBvZiB0aGUgaGFyZGVuZWQgc3RhY2suIE5lZWRzIG5vIGNhcGFiaWxpdGllcwogICMgKHJ1bnMgdGhlIGNvbnN1bCBDTEkgKyBzbGVlcCBvbmx5KS4KICBjb25zdWwta3Ytd2F0Y2hkb2c6CiAgICBzZWN1cml0eV9vcHQ6CiAgICAgIC0gbm8tbmV3LXByaXZpbGVnZXM6dHJ1ZQogICAgY2FwX2Ryb3A6CiAgICAgIC0gQUxMCiAgICBkZXBsb3k6CiAgICAgIHJlc291cmNlczoKICAgICAgICBsaW1pdHM6CiAgICAgICAgICBjcHVzOiAiMC4yNSIKICAgICAgICAgIG1lbW9yeTogNjRtCiAgICAgICAgcmVzZXJ2YXRpb25zOgogICAgICAgICAgY3B1czogIjAuMDUiCiAgICAgICAgICBtZW1vcnk6IDE2bQogICAgbG9nZ2luZzoKICAgICAgZHJpdmVyOiBqc29uLWZpbGUKICAgICAgb3B0aW9uczoKICAgICAgICBtYXgtc2l6ZTogIjEwbSIKICAgICAgICBtYXgtZmlsZTogIjMiCgogIHRyYWVmaWs6CiAgICBzZWN1cml0eV9vcHQ6CiAgICAgIC0gbm8tbmV3LXByaXZpbGVnZXM6dHJ1ZQogICAgY2FwX2Ryb3A6CiAgICAgIC0gQUxMCiAgICBjYXBfYWRkOgogICAgICAtIE5FVF9CSU5EX1NFUlZJQ0UKICAgIGRlcGxveToKICAgICAgcmVzb3VyY2VzOgogICAgICAgIGxpbWl0czoKICAgICAgICAgIGNwdXM6ICIxLjAiCiAgICAgICAgICBtZW1vcnk6IDUxMm0KICAgICAgICByZXNlcnZhdGlvbnM6CiAgICAgICAgICBjcHVzOiAiMC4xIgogICAgICAgICAgbWVtb3J5OiA2NG0KICAgIGxvZ2dpbmc6CiAgICAgIGRyaXZlcjoganNvbi1maWxlCiAgICAgIG9wdGlvbnM6CiAgICAgICAgbWF4LXNpemU6ICI1MG0iCiAgICAgICAgbWF4LWZpbGU6ICI1IgoKICBwcm94eToKICAgIHJlYWRfb25seTogdHJ1ZQogICAgdG1wZnM6CiAgICAgIC0gL3RtcDpzaXplPTI1Nm0sbW9kZT0xNzc3CiAgICBzZWN1cml0eV9vcHQ6CiAgICAgIC0gbm8tbmV3LXByaXZpbGVnZXM6dHJ1ZQogICAgY2FwX2Ryb3A6CiAgICAgIC0gQUxMCiAgICBjYXBfYWRkOgogICAgICAtIE5FVF9CSU5EX1NFUlZJQ0UKICAgIGRlcGxveToKICAgICAgcmVzb3VyY2VzOgogICAgICAgIGxpbWl0czoKICAgICAgICAgIGNwdXM6ICIyLjAiCiAgICAgICAgICBtZW1vcnk6IDFnCiAgICAgICAgcmVzZXJ2YXRpb25zOgogICAgICAgICAgY3B1czogIjAuMjUiCiAgICAgICAgICBtZW1vcnk6IDEyOG0KICAgIGxvZ2dpbmc6CiAgICAgIGRyaXZlcjoganNvbi1maWxlCiAgICAgIG9wdGlvbnM6CiAgICAgICAgbWF4LXNpemU6ICI1MG0iCiAgICAgICAgbWF4LWZpbGU6ICI1Igo="
 # FILE: docker/docker-compose.tls.yml
@@ -12506,23 +13600,25 @@ EMBED_modsecurity_exclusion_rules="IyBSRVFVRVNULTkwMC1FWENMVVNJT04tUlVMRVMtQkVGT
 # FILE: docker/alertmanager/alertmanager.yml
 EMBED_alertmanager_yml="IyBkb2NrZXIvYWxlcnRtYW5hZ2VyL2FsZXJ0bWFuYWdlci55bWwg4oCUIEFsZXJ0bWFuYWdlciByb3V0aW5nIGNvbmZpZ3VyYXRpb24uCiMKIyBDb3B5IHRoaXMgZmlsZSB0byBhbGVydG1hbmFnZXIubG9jYWwueW1sIChnaXQtaWdub3JlZCkgYW5kIHBvcHVsYXRlCiMgdGhlIHBsYWNlaG9sZGVyIHZhbHVlcyBiZWZvcmUgcnVubmluZyB0aGUgbW9uaXRvcmluZyBzdGFjayBpbiBwcm9kdWN0aW9uLgojCiMgRW52aXJvbm1lbnQtc3BlY2lmaWMgc2VjcmV0cyAod2ViaG9vayBVUkxzLCBrZXlzKSBhcmUgTk9UIGNvbW1pdHRlZC4KIyBPcGVyYXRvcnMgTVVTVCBwcm92aWRlOgojICAgQUxFUlRNQU5BR0VSX1NMQUNLX1dFQkhPT0tfVVJMICDigJQgSW5jb21pbmcgd2ViaG9vayBmb3IgI29wcy1hbGVydHMKIyAgIEFMRVJUTUFOQUdFUl9TTEFDS19DUklUSUNBTF9XRUJIT09LX1VSTCAg4oCUIEluY29taW5nIHdlYmhvb2sgZm9yICNvcHMtY3JpdGljYWwgKG9yIHNhbWUpCiMgICBBTEVSVE1BTkFHRVJfUEFHRVJEVVRZX1NFUlZJQ0VfS0VZICDigJQgUGFnZXJEdXR5IEV2ZW50cyBBUEkgdjIgaW50ZWdyYXRpb24ga2V5CiMKIyBUaGUgZG9ja2VyLWNvbXBvc2UubW9uaXRvcmluZy55bWwgbW91bnRzIGFsZXJ0bWFuYWdlci5sb2NhbC55bWwgd2hlbiBwcmVzZW50LAojIGZhbGxpbmcgYmFjayB0byB0aGlzIHRlbXBsYXRlICh3aGljaCB3aWxsIGZpcmUgdG8gZGVhZC1sZXR0ZXIgcmVjZWl2ZXJzKS4KCmdsb2JhbDoKICAjIFNsYWNrIGRlZmF1bHRzIChvdmVycmlkZSBwZXIgcmVjZWl2ZXIgaWYgbmVlZGVkKQogIHNsYWNrX2FwaV91cmw6ICJodHRwOi8vbG9jYWxob3N0OjEvZGVhZC1sZXR0ZXIiICAgIyByZXBsYWNlZCBieSBsb2NhbCBjb25maWcKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBSb3V0aW5nIHRyZWUKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpyb3V0ZToKICAjIEFsbCBhbGVydHMgYXJlIGdyb3VwZWQgYnkgYWxlcnRuYW1lICsgdGVhbSArIHNldmVyaXR5LgogIGdyb3VwX2J5OiBbImFsZXJ0bmFtZSIsICJ0ZWFtIiwgInNldmVyaXR5Il0KICAjIFdhaXQgNSBtaW51dGVzIGJlZm9yZSBzZW5kaW5nIHRoZSBmaXJzdCBub3RpZmljYXRpb24gYWZ0ZXIgYSBncm91cCBmb3Jtcy4KICBncm91cF93YWl0OiA1bQogICMgU2VuZCBhIGZvbGxvdy11cCBub3RpZmljYXRpb24gZm9yIG5ldyBhbGVydHMgaW4gYW4gZXhpc3RpbmcgZ3JvdXAgYWZ0ZXIgMTBtLgogIGdyb3VwX2ludGVydmFsOiAxMG0KICAjIFJlc2VuZCBhIGZpcmluZyBhbGVydCBldmVyeSA0IGhvdXJzIHdoaWxlIGl0IGNvbnRpbnVlcyB0byBmaXJlLgogIHJlcGVhdF9pbnRlcnZhbDogNGgKICAjIERlZmF1bHQgcmVjZWl2ZXIg4oCUIHdhcm5pbmctdGllciBTbGFjayBjaGFubmVsLgogIHJlY2VpdmVyOiBzbGFjay1vcHMtYWxlcnRzCgogIHJvdXRlczoKICAgICMgQ3JpdGljYWwgYWxlcnRzIOKGkiBTbGFjayArIFBhZ2VyRHV0eQogICAgLSBtYXRjaDoKICAgICAgICBzZXZlcml0eTogY3JpdGljYWwKICAgICAgcmVjZWl2ZXI6IGNyaXRpY2FsCiAgICAgIGNvbnRpbnVlOiBmYWxzZQoKICAgICMgV2FybmluZyBhbGVydHMg4oaSIFNsYWNrICNvcHMtYWxlcnRzIG9ubHkKICAgIC0gbWF0Y2g6CiAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgcmVjZWl2ZXI6IHNsYWNrLW9wcy1hbGVydHMKICAgICAgY29udGludWU6IGZhbHNlCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiMgUmVjZWl2ZXJzCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KcmVjZWl2ZXJzOgogICMgV2FybmluZy10aWVyOiBTbGFjayAjb3BzLWFsZXJ0cwogIC0gbmFtZTogc2xhY2stb3BzLWFsZXJ0cwogICAgc2xhY2tfY29uZmlnczoKICAgICAgLSBjaGFubmVsOiAiI29wcy1hbGVydHMiCiAgICAgICAgdGl0bGU6IHwtCiAgICAgICAgICBbe3sgLlN0YXR1cyB8IHRvVXBwZXIgfX17eyBpZiBlcSAuU3RhdHVzICJmaXJpbmciIH19Ont7IC5BbGVydHMuRmlyaW5nIHwgbGVuIH19e3sgZW5kIH19XSB7eyAuQ29tbW9uTGFiZWxzLmFsZXJ0bmFtZSB9fQogICAgICAgIHRleHQ6IHwtCiAgICAgICAgICB7eyByYW5nZSAuQWxlcnRzIH19CiAgICAgICAgICAqQWxlcnQ6KiB7eyAuQW5ub3RhdGlvbnMuc3VtbWFyeSB9fQogICAgICAgICAgKkRldGFpbHM6KiB7eyAuQW5ub3RhdGlvbnMuZGVzY3JpcHRpb24gfX0KICAgICAgICAgICpTZXZlcml0eToqIHt7IC5MYWJlbHMuc2V2ZXJpdHkgfX0KICAgICAgICAgIHt7IGlmIC5Bbm5vdGF0aW9ucy5ydW5ib29rIH19KlJ1bmJvb2s6KiB7eyAuQW5ub3RhdGlvbnMucnVuYm9vayB9fXt7IGVuZCB9fQogICAgICAgICAge3sgZW5kIH19CiAgICAgICAgc2VuZF9yZXNvbHZlZDogdHJ1ZQoKICAjIENyaXRpY2FsLXRpZXI6IFNsYWNrICNvcHMtYWxlcnRzICsgUGFnZXJEdXR5CiAgLSBuYW1lOiBjcml0aWNhbAogICAgc2xhY2tfY29uZmlnczoKICAgICAgLSBjaGFubmVsOiAiI29wcy1hbGVydHMiCiAgICAgICAgdGl0bGU6IHwtCiAgICAgICAgICA6cm90YXRpbmdfbGlnaHQ6IFtDUklUSUNBTHt7IGlmIGVxIC5TdGF0dXMgImZpcmluZyIgfX06e3sgLkFsZXJ0cy5GaXJpbmcgfCBsZW4gfX17eyBlbmQgfX1dIHt7IC5Db21tb25MYWJlbHMuYWxlcnRuYW1lIH19CiAgICAgICAgdGV4dDogfC0KICAgICAgICAgIHt7IHJhbmdlIC5BbGVydHMgfX0KICAgICAgICAgICpBbGVydDoqIHt7IC5Bbm5vdGF0aW9ucy5zdW1tYXJ5IH19CiAgICAgICAgICAqRGV0YWlsczoqIHt7IC5Bbm5vdGF0aW9ucy5kZXNjcmlwdGlvbiB9fQogICAgICAgICAge3sgaWYgLkFubm90YXRpb25zLnJ1bmJvb2sgfX0qUnVuYm9vazoqIHt7IC5Bbm5vdGF0aW9ucy5ydW5ib29rIH19e3sgZW5kIH19CiAgICAgICAgICB7eyBlbmQgfX0KICAgICAgICBzZW5kX3Jlc29sdmVkOiB0cnVlCiAgICBwYWdlcmR1dHlfY29uZmlnczoKICAgICAgLSBzZXJ2aWNlX2tleTogIjxBTEVSVE1BTkFHRVJfUEFHRVJEVVRZX1NFUlZJQ0VfS0VZPiIKICAgICAgICBkZXNjcmlwdGlvbjogInt7IC5Db21tb25Bbm5vdGF0aW9ucy5zdW1tYXJ5IH19IgogICAgICAgIGRldGFpbHM6CiAgICAgICAgICBhbGVydG5hbWU6ICd7eyAuQ29tbW9uTGFiZWxzLmFsZXJ0bmFtZSB9fScKICAgICAgICAgIHNldmVyaXR5OiAne3sgLkNvbW1vbkxhYmVscy5zZXZlcml0eSB9fScKICAgICAgICAgIGRlc2NyaXB0aW9uOiAne3sgLkNvbW1vbkFubm90YXRpb25zLmRlc2NyaXB0aW9uIH19JwogICAgICAgIHNlbmRfcmVzb2x2ZWQ6IHRydWUKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBJbmhpYml0aW9uIHJ1bGVzCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KaW5oaWJpdF9ydWxlczoKICAjIFdoZW4gYSBDcml0aWNhbCBwb29sLXV0aWxpc2F0aW9uIGFsZXJ0IGZpcmVzLCBzdXBwcmVzcyB0aGUgV2FybmluZwogICMgYWxlcnQgZm9yIHRoZSBzYW1lIHByb3ZpZGVyIHNvIG9wcyBvbmx5IHNlZXMgb25lIG5vdGlmaWNhdGlvbi4KICAtIHNvdXJjZV9tYXRjaDoKICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgIGFsZXJ0bmFtZTogTExBUFBvb2xVdGlsaXNhdGlvbkNyaXRpY2FsCiAgICB0YXJnZXRfbWF0Y2g6CiAgICAgIHNldmVyaXR5OiB3YXJuaW5nCiAgICAgIGFsZXJ0bmFtZTogTExBUFBvb2xVdGlsaXNhdGlvbkhpZ2gKICAgIGVxdWFsOiBbInByb3ZpZGVyIl0KICAjIFNhbWUgc3VwcHJlc3Npb24gZm9yIGFnZW50LWRlZ3JhZGVkOiBjcml0aWNhbCBzdXBwcmVzc2VzIHdhcm5pbmcuCiAgLSBzb3VyY2VfbWF0Y2g6CiAgICAgIHNldmVyaXR5OiBjcml0aWNhbAogICAgICBhbGVydG5hbWU6IFBhcGVyY2xpcEFnZW50RGVncmFkZWRNdWx0aXBsZQogICAgdGFyZ2V0X21hdGNoOgogICAgICBzZXZlcml0eTogd2FybmluZwogICAgICBhbGVydG5hbWU6IFBhcGVyY2xpcEFnZW50RGVncmFkZWRTaW5nbGUK"
 # FILE: docker/prometheus/prometheus.yml
-EMBED_prometheus_prometheus_yml="IyBkb2NrZXIvcHJvbWV0aGV1cy9wcm9tZXRoZXVzLnltbCDigJQgUHJvbWV0aGV1cyBzY3JhcGUgY29uZmlndXJhdGlvbi4KIwojIFByb21ldGhldXMgcnVucyBvbiB0aGUgcHJveHlfbmV0IGJyaWRnZS4gSG9zdC1uZXR3b3JrZWQgc2VydmljZXMKIyAocHJveHksIHRyYWVmaWspIGFyZSByZWFjaGVkIHZpYSB0aGUgRG9ja2VyIGJyaWRnZSBnYXRld2F5LgojIFRoZSBtb25pdG9yaW5nIG92ZXJsYXkgc2V0cyBleHRyYV9ob3N0czogaG9zdC5kb2NrZXIuaW50ZXJuYWw6aG9zdC1nYXRld2F5CiMgd2hpY2ggcmVzb2x2ZXMgdG8gdGhlIERvY2tlciBicmlkZ2UgZ2F0ZXdheSBJUCBvbiBMaW51eC4KCmdsb2JhbDoKICBzY3JhcGVfaW50ZXJ2YWw6IDE1cwogIGV2YWx1YXRpb25faW50ZXJ2YWw6IDE1cwogIGV4dGVybmFsX2xhYmVsczoKICAgIGNsdXN0ZXI6ICdsbG0tYXBpLXByb3h5JwoKcnVsZV9maWxlczoKICAtICdydWxlcy9sbGFwLXJhdGUtbGltaXQueW1sJwogIC0gJ3J1bGVzL2xsYXAtc3NlLWhlYWx0aC55bWwnCgojIEFsZXJ0bWFuYWdlciBjb25uZWN0aW9uIOKAlCBvbmx5IGFjdGl2ZSB3aGVuIHRoZSBtb25pdG9yaW5nIG92ZXJsYXkgaW5jbHVkZXMKIyB0aGUgYWxlcnRtYW5hZ2VyIHNlcnZpY2UgKGRvY2tlci1jb21wb3NlLm1vbml0b3JpbmcueW1sKS4KYWxlcnRpbmc6CiAgYWxlcnRtYW5hZ2VyczoKICAgIC0gc3RhdGljX2NvbmZpZ3M6CiAgICAgICAgLSB0YXJnZXRzOiBbJ2FsZXJ0bWFuYWdlcjo5MDkzJ10KICAgICAgdGltZW91dDogMTBzCgpzY3JhcGVfY29uZmlnczoKICAtIGpvYl9uYW1lOiAncHJvbWV0aGV1cycKICAgIHN0YXRpY19jb25maWdzOgogICAgICAtIHRhcmdldHM6IFsnbG9jYWxob3N0OjkwOTAnXQoKICAjIFByb3h5IG1ldHJpY3Mg4oCUIGhvc3QtbmV0d29ya2VkLCByZWFjaGVkIHZpYSBEb2NrZXIgZ2F0ZXdheQogIC0gam9iX25hbWU6ICdwcm94eS1zZXJ2ZXInCiAgICBzY3JhcGVfaW50ZXJ2YWw6IDEwcwogICAgbWV0cmljc19wYXRoOiAvbWV0cmljcwogICAgc3RhdGljX2NvbmZpZ3M6CiAgICAgIC0gdGFyZ2V0czogWydob3N0LmRvY2tlci5pbnRlcm5hbDo3MDgwJ10KICAgICAgICBsYWJlbHM6CiAgICAgICAgICBzZXJ2aWNlOiAncHJveHktc2VydmVyJwoKICAjIFRyYWVmaWsgbWV0cmljcyDigJQgaG9zdC1uZXR3b3JrZWQsIHJlYWNoZWQgdmlhIERvY2tlciBnYXRld2F5CiAgLSBqb2JfbmFtZTogJ3RyYWVmaWsnCiAgICBzY3JhcGVfaW50ZXJ2YWw6IDE1cwogICAgbWV0cmljc19wYXRoOiAvbWV0cmljcwogICAgc3RhdGljX2NvbmZpZ3M6CiAgICAgIC0gdGFyZ2V0czogWydob3N0LmRvY2tlci5pbnRlcm5hbDo4MDgyJ10KICAgICAgICBsYWJlbHM6CiAgICAgICAgICBzZXJ2aWNlOiAndHJhZWZpaycK"
+EMBED_prometheus_prometheus_yml="IyBkb2NrZXIvcHJvbWV0aGV1cy9wcm9tZXRoZXVzLnltbCDigJQgUHJvbWV0aGV1cyBzY3JhcGUgY29uZmlndXJhdGlvbi4KIwojIFByb21ldGhldXMgcnVucyBvbiB0aGUgcHJveHlfbmV0IGJyaWRnZS4gSG9zdC1uZXR3b3JrZWQgc2VydmljZXMKIyAocHJveHksIHRyYWVmaWspIGFyZSByZWFjaGVkIHZpYSB0aGUgRG9ja2VyIGJyaWRnZSBnYXRld2F5LgojIFRoZSBtb25pdG9yaW5nIG92ZXJsYXkgc2V0cyBleHRyYV9ob3N0czogaG9zdC5kb2NrZXIuaW50ZXJuYWw6aG9zdC1nYXRld2F5CiMgd2hpY2ggcmVzb2x2ZXMgdG8gdGhlIERvY2tlciBicmlkZ2UgZ2F0ZXdheSBJUCBvbiBMaW51eC4KCmdsb2JhbDoKICBzY3JhcGVfaW50ZXJ2YWw6IDE1cwogIGV2YWx1YXRpb25faW50ZXJ2YWw6IDE1cwogIGV4dGVybmFsX2xhYmVsczoKICAgIGNsdXN0ZXI6ICdsbG0tYXBpLXByb3h5JwoKcnVsZV9maWxlczoKICAtICdydWxlcy9sbGFwLXJhdGUtbGltaXQueW1sJwogIC0gJ3J1bGVzL2xsYXAtc3NlLWhlYWx0aC55bWwnCiAgLSAncnVsZXMvbGxhcC1iYWNrdXAtaGVhbHRoLnltbCcKCiMgQWxlcnRtYW5hZ2VyIGNvbm5lY3Rpb24g4oCUIG9ubHkgYWN0aXZlIHdoZW4gdGhlIG1vbml0b3Jpbmcgb3ZlcmxheSBpbmNsdWRlcwojIHRoZSBhbGVydG1hbmFnZXIgc2VydmljZSAoZG9ja2VyLWNvbXBvc2UubW9uaXRvcmluZy55bWwpLgphbGVydGluZzoKICBhbGVydG1hbmFnZXJzOgogICAgLSBzdGF0aWNfY29uZmlnczoKICAgICAgICAtIHRhcmdldHM6IFsnYWxlcnRtYW5hZ2VyOjkwOTMnXQogICAgICB0aW1lb3V0OiAxMHMKCnNjcmFwZV9jb25maWdzOgogIC0gam9iX25hbWU6ICdwcm9tZXRoZXVzJwogICAgc3RhdGljX2NvbmZpZ3M6CiAgICAgIC0gdGFyZ2V0czogWydsb2NhbGhvc3Q6OTA5MCddCgogICMgUHJveHkgbWV0cmljcyDigJQgaG9zdC1uZXR3b3JrZWQsIHJlYWNoZWQgdmlhIERvY2tlciBnYXRld2F5CiAgLSBqb2JfbmFtZTogJ3Byb3h5LXNlcnZlcicKICAgIHNjcmFwZV9pbnRlcnZhbDogMTBzCiAgICBtZXRyaWNzX3BhdGg6IC9tZXRyaWNzCiAgICBzdGF0aWNfY29uZmlnczoKICAgICAgLSB0YXJnZXRzOiBbJ2hvc3QuZG9ja2VyLmludGVybmFsOjcwODAnXQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNlcnZpY2U6ICdwcm94eS1zZXJ2ZXInCgogICMgVHJhZWZpayBtZXRyaWNzIOKAlCBob3N0LW5ldHdvcmtlZCwgcmVhY2hlZCB2aWEgRG9ja2VyIGdhdGV3YXkKICAtIGpvYl9uYW1lOiAndHJhZWZpaycKICAgIHNjcmFwZV9pbnRlcnZhbDogMTVzCiAgICBtZXRyaWNzX3BhdGg6IC9tZXRyaWNzCiAgICBzdGF0aWNfY29uZmlnczoKICAgICAgLSB0YXJnZXRzOiBbJ2hvc3QuZG9ja2VyLmludGVybmFsOjgwODInXQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNlcnZpY2U6ICd0cmFlZmlrJwo="
 # FILE: docker/prometheus/rules/llap-rate-limit.yml
 EMBED_prometheus_rules_llap_rate_limit_yml="IyBkb2NrZXIvcHJvbWV0aGV1cy9ydWxlcy9sbGFwLXJhdGUtbGltaXQueW1sCiMKIyBUaHJlZS10aWVyIHJhdGUtbGltaXQgaGVhbHRoIGFsZXJ0aW5nIGZvciBMTEFQIChBUEUtMTI3MSkuCiMKIyBUaWVyIDEg4oCUIFdhcm5pbmcgIOKGkiBTbGFjayAjb3BzLWFsZXJ0cwojIFRpZXIgMiDigJQgQ3JpdGljYWwg4oaSIFNsYWNrICNvcHMtYWxlcnRzICsgUGFnZXJEdXR5CiMgVGllciAzIOKAlCBBZ2VudCBoZWFsdGggKFBhcGVyY2xpcCBydW5uZXIgbWV0cmljcykKIyBTY3JhcGUgZ3VhcmRzIOKAlCBDcml0aWNhbCDihpIgU2xhY2sgI29wcy1hbGVydHMgKyBQYWdlckR1dHkgKEFQRS0yNjQzKQojCiMgQWxsIHBvb2wtdXRpbGlzYXRpb24gcnVsZXMgdGFyZ2V0IHRoZSA1aCB3aW5kb3cgbGFiZWwgdG8gbWF0Y2ggdGhlIEFEUgojIChBUEUtMTI2Nikgd2hpY2ggdXNlcyBhIDUtaG91ciByb2xsaW5nIHdpbmRvdyBmb3IgdG9rZW4tYnVkZ2V0IHRyYWNraW5nLgojCiMgSU1QT1JUQU5UOiBUaGUgc2NyYXBlLXRhcmdldC1oZWFsdGggZ3JvdXAgKEFQRS0yNjQzKSBtdXN0IHN0YXkgYXQgdGhlIGJvdHRvbQojIG9mIHRoaXMgZmlsZSBhbmQgcmVtYWluIGFjdGl2ZS4gV2l0aG91dCBpdCwgYWxsIGJ1c2luZXNzLWxvZ2ljIGFsZXJ0cyBzaWxlbnRseQojIHN0b3AgZmlyaW5nIHdoZW4gUHJvbWV0aGV1cyBjYW5ub3QgcmVhY2ggYSBzY3JhcGUgdGFyZ2V0LgoKZ3JvdXBzOgogIC0gbmFtZTogbGxhcF9yYXRlX2xpbWl0CiAgICBpbnRlcnZhbDogMzBzCiAgICBydWxlczoKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgIyBUaWVyIDEg4oCUIFdhcm5pbmc6IHBvb2wgYXQgNzAgJSBjYXBhY2l0eSBmb3IgNSBtaW51dGVzCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBQb29sVXRpbGlzYXRpb25IaWdoCiAgICAgICAgZXhwcjogbGxhcF9wb29sX3V0aWxpc2F0aW9uX3JhdGlve3dpbmRvdz0iNWgifSA+IDAuNwogICAgICAgIGZvcjogNW0KICAgICAgICBsYWJlbHM6CiAgICAgICAgICBzZXZlcml0eTogd2FybmluZwogICAgICAgICAgdGVhbTogcGxhdGZvcm0KICAgICAgICBhbm5vdGF0aW9uczoKICAgICAgICAgIHN1bW1hcnk6ICJMTEFQIHBvb2wgdXRpbGlzYXRpb24gaGlnaCDigJQge3sgJGxhYmVscy5wcm92aWRlciB9fSIKICAgICAgICAgIGRlc2NyaXB0aW9uOiA+LQogICAgICAgICAgICBQb29sIHV0aWxpc2F0aW9uIGZvciB7eyAkbGFiZWxzLnByb3ZpZGVyIH19ICg1aCB3aW5kb3cpIGlzCiAgICAgICAgICAgIHt7ICR2YWx1ZSB8IGh1bWFuaXplUGVyY2VudGFnZSB9fSDigJQgYWJvdmUgdGhlIDcwICUgd2FybmluZwogICAgICAgICAgICB0aHJlc2hvbGQgZm9yIHRoZSBwYXN0IDUgbWludXRlcy4gSW52ZXN0aWdhdGUgdXBzdHJlYW0gcXVvdGEKICAgICAgICAgICAgaGVhZHJvb20gb3IgcmVkdWNlIHJlcXVlc3Qgdm9sdW1lLgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vb3V0bGluZS5hcGVyaW0uY29tL2RvYy9sbGFwLXJhdGUtbGltaXQtcnVuYm9vayIKCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgVGllciAyYSDigJQgQ3JpdGljYWw6IHBvb2wgYXQgOTAgJSBjYXBhY2l0eSBmb3IgMiBtaW51dGVzCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBQb29sVXRpbGlzYXRpb25Dcml0aWNhbAogICAgICAgIGV4cHI6IGxsYXBfcG9vbF91dGlsaXNhdGlvbl9yYXRpb3t3aW5kb3c9IjVoIn0gPiAwLjkKICAgICAgICBmb3I6IDJtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIkxMQVAgcG9vbCB1dGlsaXNhdGlvbiBjcml0aWNhbCDigJQge3sgJGxhYmVscy5wcm92aWRlciB9fSIKICAgICAgICAgIGRlc2NyaXB0aW9uOiA+LQogICAgICAgICAgICBQb29sIHV0aWxpc2F0aW9uIGZvciB7eyAkbGFiZWxzLnByb3ZpZGVyIH19ICg1aCB3aW5kb3cpIGlzCiAgICAgICAgICAgIHt7ICR2YWx1ZSB8IGh1bWFuaXplUGVyY2VudGFnZSB9fSDigJQgYWJvdmUgdGhlIDkwICUgY3JpdGljYWwKICAgICAgICAgICAgdGhyZXNob2xkIGZvciB0aGUgcGFzdCAyIG1pbnV0ZXMuIEZhaWxvdmVyIG1heSBhY3RpdmF0ZSBpbW1pbmVudGx5LgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vb3V0bGluZS5hcGVyaW0uY29tL2RvYy9sbGFwLXJhdGUtbGltaXQtcnVuYm9vayIKCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgVGllciAyYiDigJQgQ3JpdGljYWw6IGFsbCBhY2NvdW50cyBleGhhdXN0ZWQgZm9yIDEgbWludXRlCiAgICAgICMKICAgICAgIyBVc2VzIHJhdGUoKSBvdmVyIHRoZSBjb3VudGVyIHNvIHRoZSBhbGVydCBmaXJlcyBvbmx5IHdoZW4gbmV3CiAgICAgICMgZXhoYXVzdGlvbiBldmVudHMgYXJlIG9jY3VycmluZywgbm90IGlmIHRoZSBjb3VudGVyIHNpdHMgYXQgYQogICAgICAjIGhpc3RvcmljYWwgbm9uLXplcm8gdmFsdWUgYWZ0ZXIgYSByZXN0YXJ0LgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBMTEFQQWxsQWNjb3VudHNFeGhhdXN0ZWQKICAgICAgICBleHByOiByYXRlKGxsYXBfYWNjb3VudHNfZXhoYXVzdGVkX3RvdGFsWzFtXSkgPiAwCiAgICAgICAgZm9yOiAxbQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNldmVyaXR5OiBjcml0aWNhbAogICAgICAgICAgdGVhbTogcGxhdGZvcm0KICAgICAgICBhbm5vdGF0aW9uczoKICAgICAgICAgIHN1bW1hcnk6ICJBbGwgTExBUCBhY2NvdW50cyBleGhhdXN0ZWQg4oCUIHt7ICRsYWJlbHMucHJvdmlkZXIgfX0iCiAgICAgICAgICBkZXNjcmlwdGlvbjogPi0KICAgICAgICAgICAgQWxsIExMTSBwcm92aWRlciBhY2NvdW50cyBmb3Ige3sgJGxhYmVscy5wcm92aWRlciB9fSBhcmUgZXhoYXVzdGVkLgogICAgICAgICAgICBSZXF1ZXN0cyBjYW5ub3QgYmUgc2VydmVkLiBJbW1lZGlhdGUgYWN0aW9uIHJlcXVpcmVkIOKAlCBjaGVjayBjaXJjdWl0CiAgICAgICAgICAgIGJyZWFrZXIgc3RhdGVzIGFuZCB1cHN0cmVhbSBxdW90YSByZXNldHMuCiAgICAgICAgICBydW5ib29rOiAiaHR0cHM6Ly9vdXRsaW5lLmFwZXJpbS5jb20vZG9jL2xsYXAtcmF0ZS1saW1pdC1ydW5ib29rIgoKICAtIG5hbWU6IHBhcGVyY2xpcF9hZ2VudF9oZWFsdGgKICAgIGludGVydmFsOiAzMHMKICAgIHJ1bGVzOgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIFRpZXIgM2Eg4oCUIFdhcm5pbmc6IGFueSBzaW5nbGUgYWdlbnQgaW4gZXJyb3Igc3RhdGUgZm9yIDUrIG1pbnV0ZXMKICAgICAgIwogICAgICAjIHBhcGVyY2xpcF9hZ2VudF9zdGF0ZSBsYWJlbHM6IDA9aWRsZSwgMT1ydW5uaW5nLCAyPXBhdXNlZCwgMz1lcnJvcgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBQYXBlcmNsaXBBZ2VudERlZ3JhZGVkU2luZ2xlCiAgICAgICAgZXhwcjogc3VtKHBhcGVyY2xpcF9hZ2VudF9zdGF0ZSA9PSAzKSA+PSAxCiAgICAgICAgZm9yOiA1bQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNldmVyaXR5OiB3YXJuaW5nCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIk9uZSBvciBtb3JlIFBhcGVyY2xpcCBhZ2VudHMgaW4gZXJyb3Igc3RhdGUgZm9yIDUrIG1pbnV0ZXMiCiAgICAgICAgICBkZXNjcmlwdGlvbjogPi0KICAgICAgICAgICAge3sgJHZhbHVlIH19IFBhcGVyY2xpcCBhZ2VudChzKSBoYXZlIGJlZW4gaW4gdGhlIGVycm9yIHN0YXRlCiAgICAgICAgICAgIChwYXBlcmNsaXBfYWdlbnRfc3RhdGU9MykgZm9yIG1vcmUgdGhhbiA1IG1pbnV0ZXMuIENoZWNrIHRoZQogICAgICAgICAgICBydW5uZXIgbG9ncyBhbmQgaGVhcnRiZWF0IHF1ZXVlIGZvciBzdHVjayBvciBmYWlsZWQgYWdlbnRzLgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vb3V0bGluZS5hcGVyaW0uY29tL2RvYy9wYXBlcmNsaXAtYWdlbnQtcnVuYm9vayIKCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgVGllciAzYiDigJQgQ3JpdGljYWw6IHR3byBvciBtb3JlIGFnZW50cyBpbiBlcnJvciBzdGF0ZSBmb3IgMisgbWludXRlcwogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBQYXBlcmNsaXBBZ2VudERlZ3JhZGVkTXVsdGlwbGUKICAgICAgICBleHByOiBzdW0ocGFwZXJjbGlwX2FnZW50X3N0YXRlID09IDMpID49IDIKICAgICAgICBmb3I6IDJtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIjIrIFBhcGVyY2xpcCBhZ2VudHMgZGVncmFkZWQg4oCUIHt7ICR2YWx1ZSB9fSBhZ2VudHMgaW4gZXJyb3IiCiAgICAgICAgICBkZXNjcmlwdGlvbjogPi0KICAgICAgICAgICAge3sgJHZhbHVlIH19IFBhcGVyY2xpcCBhZ2VudHMgaGF2ZSBiZWVuIGluIHRoZSBlcnJvciBzdGF0ZQogICAgICAgICAgICAocGFwZXJjbGlwX2FnZW50X3N0YXRlPTMpIGZvciBtb3JlIHRoYW4gMiBtaW51dGVzIHNpbXVsdGFuZW91c2x5LgogICAgICAgICAgICBUaGlzIGluZGljYXRlcyBzeXN0ZW1pYyBkZWdyYWRhdGlvbiBvZiB0aGUgYWdlbnQgcnVubmVyLiBFc2NhbGF0ZQogICAgICAgICAgICBpbW1lZGlhdGVseS4KICAgICAgICAgIHJ1bmJvb2s6ICJodHRwczovL291dGxpbmUuYXBlcmltLmNvbS9kb2MvcGFwZXJjbGlwLWFnZW50LXJ1bmJvb2siCgogICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAjIFNjcmFwZS10YXJnZXQgaGVhbHRoIGd1YXJkcyAoQVBFLTI2NDMpCiAgIwogICMgQWxlcnRzIHdoZW4gUHJvbWV0aGV1cyBjYW5ub3QgcmVhY2ggYSBtZXRyaWMgc291cmNlLiBXaXRob3V0IHRoZXNlLAogICMgYWxsIGJ1c2luZXNzLWxvZ2ljIGFsZXJ0cyBhYm92ZSBzaWxlbnRseSBzdG9wIGZpcmluZyB3aGVuIGEgdGFyZ2V0IGlzCiAgIyBkb3duIOKAlCBtYWtpbmcgc2lsZW50IGZhaWx1cmUgaW5kaXN0aW5ndWlzaGFibGUgZnJvbSBldmVyeXRoaW5nIGJlaW5nCiAgIyBoZWFsdGh5LiBSb3V0ZXMgc2FtZSBhcyBUaWVyIDIgY3JpdGljYWwgKHNldmVyaXR5OiBjcml0aWNhbCkuCiAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogIC0gbmFtZTogc2NyYXBlLXRhcmdldC1oZWFsdGgKICAgIGludGVydmFsOiAzMHMKICAgIHJ1bGVzOgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIExMQVAgcHJveHkgc2NyYXBlIGZhaWxpbmcg4oCUIHByb3h5LXNlcnZlciBqb2IgdW5yZWFjaGFibGUKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgLSBhbGVydDogTGxhcE1ldHJpY3NTY3JhcGVGYWlsaW5nCiAgICAgICAgZXhwcjogdXB7am9iPSJwcm94eS1zZXJ2ZXIifSA9PSAwCiAgICAgICAgZm9yOiAybQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNldmVyaXR5OiBjcml0aWNhbAogICAgICAgICAgdGVhbTogcGxhdGZvcm0KICAgICAgICBhbm5vdGF0aW9uczoKICAgICAgICAgIHN1bW1hcnk6ICJDUklUSUNBTDogTExBUCBwcm94eSBtZXRyaWNzIHNjcmFwZSBmYWlsaW5nIgogICAgICAgICAgZGVzY3JpcHRpb246ID4tCiAgICAgICAgICAgIFByb21ldGhldXMgY2Fubm90IHJlYWNoIHRoZSBMTEFQIHByb3h5LXNlcnZlciBtZXRyaWNzIGVuZHBvaW50CiAgICAgICAgICAgIChqb2I9cHJveHktc2VydmVyKS4gQWxsIExMQVAgVGllciAxLzIgcmF0ZS1saW1pdCBhbGVydHMgYXJlCiAgICAgICAgICAgIHNpbGVudGx5IGluYWN0aXZlLiBDaGVjayB0aGF0IHRoZSBwcm94eSBpcyBydW5uaW5nIGFuZCB0aGUKICAgICAgICAgICAgc2NyYXBlIHRhcmdldCBpcyByZWFjaGFibGUgYXQgaG9zdC5kb2NrZXIuaW50ZXJuYWw6NzA4MC4KICAgICAgICAgIHJ1bmJvb2s6ICJodHRwczovL291dGxpbmUuYXBlcmltLmNvbS9kb2MvbGxhcC1yYXRlLWxpbWl0LXJ1bmJvb2siCgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIExMQVAgbWV0cmljcyBhYnNlbnQg4oCUIHByb3h5IGlzIHVwIGJ1dCBsbGFwXyogbWV0cmljcyBhcmUgbWlzc2luZwogICAgICAjIENhdGNoZXMgdGhlIGNhc2Ugd2hlcmUgdGhlIGpvYiBpcyByZWFjaGFibGUgYnV0IHRoZSBMTEFQIG1ldHJpY3MKICAgICAgIyBlbmRwb2ludCByZXR1cm5zIDQwNCBvciBtZXRyaWNzIGhhdmUgbm90IGJlZW4gaW5pdGlhbGlzZWQuCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExsYXBNZXRyaWNzQWJzZW50CiAgICAgICAgZXhwcjogYWJzZW50KGxsYXBfcG9vbF91dGlsaXNhdGlvbl9yYXRpbykKICAgICAgICBmb3I6IDJtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIkNSSVRJQ0FMOiBMTEFQIHBvb2wgdXRpbGlzYXRpb24gbWV0cmljIGFic2VudCIKICAgICAgICAgIGRlc2NyaXB0aW9uOiA+LQogICAgICAgICAgICBUaGUgbWV0cmljIGxsYXBfcG9vbF91dGlsaXNhdGlvbl9yYXRpbyBpcyBhYnNlbnQgZnJvbSBQcm9tZXRoZXVzLgogICAgICAgICAgICBUaGUgTExBUCBwcm94eSBtYXkgYmUgcnVubmluZyBidXQgbm90IGV4cG9zaW5nIHJhdGUtbGltaXQgaGVhbHRoCiAgICAgICAgICAgIG1ldHJpY3MgKHBvc3NpYmxlIC9tZXRyaWNzIGVuZHBvaW50IDQwNCBvciBtaXNzaW5nIGluaXRpYWxpc2F0aW9uKS4KICAgICAgICAgICAgQWxsIFRpZXIgMS8yIHBvb2wgdXRpbGlzYXRpb24gYWxlcnRzIGFyZSBzaWxlbnRseSBpbmFjdGl2ZS4KICAgICAgICAgIHJ1bmJvb2s6ICJodHRwczovL291dGxpbmUuYXBlcmltLmNvbS9kb2MvbGxhcC1yYXRlLWxpbWl0LXJ1bmJvb2siCgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIFBhcGVyY2xpcCBydW5uZXIgc2NyYXBlIGZhaWxpbmcg4oCUIGVuYWJsZWQgb25jZSBUYWlsc2NhbGUgKEFQRS05MTcpCiAgICAgICMgaXMgbGl2ZS4gVW5jb21tZW50IGluIGNvbmNlcnQgd2l0aCB0aGUgcGFwZXJjbGlwLXJ1bm5lciBzY3JhcGUgam9iCiAgICAgICMgaW4gcHJvbWV0aGV1cy55bWwuCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgLSBhbGVydDogUGFwZXJjbGlwUnVubmVyTWV0cmljc1NjcmFwZUZhaWxpbmcKICAgICAgIyAgIGV4cHI6IHVwe2pvYj0icGFwZXJjbGlwLXJ1bm5lciJ9ID09IDAKICAgICAgIyAgIGZvcjogMm0KICAgICAgIyAgIGxhYmVsczoKICAgICAgIyAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICMgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICMgICBhbm5vdGF0aW9uczoKICAgICAgIyAgICAgc3VtbWFyeTogIkNSSVRJQ0FMOiBQYXBlcmNsaXAgcnVubmVyIG1ldHJpY3Mgc2NyYXBlIGZhaWxpbmciCiAgICAgICMgICAgIGRlc2NyaXB0aW9uOiA+LQogICAgICAjICAgICAgIFByb21ldGhldXMgY2Fubm90IHJlYWNoIHRoZSBQYXBlcmNsaXAgcnVubmVyIG1ldHJpY3MgZW5kcG9pbnQKICAgICAgIyAgICAgICAoam9iPXBhcGVyY2xpcC1ydW5uZXIpLiBBbGwgVGllciAzIGFnZW50IGhlYWx0aCBhbGVydHMgYXJlCiAgICAgICMgICAgICAgc2lsZW50bHkgaW5hY3RpdmUuIENoZWNrIFRhaWxzY2FsZSBjb25uZWN0aXZpdHkgKEFQRS05MTcpIGFuZAogICAgICAjICAgICAgIHRoZSBydW5uZXIgL21ldHJpY3MgZW5kcG9pbnQuCiAgICAgICMgICAgIHJ1bmJvb2s6ICJodHRwczovL291dGxpbmUuYXBlcmltLmNvbS9kb2MvcGFwZXJjbGlwLWFnZW50LXJ1bmJvb2siCg=="
 # FILE: docker/prometheus/rules/llap-sse-health.yml
 EMBED_prometheus_rules_llap_sse_health_yml="IyBkb2NrZXIvcHJvbWV0aGV1cy9ydWxlcy9sbGFwLXNzZS1oZWFsdGgueW1sCiMKIyBTU0Ugc3RyZWFtIGhlYWx0aCBhbGVydGluZyBmb3IgTExBUCAoQVBFLTUxMTMpLgojCiMgRmlyZXMgd2hlbiB0aGUgcmF0ZSBvZiB6ZXJvLWV2ZW50IFNTRSBwYXJ0aWFsIHN0cmVhbXMgKEhUVFAgMjAwICsgZW1wdHkgYm9keSkKIyBleGNlZWRzIDAuMSUgb2YgdG90YWwgcHJveGllZCByZXF1ZXN0cyBvdmVyIGEgNS1taW51dGUgd2luZG93LiBUaGlzIHBhdHRlcm4KIyBpbmRpY2F0ZXMgdXBzdHJlYW0gQW50aHJvcGljIGlzIHJldHVybmluZyBlbXB0eSByZXNwb25zZXMgdGhhdCBzdHJhbmQgYWdlbnRzCiMgKHJvb3QgY2F1c2UgZG9jdW1lbnRlZCBpbiBBUEUtNTA3OSBwb3N0LW1vcnRlbSkuCgpncm91cHM6CiAgLSBuYW1lOiBsbGFwX3NzZV9oZWFsdGgKICAgIGludGVydmFsOiAzMHMKICAgIHJ1bGVzOgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIFdhcm5pbmc6IGVtcHR5LXN0cmVhbSByYXRlID4gMC4xJSBvdmVyIDUgbWludXRlcwogICAgICAjCiAgICAgICMgUmF0aW86IHplcm8tZXZlbnQgcGFydGlhbCBzdHJlYW1zIC8gYWxsIHByb3hpZWQgcmVxdWVzdHMuCiAgICAgICMgVXNlcyByYXRlIGZvciBmYXN0LW1vdmluZyBjb3VudGVycyBhbmQgZmFsbHMgYmFjayBncmFjZWZ1bGx5IHdoZW4KICAgICAgIyB0aGUgZGVub21pbmF0b3IgaXMgemVybyAobm8gdHJhZmZpYykuCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBFbXB0eVNTRVN0cmVhbVJhdGVIaWdoCiAgICAgICAgZXhwcjogPi0KICAgICAgICAgICgKICAgICAgICAgICAgcmF0ZShwcm94eV9zc2VfZW1wdHlfc3RyZWFtc190b3RhbFs1bV0pCiAgICAgICAgICAgIC8KICAgICAgICAgICAgcmF0ZShwcm94eV9yZXF1ZXN0c190b3RhbFs1bV0pCiAgICAgICAgICApID4gMC4wMDEKICAgICAgICBmb3I6IDVtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBlbXB0eSBTU0Ugc3RyZWFtIHJhdGUgPiAwLjElIChBUEUtNTExMykiCiAgICAgICAgICBkZXNjcmlwdGlvbjogPi0KICAgICAgICAgICAgVGhlIHJhdGUgb2YgZW1wdHkgU1NFIHN0cmVhbXMgKEhUVFAgMjAwIHdpdGggemVybyBldmVudHMpIGhhcyBleGNlZWRlZAogICAgICAgICAgICAwLjElIG9mIHRvdGFsIHByb3hpZWQgcmVxdWVzdHMgb3ZlciB0aGUgcGFzdCA1IG1pbnV0ZXMuCiAgICAgICAgICAgIEN1cnJlbnQgcmF0ZToge3sgJHZhbHVlIHwgaHVtYW5pemVQZXJjZW50YWdlIH19LgogICAgICAgICAgICBUaGlzIGluZGljYXRlcyB1cHN0cmVhbSBBbnRocm9waWMgaXMgcmV0dXJuaW5nIGVtcHR5IHJlc3BvbnNlcyB0aGF0CiAgICAgICAgICAgIHN0cmFuZCBDbGF1ZGUgYWdlbnRzOyBzZWUgQVBFLTUwNzkgcG9zdC1tb3J0ZW0gZm9yIHJvb3QgY2F1c2UuCiAgICAgICAgICBydW5ib29rOiAiaHR0cHM6Ly9vdXRsaW5lLmFwZXJpbS5jb20vZG9jL3Bvc3QtbW9ydGVtLWh0dHAtMjAwLWVtcHR5bWFsZm9ybWVkLXJlc3BvbnNlcy1zdHJhbmRpbmctY2xhdWRlLWFnZW50cy1hcGUtNTA3OS1lR0Y5MWFMbW9HIgoKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgIyBBYnNlbnQtbWV0cmljIGd1YXJkOiBhbGVydCBpZiBwcm94eV9zc2VfZW1wdHlfc3RyZWFtc190b3RhbCBpcwogICAgICAjIG1pc3NpbmcgZW50aXJlbHkgKHByb3h5IG5vdCBydW5uaW5nIG9yIG1ldHJpY3MgZW5kcG9pbnQgZG93bikuCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBFbXB0eVNTRU1ldHJpY0Fic2VudAogICAgICAgIGV4cHI6IGFic2VudChwcm94eV9zc2VfZW1wdHlfc3RyZWFtc190b3RhbCkKICAgICAgICBmb3I6IDVtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBlbXB0eS1TU0UgbWV0cmljIGFic2VudCAtIHByb3h5IG1heSBiZSBkb3duIgogICAgICAgICAgZGVzY3JpcHRpb246ID4tCiAgICAgICAgICAgIFRoZSBtZXRyaWMgcHJveHlfc3NlX2VtcHR5X3N0cmVhbXNfdG90YWwgaXMgYWJzZW50IGZyb20gUHJvbWV0aGV1cwogICAgICAgICAgICBmb3IgNSsgbWludXRlcy4gVGhlIExMQVAgcHJveHkgbWF5IGJlIGRvd24gb3IgdGhlIC9tZXRyaWNzIGVuZHBvaW50CiAgICAgICAgICAgIG1heSBiZSB1bnJlYWNoYWJsZS4gRW1wdHktc3RyZWFtIGFsZXJ0aW5nIGlzIHNpbGVudGx5IGluYWN0aXZlLgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vb3V0bGluZS5hcGVyaW0uY29tL2RvYy9sbGFwLXJhdGUtbGltaXQtcnVuYm9vayIK"
+# FILE: docker/prometheus/rules/llap-backup-health.yml
+EMBED_prometheus_rules_llap_backup_health_yml="IyBkb2NrZXIvcHJvbWV0aGV1cy9ydWxlcy9sbGFwLWJhY2t1cC1oZWFsdGgueW1sCiMKIyBCYWNrdXAgaGVhbHRoIGFsZXJ0aW5nIGZvciBMTEFQICgjMTc1OCkuCiMKIyBXSFkgVEhJUyBGSUxFIEVYSVNUUwojIC0tLS0tLS0tLS0tLS0tLS0tLS0tCiMgUHJvZHVjdGlvbiByYW4gd2l0aCBaRVJPIG9mZi1ob3N0IGJhY2t1cHMgZm9yIHdlZWtzLiBgcmVzdGljIHNuYXBzaG90c2AKIyByZXR1cm5lZCBgU3RhdDogVW5hdXRob3JpemVkYCBvbiBldmVyeSBhdHRlbXB0LCBzbyBubyBzbmFwc2hvdCB3YXMgZXZlcgojIHdyaXR0ZW4sIGFuZCB0aGUgb25seSByZWNvdmVyeSBwb2ludCBvbiB0aGUgd2hvbGUgc3lzdGVtIHdhcyBhbiA4MyBNQiBkdW1wCiMgZnJvbSAyMDI2LTA3LTE4IGZvciB3aGF0IGhhZCBncm93biBpbnRvIGFuIDExIEdCIGRhdGFiYXNlLgojCiMgTm90aGluZyBhbGVydGVkLCBiZWNhdXNlOgojICAgLSB0aGUgYmFja3VwIGNvbnRhaW5lciBoZWFsdGggY2hlY2sgY291bGQgbm90IHJlcG9ydCB1bmhlYWx0aHkgYXQgYWxsCiMgICAgIChgLi4uIHx8IGV4aXQgMGApIGFuZCB0aW1lZCBvdXQgaW5zdGVhZCBvZiBzdXJmYWNpbmcgYFVuYXV0aG9yaXplZGA7CiMgICAtIHRoZSBwcm94eSBleHBvcnRlZCBgYmFja3VwX2FnZW50X29ubGluZSA9IDFgIHRoZSBlbnRpcmUgdGltZSwgYmVjYXVzZSB0aGUKIyAgICAgYWdlbnQgUFJPQ0VTUyB3YXMgYWxpdmUuIExpdmVuZXNzIHdhcyBiZWluZyByZWFkIGFzIGJhY2t1cCBzdWNjZXNzOwojICAgLSBgYmFja3VwX2xhc3Rfc3VjY2Vzc19hZ2Vfc2Vjb25kc2Agd2FzIHdyaXR0ZW4gYXMgMCB3aGVuIG5vIHN1Y2Nlc3NmdWwgam9iCiMgICAgIHdhcyBrbm93biwgc28gYW55IGBhZ2UgPiB0aHJlc2hvbGRgIHJ1bGUgd2FzIHN0cnVjdHVyYWxseSBpbmNhcGFibGUgb2YKIyAgICAgZmlyaW5nIGR1cmluZyBhIHRvdGFsIG91dGFnZS4KIwojIFRoZSBydWxlcyBiZWxvdyBhbGVydCBvbiB0aGUgcmVjb3ZlcnkgcG9pbnQsIG5vdCBvbiB0aGUgcHJvY2VzczoKIyAgIC0gYmFja3VwX3N0YWxlICAgICAgICAgICAgICAgIOKAlCBubyBzdWNjZXNzZnVsIGJhY2t1cCBpbnNpZGUgdGhlIHdpbmRvdwojICAgLSBiYWNrdXBfbGFzdF9zdWNjZXNzX2tub3duICAg4oCUIHdoZXRoZXIgYSBzdWNjZXNzIGhhcyBFVkVSIGJlZW4gb2JzZXJ2ZWQKIyAgIC0gYmFja3VwX2FnZW50X29ubGluZSAgICAgICAgIOKAlCBsaXZlbmVzcyBvbmx5OyB3YXJuaW5nIHNldmVyaXR5LCBuZXZlciB0aGUKIyAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgc29sZSBiYWNrdXAgc2lnbmFsCiMKIyBUaGUgcHJveHkgZW1pdHMgdGhlc2UgZnJvbSBjcmF0ZXMvcHJveHktc2VydmVyL3NyYy9iYWNrdXBfaGVhbHRoLnJzLgojCiMgQU5OT1RBVElPTiBTVFlMRQojIC0tLS0tLS0tLS0tLS0tLS0KIyBgZGVzY3JpcHRpb25gIGlzIE9ORSBzaG9ydCBzZW50ZW5jZSDigJQgaXQgaXMgd2hhdCBsYW5kcyBpbiBhIHBhZ2luZyBjaGFubmVsLAojIHdoZXJlIGxvbmcgcHJvc2UgaXMgdHJ1bmNhdGVkIGFuZCB1bnJlYWQuIEV2ZXJ5IHJ1bGUgY2FycmllcyBhIGBydW5ib29rYAojIGFubm90YXRpb24gcG9pbnRpbmcgYXQgZG9ja2VyL2JhY2t1cC9SRUFETUUubWQsIHdoaWNoIGhvbGRzIHRoZSBkaWFnbm9zaXMgYW5kCiMgcmVjb3ZlcnkgcHJvY2VkdXJlIGluIGZ1bGwuIFRoaXMgYWxzbyBrZWVwcyB0aGUgcHJvbXRvb2wgYGV4cF9hbm5vdGF0aW9uc2AKIyBmaXh0dXJlcyBsZWdpYmxlLgojCiMgVEhFU0UgUlVMRVMgQVJFIFVOSVQtVEVTVEVELiBgZG9ja2VyL3Byb21ldGhldXMvdGVzdC9hbGVydF9ydWxlc190ZXN0LmJhdHNgCiMgcnVucyBgcHJvbXRvb2wgY2hlY2sgcnVsZXNgIGFuZCBgcHJvbXRvb2wgdGVzdCBydWxlc2AgYWdhaW5zdAojIGBkb2NrZXIvcHJvbWV0aGV1cy90ZXN0L2xsYXAtYmFja3VwLWhlYWx0aC50ZXN0LnltbGAsIHdoaWNoIGZlZWRzIHN5bnRoZXRpYwojIHNlcmllcyB0aHJvdWdoIHRoZSByZWFsIFByb21RTCBldmFsdWF0b3IuIEJlZm9yZSB0aGF0IGV4aXN0ZWQsIHRoZSBzdWl0ZSB3YXMgYQojIFlBTUwgc3Vic3RyaW5nIGdyZXA6IGluamVjdGluZyBgZXhwcjogYmFja3VwX2xhc3Rfc3VjY2Vzc19rbm93biA9PT09IDAgdW5sZXNzCiMgb24oKSB2ZWN0b3IoYCAoaW52YWxpZCBQcm9tUUwsIHdoaWNoIFByb21ldGhldXMgcmVmdXNlcyB0byBsb2FkIOKAlCB0YWtpbmcgQUxMCiMgbW9uaXRvcmluZyBkb3duKSBsZWZ0IGV2ZXJ5IHRlc3QgZ3JlZW4uCgpncm91cHM6CiAgLSBuYW1lOiBsbGFwX2JhY2t1cF9oZWFsdGgKICAgIGludGVydmFsOiA2MHMKICAgIHJ1bGVzOgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIENSSVRJQ0FMOiBubyBzdWNjZXNzZnVsIGJhY2t1cCBoYXMgZXZlciBiZWVuIHJlY29yZGVkLgogICAgICAjCiAgICAgICMgVGhpcyBpcyB0aGUgZXhhY3QgcHJvZHVjdGlvbiBzdGF0ZSBvbiAyMDI2LTA4LTAyLiBJdCBtdXN0IHBhZ2UuCiAgICAgICMgRGVsaWJlcmF0ZWx5IHNlcGFyYXRlIGZyb20gdGhlIHN0YWxlbmVzcyBhbGVydCBiZWNhdXNlIHRoZSBhZ2UgZ2F1Z2UKICAgICAgIyBpcyBOYU4gaW4gdGhpcyBzdGF0ZSBhbmQgbm8gbnVtZXJpYyBjb21wYXJpc29uIGNhbiBjYXRjaCBpdC4KICAgICAgIwogICAgICAjIGBiYWNrdXBfbGFzdF9zdWNjZXNzX2tub3duYCBtZWFucyAiYSBjb21wbGV0ZWQgYmFja3VwIGhhcyBFVkVSIGJlZW4KICAgICAgIyBvYnNlcnZlZCIsIGRlcml2ZWQgZnJvbSB0aGUgbmV3ZXN0IHJlc3RpYyBzbmFwc2hvdCB0aGUgYWdlbnQgaGFzCiAgICAgICMgcHVibGlzaGVkIOKAlCBOT1QgZnJvbSB0aGUgc3RhdHVzIG9mIHRoZSBzaW5nbGUgbW9zdCByZWNlbnQgcnVuLiBPbmUKICAgICAgIyBmYWlsZWQgcnVuIGFmdGVyIGEgZ29vZCBuaWdodCBtdXN0IG5vdCBwYWdlICJ0aGVyZSBpcyBubyByZWNvdmVyeQogICAgICAjIHBvaW50IiB3aGlsZSB5ZXN0ZXJkYXkncyBzbmFwc2hvdCBleGlzdHMuCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBCYWNrdXBOZXZlclN1Y2NlZWRlZAogICAgICAgIGV4cHI6IGJhY2t1cF9sYXN0X3N1Y2Nlc3Nfa25vd24gPT0gMAogICAgICAgIGZvcjogMTVtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIkxMQVAgaGFzIE5PIGJhY2t1cCByZWNvdmVyeSBwb2ludCAoIzE3NTgpIgogICAgICAgICAgZGVzY3JpcHRpb246ICJObyBzdWNjZXNzZnVsIGJhY2t1cCBoYXMgZXZlciBiZWVuIG9ic2VydmVkIGZvciB0aGlzIGRlcGxveW1lbnQuIgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vZ2l0aHViLmNvbS9MTE0tQVBJLVByb3h5L2NvcmUvYmxvYi9tYWluL2RvY2tlci9iYWNrdXAvUkVBRE1FLm1kIgoKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgIyBDUklUSUNBTDogYSBzdWNjZXNzZnVsIGJhY2t1cCBleGlzdHMgYnV0IGlzIG91dHNpZGUgdGhlIGV4cGVjdGVkIHdpbmRvdy4KICAgICAgIwogICAgICAjIEdhdGVkIG9uIGJhY2t1cF9sYXN0X3N1Y2Nlc3Nfa25vd24gPT0gMSBiZWNhdXNlCiAgICAgICMgYmFja3VwX2xhc3Rfc3VjY2Vzc19hZ2Vfc2Vjb25kcyBpcyBOYU4gd2hlbiBub3RoaW5nIGlzIGtub3duLCBhbmQgbm8KICAgICAgIyBudW1lcmljIGNvbXBhcmlzb24gY2F0Y2hlcyBOYU4uCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBCYWNrdXBTdGFsZQogICAgICAgIGV4cHI6IGJhY2t1cF9zdGFsZSA9PSAxIGFuZCBiYWNrdXBfbGFzdF9zdWNjZXNzX2tub3duID09IDEKICAgICAgICBmb3I6IDE1bQogICAgICAgIGxhYmVsczoKICAgICAgICAgIHNldmVyaXR5OiBjcml0aWNhbAogICAgICAgICAgdGVhbTogcGxhdGZvcm0KICAgICAgICBhbm5vdGF0aW9uczoKICAgICAgICAgIHN1bW1hcnk6ICJMTEFQIGJhY2t1cCBpcyBzdGFsZSDigJQgbGFzdCBzdWNjZXNzIGlzIG91dHNpZGUgdGhlIGV4cGVjdGVkIHdpbmRvdyIKICAgICAgICAgIGRlc2NyaXB0aW9uOiAiVGhlIG5ld2VzdCBzdWNjZXNzZnVsIGJhY2t1cCBpcyBvbGRlciB0aGFuIHRoZSBzdGFsZW5lc3MgYm91bmQgZGVyaXZlZCBmcm9tIEJBQ0tVUF9TQ0hFRFVMRS4iCiAgICAgICAgICBydW5ib29rOiAiaHR0cHM6Ly9naXRodWIuY29tL0xMTS1BUEktUHJveHkvY29yZS9ibG9iL21haW4vZG9ja2VyL2JhY2t1cC9SRUFETUUubWQiCgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIENSSVRJQ0FMOiB0aGUgbW9zdCByZWNlbnQgYmFja3VwIHJ1biByZXBvcnRlZCBmYWlsdXJlLgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBMTEFQQmFja3VwTGFzdFJ1bkZhaWxlZAogICAgICAgIGV4cHI6IGJhY2t1cF9sYXN0X3J1bl9mYWlsZWQgPT0gMQogICAgICAgIGZvcjogMTBtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIkxMQVAgbGFzdCBiYWNrdXAgcnVuIGZhaWxlZCIKICAgICAgICAgIGRlc2NyaXB0aW9uOiAiVGhlIG1vc3QgcmVjZW50bHkgcmVjb3JkZWQgYmFja3VwIGpvYiBmaW5pc2hlZCB3aXRoIHN0YXR1cyBmYWlsZWQuIgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vZ2l0aHViLmNvbS9MTE0tQVBJLVByb3h5L2NvcmUvYmxvYi9tYWluL2RvY2tlci9iYWNrdXAvUkVBRE1FLm1kIgoKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgIyBXQVJOSU5HOiBhZ2VudCBoZWFydGJlYXQgc3RhbGUuCiAgICAgICMKICAgICAgIyBMaXZlbmVzcyBvbmx5LiBLZXB0IGF0IHdhcm5pbmcgc2V2ZXJpdHkgcHJlY2lzZWx5IHNvIHRoYXQgbm9ib2R5IHRyZWF0cwogICAgICAjIGEgZ3JlZW4gdmVyc2lvbiBvZiB0aGlzIGFsZXJ0IGFzIHByb29mIHRoYXQgYmFja3VwcyBhcmUgd29ya2luZy4KICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgLSBhbGVydDogTExBUEJhY2t1cEFnZW50T2ZmbGluZQogICAgICAgIGV4cHI6IGJhY2t1cF9hZ2VudF9vbmxpbmUgPT0gMAogICAgICAgIGZvcjogMTVtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBiYWNrdXAgYWdlbnQgaGVhcnRiZWF0IHN0YWxlIG9yIGFic2VudCIKICAgICAgICAgIGRlc2NyaXB0aW9uOiAiVGhlIGJhY2t1cCBhZ2VudCBoYXMgbm90IHdyaXR0ZW4gYSBDb25zdWwgaGVhcnRiZWF0IGZvciAxNSsgbWludXRlcy4gVGhpcyBpcyBMSVZFTkVTUyBvbmx5LiIKICAgICAgICAgIHJ1bmJvb2s6ICJodHRwczovL2dpdGh1Yi5jb20vTExNLUFQSS1Qcm94eS9jb3JlL2Jsb2IvbWFpbi9kb2NrZXIvYmFja3VwL1JFQURNRS5tZCIKCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgQ1JJVElDQUw6IHRoZSBiYWNrdXAgbWV0cmljcyB0aGVtc2VsdmVzIGFyZSBtaXNzaW5nLgogICAgICAjCiAgICAgICMgV2l0aG91dCB0aGlzLCBhIHByb3h5IHRoYXQgc3RvcHMgZXhwb3J0aW5nIGJhY2t1cCBtZXRyaWNzIHNpbGVudGx5CiAgICAgICMgZGlzYWJsZXMgZXZlcnkgcnVsZSBhYm92ZSDigJQgdGhlIHNhbWUgY2xhc3Mgb2YgaW52aXNpYmxlIGZhaWx1cmUuCiAgICAgICMKICAgICAgIyBTZXZlcml0eSBpcyBDUklUSUNBTCwgbm90IHdhcm5pbmc6IHdoaWxlIHRoaXMgZmlyZXMsIGV2ZXJ5IGNyaXRpY2FsCiAgICAgICMgYmFja3VwIGFsZXJ0IGlzIGluZXJ0LiAiVGhlIGFsZXJ0aW5nIGlzIG9mZiIgaXMgZXhhY3RseSBhcyBzZXZlcmUgYXMgdGhlCiAgICAgICMgdGhpbmcgaXQgd291bGQgaGF2ZSBhbGVydGVkIG9uLCBhbmQgYSB3YXJuaW5nLXNldmVyaXR5IG1ldGEtYWxlcnQgaXMgaG93CiAgICAgICMgYSBtb25pdG9yaW5nIGdhcCBzdGF5cyBhIG1vbml0b3JpbmcgZ2FwLgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBMTEFQQmFja3VwTWV0cmljc0Fic2VudAogICAgICAgIGV4cHI6IGFic2VudChiYWNrdXBfbGFzdF9zdWNjZXNzX2tub3duKQogICAgICAgIGZvcjogMTVtCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IGNyaXRpY2FsCiAgICAgICAgICB0ZWFtOiBwbGF0Zm9ybQogICAgICAgIGFubm90YXRpb25zOgogICAgICAgICAgc3VtbWFyeTogIkxMQVAgYmFja3VwIG1ldHJpY3MgYWJzZW50IOKAlCBiYWNrdXAgYWxlcnRpbmcgaXMgaW5hY3RpdmUiCiAgICAgICAgICBkZXNjcmlwdGlvbjogImJhY2t1cF9sYXN0X3N1Y2Nlc3Nfa25vd24gaXMgYWJzZW50LCBzbyBldmVyeSBiYWNrdXAgYWxlcnQgaXMgc2lsZW50bHkgaW5lcnQuIgogICAgICAgICAgcnVuYm9vazogImh0dHBzOi8vZ2l0aHViLmNvbS9MTE0tQVBJLVByb3h5L2NvcmUvYmxvYi9tYWluL2RvY2tlci9iYWNrdXAvUkVBRE1FLm1kIgoKICAgICAgIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KICAgICAgIyBXQVJOSU5HOiBubyByZXN0b3JlIHJlaGVhcnNhbCBoYXMgZXZlciBiZWVuIHJlY29yZGVkLgogICAgICAjCiAgICAgICMgSXNzdWUgIzE3NTggcmVxdWlyZW1lbnQgNTogImEgYmFja3VwIHRoYXQgY2Fubm90IGJlIHJlc3RvcmVkIGlzIHRyZWF0ZWQKICAgICAgIyBhcyBubyBiYWNrdXAiLiBBIHNuYXBzaG90IHRoYXQgaGFzIG5ldmVyIGJlZW4gcmVzdG9yZWQgaXMgYW4gdW50ZXN0ZWQKICAgICAgIyByZWNvdmVyeSBwb2ludCwgbm90IGEgcHJvdmVuIG9uZS4KICAgICAgIwogICAgICAjIFNldmVyaXR5IGlzIFdBUk5JTkcgcmF0aGVyIHRoYW4gY3JpdGljYWwsIGRlbGliZXJhdGVseS4gVGhpcyBnYXVnZSByZWFkcwogICAgICAjIDAgb24gZXZlcnkgZGVwbG95bWVudCB0aGF0IGhhcyBub3QgeWV0IHJlaGVhcnNlZCwgd2hpY2ggdG9kYXkgaXMgYWxsIG9mCiAgICAgICMgdGhlbSDigJQgYSBjcml0aWNhbCB0aGF0IGZpcmVzIG9uIDEwMCUgb2YgaW5zdGFsbHMgZnJvbSB0aGUgbW9tZW50IGl0CiAgICAgICMgc2hpcHMgZ2V0cyBtdXRlZCwgYW5kIGEgbXV0ZWQgYWxlcnQgaXMgdGhlICMxNzU4IGZhaWx1cmUgbW9kZSB3aXRoIGV4dHJhCiAgICAgICMgc3RlcHMuIEl0IGJlY29tZXMgYSBjYW5kaWRhdGUgZm9yIGNyaXRpY2FsIG9uY2UgdGhlIEFVVE9NQVRFRCBzY2hlZHVsZWQKICAgICAgIyByZWhlYXJzYWwgbGFuZHMgYW5kIGEgY2xlYW4gc2lnbmFsIGlzIHRoZSBub3JtLgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBMTEFQQmFja3VwUmVzdG9yZU5ldmVyUmVoZWFyc2VkCiAgICAgICAgZXhwcjogYmFja3VwX3Jlc3RvcmVfcmVoZWFyc2FsX2tub3duID09IDAKICAgICAgICBmb3I6IDFoCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBiYWNrdXAgcmVzdG9yZSBoYXMgbmV2ZXIgYmVlbiByZWhlYXJzZWQiCiAgICAgICAgICBkZXNjcmlwdGlvbjogIk5vIHJlc3RvcmUgcmVoZWFyc2FsIGhhcyBldmVyIGJlZW4gcHVibGlzaGVkOyB0aGUgc25hcHNob3RzIGFyZSBhbiBVTlRFU1RFRCByZWNvdmVyeSBwb2ludC4iCiAgICAgICAgICBydW5ib29rOiAiaHR0cHM6Ly9naXRodWIuY29tL0xMTS1BUEktUHJveHkvY29yZS9ibG9iL21haW4vZG9ja2VyL2JhY2t1cC9SRUFETUUubWQiCgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAjIFdBUk5JTkc6IHRoZSBsYXN0IHJlc3RvcmUgcmVoZWFyc2FsIGlzIHRvbyBvbGQuCiAgICAgICMKICAgICAgIyBHYXRlZCBvbiBiYWNrdXBfcmVzdG9yZV9yZWhlYXJzYWxfa25vd24gPT0gMSBmb3IgdGhlIHNhbWUgcmVhc29uCiAgICAgICMgTExBUEJhY2t1cFN0YWxlIGlzIGdhdGVkOiBiYWNrdXBfbGFzdF9yZXN0b3JlX3JlaGVhcnNhbF9hZ2Vfc2Vjb25kcyBpcwogICAgICAjIE5hTiB3aGVuIG5vdGhpbmcgaXMga25vd24sIGFuZCBubyBudW1lcmljIGNvbXBhcmlzb24gY2F0Y2hlcyBOYU4uCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgIC0gYWxlcnQ6IExMQVBCYWNrdXBSZXN0b3JlUmVoZWFyc2FsU3RhbGUKICAgICAgICBleHByOiA+LQogICAgICAgICAgYmFja3VwX3Jlc3RvcmVfcmVoZWFyc2FsX2tub3duID09IDEKICAgICAgICAgIGFuZCBiYWNrdXBfbGFzdF9yZXN0b3JlX3JlaGVhcnNhbF9hZ2Vfc2Vjb25kcyA+IDI1OTIwMDAKICAgICAgICBmb3I6IDFoCiAgICAgICAgbGFiZWxzOgogICAgICAgICAgc2V2ZXJpdHk6IHdhcm5pbmcKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBiYWNrdXAgcmVzdG9yZSByZWhlYXJzYWwgaXMgb2xkZXIgdGhhbiAzMCBkYXlzIgogICAgICAgICAgZGVzY3JpcHRpb246ICJUaGUgbmV3ZXN0IHN1Y2Nlc3NmdWwgcmVzdG9yZSByZWhlYXJzYWwgaXMgbW9yZSB0aGFuIDMwIGRheXMgb2xkLiIKICAgICAgICAgIHJ1bmJvb2s6ICJodHRwczovL2dpdGh1Yi5jb20vTExNLUFQSS1Qcm94eS9jb3JlL2Jsb2IvbWFpbi9kb2NrZXIvYmFja3VwL1JFQURNRS5tZCIKCiAgICAgICMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCiAgICAgICMgQ1JJVElDQUw6IHRoZSBtb3N0IHJlY2VudCByZXN0b3JlIHJlaGVhcnNhbCBGQUlMRUQuCiAgICAgICMKICAgICAgIyBBIGJhY2t1cCB0aGF0IGRlbW9uc3RyYWJseSBjYW5ub3QgYmUgcmVzdG9yZWQgaXMgbm90IGEgcmVjb3ZlcnkgcG9pbnQuCiAgICAgICMgVGhpcyBvbmUgSVMgY3JpdGljYWw6IHVubGlrZSAibmV2ZXIgcmVoZWFyc2VkIiwgaXQgb25seSBmaXJlcyBvbiBhCiAgICAgICMgZGVwbG95bWVudCB0aGF0IHJhbiBhIHJlaGVhcnNhbCBhbmQgZ290IGEgbmVnYXRpdmUgYW5zd2VyLgogICAgICAjIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICAgICAtIGFsZXJ0OiBMTEFQQmFja3VwUmVzdG9yZVJlaGVhcnNhbEZhaWxlZAogICAgICAgIGV4cHI6IGJhY2t1cF9sYXN0X3Jlc3RvcmVfcmVoZWFyc2FsX2ZhaWxlZCA9PSAxCiAgICAgICAgZm9yOiAxMG0KICAgICAgICBsYWJlbHM6CiAgICAgICAgICBzZXZlcml0eTogY3JpdGljYWwKICAgICAgICAgIHRlYW06IHBsYXRmb3JtCiAgICAgICAgYW5ub3RhdGlvbnM6CiAgICAgICAgICBzdW1tYXJ5OiAiTExBUCBiYWNrdXAgcmVzdG9yZSByZWhlYXJzYWwgRkFJTEVEIOKAlCB0aGUgcmVjb3ZlcnkgcG9pbnQgaXMgdW5wcm92ZW4iCiAgICAgICAgICBkZXNjcmlwdGlvbjogIlRoZSBtb3N0IHJlY2VudCByZXN0b3JlIHJlaGVhcnNhbCBkaWQgbm90IHJlc3RvcmUgY2xlYW5seS4iCiAgICAgICAgICBydW5ib29rOiAiaHR0cHM6Ly9naXRodWIuY29tL0xMTS1BUEktUHJveHkvY29yZS9ibG9iL21haW4vZG9ja2VyL2JhY2t1cC9SRUFETUUubWQiCg=="
 # FILE: docker/grafana/provisioning/dashboards/dashboard.yml
 EMBED_grafana_dashboard_yml="IyBkb2NrZXIvZ3JhZmFuYS9wcm92aXNpb25pbmcvZGFzaGJvYXJkcy9kYXNoYm9hcmQueW1sCiMgR3JhZmFuYSBkYXNoYm9hcmQgcHJvdmlkZXIgY29uZmlndXJhdGlvbi4KCmFwaVZlcnNpb246IDEKCnByb3ZpZGVyczoKICAtIG5hbWU6ICdsbG0tYXBpLXByb3h5JwogICAgb3JnSWQ6IDEKICAgIGZvbGRlcjogJ0xMTSBBUEkgUHJveHknCiAgICB0eXBlOiBmaWxlCiAgICBkaXNhYmxlRGVsZXRpb246IGZhbHNlCiAgICB1cGRhdGVJbnRlcnZhbFNlY29uZHM6IDMwCiAgICBvcHRpb25zOgogICAgICBwYXRoOiAvZXRjL2dyYWZhbmEvcHJvdmlzaW9uaW5nL2Rhc2hib2FyZHMK"
 # FILE: docker/grafana/provisioning/dashboards/proxy.json
 EMBED_grafana_proxy_json="ewogICJfX2lucHV0cyI6IFtdLAogICJfX3JlcXVpcmVzIjogWwogICAgewogICAgICAidHlwZSI6ICJncmFmYW5hIiwKICAgICAgImlkIjogImdyYWZhbmEiLAogICAgICAibmFtZSI6ICJHcmFmYW5hIiwKICAgICAgInZlcnNpb24iOiAiOS4wLjAiCiAgICB9LAogICAgewogICAgICAidHlwZSI6ICJkYXRhc291cmNlIiwKICAgICAgImlkIjogInByb21ldGhldXMiLAogICAgICAibmFtZSI6ICJQcm9tZXRoZXVzIiwKICAgICAgInZlcnNpb24iOiAiMS4wLjAiCiAgICB9CiAgXSwKICAiYW5ub3RhdGlvbnMiOiB7CiAgICAibGlzdCI6IFtdCiAgfSwKICAiZGVzY3JpcHRpb24iOiAiTExNIEFQSSBQcm94eSDigJQgb3ZlcnZpZXcgZGFzaGJvYXJkIiwKICAiZWRpdGFibGUiOiB0cnVlLAogICJmaXNjYWxZZWFyU3RhcnRNb250aCI6IDAsCiAgImdyYXBoVG9vbHRpcCI6IDAsCiAgImlkIjogbnVsbCwKICAibGlua3MiOiBbXSwKICAicGFuZWxzIjogWwogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInJlcXBzIgogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDgsICJ3IjogMTIsICJ4IjogMCwgInkiOiAwIH0sCiAgICAgICJpZCI6IDEsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJsZWdlbmQiOiB7ICJkaXNwbGF5TW9kZSI6ICJsaXN0IiwgInBsYWNlbWVudCI6ICJib3R0b20iIH0sCiAgICAgICAgInRvb2x0aXAiOiB7ICJtb2RlIjogInNpbmdsZSIgfQogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJyYXRlKHByb3h5X3JlcXVlc3RzX3RvdGFsWzVtXSkiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJ7e3Byb3ZpZGVyfX0gLyB7e21vZGVsfX0gLyB7e3N0YXR1c19jb2RlfX0iLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiUHJveHkgUmVxdWVzdCBSYXRlIChyZXEvcykiLAogICAgICAidHlwZSI6ICJ0aW1lc2VyaWVzIgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7ICJtb2RlIjogInBhbGV0dGUtY2xhc3NpYyIgfSwKICAgICAgICAgICJjdXN0b20iOiB7ICJsaW5lV2lkdGgiOiAxIH0sCiAgICAgICAgICAidW5pdCI6ICJzIgogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDgsICJ3IjogMTIsICJ4IjogMTIsICJ5IjogMCB9LAogICAgICAiaWQiOiAyLAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAibGVnZW5kIjogeyAiZGlzcGxheU1vZGUiOiAibGlzdCIsICJwbGFjZW1lbnQiOiAiYm90dG9tIiB9LAogICAgICAgICJ0b29sdGlwIjogeyAibW9kZSI6ICJzaW5nbGUiIH0KICAgICAgfSwKICAgICAgInRhcmdldHMiOiBbCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAiaGlzdG9ncmFtX3F1YW50aWxlKDAuOTksIHJhdGUocHJveHlfcmVxdWVzdF9kdXJhdGlvbl9zZWNvbmRzX2J1Y2tldFs1bV0pKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogInA5OSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9LAogICAgICAgIHsKICAgICAgICAgICJleHByIjogImhpc3RvZ3JhbV9xdWFudGlsZSgwLjUwLCByYXRlKHByb3h5X3JlcXVlc3RfZHVyYXRpb25fc2Vjb25kc19idWNrZXRbNW1dKSkiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJwNTAiLAogICAgICAgICAgInJlZklkIjogIkIiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiUHJveHkgUmVxdWVzdCBMYXRlbmN5IChwNTAvcDk5KSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInMiCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogOCwgInciOiAxMiwgIngiOiAwLCAieSI6IDggfSwKICAgICAgImlkIjogMywKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgImxlZ2VuZCI6IHsgImRpc3BsYXlNb2RlIjogImxpc3QiLCAicGxhY2VtZW50IjogImJvdHRvbSIgfSwKICAgICAgICAidG9vbHRpcCI6IHsgIm1vZGUiOiAic2luZ2xlIiB9CiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImhpc3RvZ3JhbV9xdWFudGlsZSgwLjk5LCByYXRlKHByb3h5X3R0ZnRfc2Vjb25kc19idWNrZXRbNW1dKSkiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJUVEZUIHA5OSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9LAogICAgICAgIHsKICAgICAgICAgICJleHByIjogImhpc3RvZ3JhbV9xdWFudGlsZSgwLjUwLCByYXRlKHByb3h5X3R0ZnRfc2Vjb25kc19idWNrZXRbNW1dKSkiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJUVEZUIHA1MCIsCiAgICAgICAgICAicmVmSWQiOiAiQiIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJUaW1lIHRvIEZpcnN0IFRva2VuIChUVEZUKSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInJlcXBzIgogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDgsICJ3IjogMTIsICJ4IjogMTIsICJ5IjogOCB9LAogICAgICAiaWQiOiA0LAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAibGVnZW5kIjogeyAiZGlzcGxheU1vZGUiOiAibGlzdCIsICJwbGFjZW1lbnQiOiAiYm90dG9tIiB9LAogICAgICAgICJ0b29sdGlwIjogeyAibW9kZSI6ICJzaW5nbGUiIH0KICAgICAgfSwKICAgICAgInRhcmdldHMiOiBbCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAicmF0ZShwcm94eV9yZXF1ZXN0c190b3RhbHtzdGF0dXNfY29kZT1+XCI1Li5cIn1bNW1dKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogIjV4eCBlcnJvcnMgKHt7cHJvdmlkZXJ9fSkiLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiUHJveHkgRXJyb3IgUmF0ZSAoNXh4KSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiY29sbGFwc2VkIjogZmFsc2UsCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDEsICJ3IjogMjQsICJ4IjogMCwgInkiOiAxNiB9LAogICAgICAiaWQiOiAxMCwKICAgICAgInRpdGxlIjogIlRyYXAgU3lzdGVtIiwKICAgICAgInR5cGUiOiAicm93IgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7ICJtb2RlIjogInBhbGV0dGUtY2xhc3NpYyIgfSwKICAgICAgICAgICJjdXN0b20iOiB7ICJsaW5lV2lkdGgiOiAxIH0sCiAgICAgICAgICAidW5pdCI6ICJyZXFwcyIKICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA4LCAidyI6IDEyLCAieCI6IDAsICJ5IjogMTcgfSwKICAgICAgImlkIjogMTEsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJsZWdlbmQiOiB7ICJkaXNwbGF5TW9kZSI6ICJsaXN0IiwgInBsYWNlbWVudCI6ICJib3R0b20iIH0sCiAgICAgICAgInRvb2x0aXAiOiB7ICJtb2RlIjogInNpbmdsZSIgfQogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJyYXRlKHByb3h5X3RyYXBfZGV0ZWN0aW9uc190b3RhbFs1bV0pIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAie3twcm92aWRlcn19IC8ge3tjYXRlZ29yeX19IiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIlRyYXAgRGV0ZWN0aW9uIFJhdGUiLAogICAgICAidHlwZSI6ICJ0aW1lc2VyaWVzIgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7ICJtb2RlIjogInBhbGV0dGUtY2xhc3NpYyIgfSwKICAgICAgICAgICJ0aHJlc2hvbGRzIjogewogICAgICAgICAgICAibW9kZSI6ICJhYnNvbHV0ZSIsCiAgICAgICAgICAgICJzdGVwcyI6IFsKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJ5ZWxsb3ciLCAidmFsdWUiOiAxMCB9LAogICAgICAgICAgICAgIHsgImNvbG9yIjogInJlZCIsICJ2YWx1ZSI6IDUwIH0KICAgICAgICAgICAgXQogICAgICAgICAgfQogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDgsICJ3IjogMTIsICJ4IjogMTIsICJ5IjogMTcgfSwKICAgICAgImlkIjogMTIsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJjb2xvck1vZGUiOiAidmFsdWUiLAogICAgICAgICJncmFwaE1vZGUiOiAiYXJlYSIsCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJyZWR1Y2VPcHRpb25zIjogeyAiY2FsY3MiOiBbImxhc3ROb3ROdWxsIl0sICJmaWVsZHMiOiAiIiwgInZhbHVlcyI6IGZhbHNlIH0sCiAgICAgICAgInRleHRNb2RlIjogImF1dG8iCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogInByb3h5X3RyYXBfcGF0dGVybnNfYWN0aXZlIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAie3tzdGF0dXN9fSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJBY3RpdmUgVHJhcCBQYXR0ZXJucyBieSBTdGF0dXMiLAogICAgICAidHlwZSI6ICJzdGF0IgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7ICJtb2RlIjogInBhbGV0dGUtY2xhc3NpYyIgfSwKICAgICAgICAgICJjdXN0b20iOiB7ICJsaW5lV2lkdGgiOiAxIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIKICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA4LCAidyI6IDgsICJ4IjogMCwgInkiOiAyNSB9LAogICAgICAiaWQiOiAxMywKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgImxlZ2VuZCI6IHsgImRpc3BsYXlNb2RlIjogImxpc3QiLCAicGxhY2VtZW50IjogImJvdHRvbSIgfSwKICAgICAgICAidG9vbHRpcCI6IHsgIm1vZGUiOiAic2luZ2xlIiB9CiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogInJhdGUocHJveHlfdHJhcF9jaGFubmVsX2Ryb3BzX3RvdGFsWzVtXSkiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJkcm9wcy9zIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0sCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAicmF0ZShwcm94eV90cmFwX3BhdHRlcm5fY3JlYXRpb25zX3Rocm90dGxlZF90b3RhbFs1bV0pIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAidGhyb3R0bGUvcyIsCiAgICAgICAgICAicmVmSWQiOiAiQiIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJDaGFubmVsIERyb3BzICYgVGhyb3R0bGUgUmF0ZSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInMiCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogOCwgInciOiA4LCAieCI6IDgsICJ5IjogMjUgfSwKICAgICAgImlkIjogMTQsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJsZWdlbmQiOiB7ICJkaXNwbGF5TW9kZSI6ICJsaXN0IiwgInBsYWNlbWVudCI6ICJib3R0b20iIH0sCiAgICAgICAgInRvb2x0aXAiOiB7ICJtb2RlIjogInNpbmdsZSIgfQogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJoaXN0b2dyYW1fcXVhbnRpbGUoMC45OSwgcmF0ZShwcm94eV90cmFwX2RldGVjdGlvbl9kdXJhdGlvbl9zZWNvbmRzX2J1Y2tldFs1bV0pKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogInA5OSB7e3Byb3ZpZGVyfX0iLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfSwKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJoaXN0b2dyYW1fcXVhbnRpbGUoMC41MCwgcmF0ZShwcm94eV90cmFwX2RldGVjdGlvbl9kdXJhdGlvbl9zZWNvbmRzX2J1Y2tldFs1bV0pKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogInA1MCB7e3Byb3ZpZGVyfX0iLAogICAgICAgICAgInJlZklkIjogIkIiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiVHJhcCBEZXRlY3Rpb24gTGF0ZW5jeSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInJlcXBzIgogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDgsICJ3IjogOCwgIngiOiAxNiwgInkiOiAyNSB9LAogICAgICAiaWQiOiAxNSwKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgImxlZ2VuZCI6IHsgImRpc3BsYXlNb2RlIjogImxpc3QiLCAicGxhY2VtZW50IjogImJvdHRvbSIgfSwKICAgICAgICAidG9vbHRpcCI6IHsgIm1vZGUiOiAic2luZ2xlIiB9CiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogInJhdGUocHJveHlfdHJhcF9pc3N1ZXNfZmlsZWRfdG90YWxbNW1dKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogInt7cHJvdmlkZXJ9fSAvIHt7cmVwb3NpdG9yeX19IiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0sCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAicmF0ZShwcm94eV90cmFwX2lzc3VlX2ZpbGluZ19lcnJvcnNfdG90YWxbNW1dKSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogImVycm9ycyAoe3tlcnJvcl90eXBlfX0pIiwKICAgICAgICAgICJyZWZJZCI6ICJCIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkdpdEh1YiBJc3N1ZSBGaWxpbmcgUmF0ZSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9CiAgXSwKICAicmVmcmVzaCI6ICIzMHMiLAogICJzY2hlbWFWZXJzaW9uIjogMzgsCiAgInRhZ3MiOiBbImxsbSIsICJwcm94eSJdLAogICJ0aW1lIjogeyAiZnJvbSI6ICJub3ctMWgiLCAidG8iOiAibm93IiB9LAogICJ0aW1lcGlja2VyIjoge30sCiAgInRpbWV6b25lIjogImJyb3dzZXIiLAogICJ0aXRsZSI6ICJMTE0gQVBJIFByb3h5IE92ZXJ2aWV3IiwKICAidWlkIjogImxsbS1hcGktcHJveHktb3ZlcnZpZXciLAogICJ2ZXJzaW9uIjogMgp9Cg=="
 # FILE: docker/grafana/provisioning/dashboards/backup-health.json
-EMBED_grafana_backup_health_json="ewogICJfX2lucHV0cyI6IFtdLAogICJfX3JlcXVpcmVzIjogWwogICAgewogICAgICAidHlwZSI6ICJncmFmYW5hIiwKICAgICAgImlkIjogImdyYWZhbmEiLAogICAgICAibmFtZSI6ICJHcmFmYW5hIiwKICAgICAgInZlcnNpb24iOiAiOS4wLjAiCiAgICB9LAogICAgewogICAgICAidHlwZSI6ICJkYXRhc291cmNlIiwKICAgICAgImlkIjogInByb21ldGhldXMiLAogICAgICAibmFtZSI6ICJQcm9tZXRoZXVzIiwKICAgICAgInZlcnNpb24iOiAiMS4wLjAiCiAgICB9CiAgXSwKICAiYW5ub3RhdGlvbnMiOiB7CiAgICAibGlzdCI6IFtdCiAgfSwKICAiZGVzY3JpcHRpb24iOiAiTExNIEFQSSBQcm94eSDigJQgYmFja3VwIGFnZW50IGhlYWx0aDogbGl2ZW5lc3MsIGxhc3Qtc3VjY2VzcyBhZ2UsIGFuZCBmYWlsdXJlIHN0YXRlIiwKICAiZWRpdGFibGUiOiB0cnVlLAogICJmaXNjYWxZZWFyU3RhcnRNb250aCI6IDAsCiAgImdyYXBoVG9vbHRpcCI6IDAsCiAgImlkIjogbnVsbCwKICAibGlua3MiOiBbXSwKICAicGFuZWxzIjogWwogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsKICAgICAgICAgICAgIm1vZGUiOiAidGhyZXNob2xkcyIKICAgICAgICAgIH0sCiAgICAgICAgICAidGhyZXNob2xkcyI6IHsKICAgICAgICAgICAgIm1vZGUiOiAiYWJzb2x1dGUiLAogICAgICAgICAgICAic3RlcHMiOiBbCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAicmVkIiwgInZhbHVlIjogbnVsbCB9LAogICAgICAgICAgICAgIHsgImNvbG9yIjogImdyZWVuIiwgInZhbHVlIjogMSB9CiAgICAgICAgICAgIF0KICAgICAgICAgIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIsCiAgICAgICAgICAibWFwcGluZ3MiOiBbCiAgICAgICAgICAgIHsgInR5cGUiOiAidmFsdWUiLCAib3B0aW9ucyI6IHsgIjAiOiB7ICJ0ZXh0IjogIk9GRkxJTkUiIH0sICIxIjogeyAidGV4dCI6ICJPTkxJTkUiIH0gfSB9CiAgICAgICAgICBdCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogNCwgInciOiA4LCAieCI6IDAsICJ5IjogMCB9LAogICAgICAiaWQiOiAxLAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAicmVkdWNlT3B0aW9ucyI6IHsgImNhbGNzIjogWyJsYXN0Tm90TnVsbCJdIH0sCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJ0ZXh0TW9kZSI6ICJhdXRvIiwKICAgICAgICAiY29sb3JNb2RlIjogImJhY2tncm91bmQiCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9hZ2VudF9vbmxpbmUiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJBZ2VudCBPbmxpbmUiLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiQmFja3VwIEFnZW50IExpdmVuZXNzIiwKICAgICAgInR5cGUiOiAic3RhdCIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogewogICAgICAgICAgICAibW9kZSI6ICJ0aHJlc2hvbGRzIgogICAgICAgICAgfSwKICAgICAgICAgICJ0aHJlc2hvbGRzIjogewogICAgICAgICAgICAibW9kZSI6ICJhYnNvbHV0ZSIsCiAgICAgICAgICAgICJzdGVwcyI6IFsKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJ5ZWxsb3ciLCAidmFsdWUiOiA4NjQwMCB9LAogICAgICAgICAgICAgIHsgImNvbG9yIjogInJlZCIsICJ2YWx1ZSI6IDE3MjgwMCB9CiAgICAgICAgICAgIF0KICAgICAgICAgIH0sCiAgICAgICAgICAidW5pdCI6ICJzIgogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDQsICJ3IjogOCwgIngiOiA4LCAieSI6IDAgfSwKICAgICAgImlkIjogMiwKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgInJlZHVjZU9wdGlvbnMiOiB7ICJjYWxjcyI6IFsibGFzdE5vdE51bGwiXSB9LAogICAgICAgICJvcmllbnRhdGlvbiI6ICJhdXRvIiwKICAgICAgICAidGV4dE1vZGUiOiAiYXV0byIsCiAgICAgICAgImNvbG9yTW9kZSI6ICJiYWNrZ3JvdW5kIgogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJiYWNrdXBfbGFzdF9zdWNjZXNzX2FnZV9zZWNvbmRzIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAiTGFzdCBTdWNjZXNzIEFnZSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJMYXN0IFN1Y2Nlc3NmdWwgQmFja3VwIEFnZSIsCiAgICAgICJ0eXBlIjogInN0YXQiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsKICAgICAgICAgICAgIm1vZGUiOiAidGhyZXNob2xkcyIKICAgICAgICAgIH0sCiAgICAgICAgICAidGhyZXNob2xkcyI6IHsKICAgICAgICAgICAgIm1vZGUiOiAiYWJzb2x1dGUiLAogICAgICAgICAgICAic3RlcHMiOiBbCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAiZ3JlZW4iLCAidmFsdWUiOiBudWxsIH0sCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAicmVkIiwgInZhbHVlIjogMSB9CiAgICAgICAgICAgIF0KICAgICAgICAgIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIsCiAgICAgICAgICAibWFwcGluZ3MiOiBbCiAgICAgICAgICAgIHsgInR5cGUiOiAidmFsdWUiLCAib3B0aW9ucyI6IHsgIjAiOiB7ICJ0ZXh0IjogIk9LIiB9LCAiMSI6IHsgInRleHQiOiAiRkFJTEVEIiB9IH0gfQogICAgICAgICAgXQogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDQsICJ3IjogOCwgIngiOiAxNiwgInkiOiAwIH0sCiAgICAgICJpZCI6IDMsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJyZWR1Y2VPcHRpb25zIjogeyAiY2FsY3MiOiBbImxhc3ROb3ROdWxsIl0gfSwKICAgICAgICAib3JpZW50YXRpb24iOiAiYXV0byIsCiAgICAgICAgInRleHRNb2RlIjogImF1dG8iLAogICAgICAgICJjb2xvck1vZGUiOiAiYmFja2dyb3VuZCIKICAgICAgfSwKICAgICAgInRhcmdldHMiOiBbCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAiYmFja3VwX2xhc3RfcnVuX2ZhaWxlZCIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogIkxhc3QgUnVuIEZhaWxlZCIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJMYXN0IEJhY2t1cCBSdW4gU3RhdHVzIiwKICAgICAgInR5cGUiOiAic3RhdCIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogeyAibW9kZSI6ICJwYWxldHRlLWNsYXNzaWMiIH0sCiAgICAgICAgICAiY3VzdG9tIjogeyAibGluZVdpZHRoIjogMSB9LAogICAgICAgICAgInVuaXQiOiAic2hvcnQiCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogOCwgInciOiAxMiwgIngiOiAwLCAieSI6IDQgfSwKICAgICAgImlkIjogNCwKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgImxlZ2VuZCI6IHsgImRpc3BsYXlNb2RlIjogImxpc3QiLCAicGxhY2VtZW50IjogImJvdHRvbSIgfSwKICAgICAgICAidG9vbHRpcCI6IHsgIm1vZGUiOiAic2luZ2xlIiB9CiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9hZ2VudF9vbmxpbmUiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJBZ2VudCBPbmxpbmUgKDE9eWVzKSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJCYWNrdXAgQWdlbnQgTGl2ZW5lc3MgT3ZlciBUaW1lIiwKICAgICAgInR5cGUiOiAidGltZXNlcmllcyIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogeyAibW9kZSI6ICJwYWxldHRlLWNsYXNzaWMiIH0sCiAgICAgICAgICAiY3VzdG9tIjogeyAibGluZVdpZHRoIjogMSB9LAogICAgICAgICAgInVuaXQiOiAicyIKICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA4LCAidyI6IDEyLCAieCI6IDEyLCAieSI6IDQgfSwKICAgICAgImlkIjogNSwKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgImxlZ2VuZCI6IHsgImRpc3BsYXlNb2RlIjogImxpc3QiLCAicGxhY2VtZW50IjogImJvdHRvbSIgfSwKICAgICAgICAidG9vbHRpcCI6IHsgIm1vZGUiOiAic2luZ2xlIiB9CiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9sYXN0X3N1Y2Nlc3NfYWdlX3NlY29uZHMiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJTZWNvbmRzIHNpbmNlIGxhc3Qgc3VjY2VzcyIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJMYXN0IFN1Y2Nlc3NmdWwgQmFja3VwIEFnZSBPdmVyIFRpbWUiLAogICAgICAidHlwZSI6ICJ0aW1lc2VyaWVzIgogICAgfQogIF0sCiAgInJlZnJlc2giOiAiNjBzIiwKICAic2NoZW1hVmVyc2lvbiI6IDM4LAogICJ0YWdzIjogWyJsbG0iLCAicHJveHkiLCAiYmFja3VwIl0sCiAgInRpbWUiOiB7ICJmcm9tIjogIm5vdy02aCIsICJ0byI6ICJub3ciIH0sCiAgInRpbWVwaWNrZXIiOiB7fSwKICAidGltZXpvbmUiOiAiYnJvd3NlciIsCiAgInRpdGxlIjogIkxMTSBBUEkgUHJveHkg4oCUIEJhY2t1cCBIZWFsdGgiLAogICJ1aWQiOiAibGxtLWFwaS1wcm94eS1iYWNrdXAtaGVhbHRoIiwKICAidmVyc2lvbiI6IDEKfQo="
+EMBED_grafana_backup_health_json="ewogICJfX2lucHV0cyI6IFtdLAogICJfX3JlcXVpcmVzIjogWwogICAgewogICAgICAidHlwZSI6ICJncmFmYW5hIiwKICAgICAgImlkIjogImdyYWZhbmEiLAogICAgICAibmFtZSI6ICJHcmFmYW5hIiwKICAgICAgInZlcnNpb24iOiAiOS4wLjAiCiAgICB9LAogICAgewogICAgICAidHlwZSI6ICJkYXRhc291cmNlIiwKICAgICAgImlkIjogInByb21ldGhldXMiLAogICAgICAibmFtZSI6ICJQcm9tZXRoZXVzIiwKICAgICAgInZlcnNpb24iOiAiMS4wLjAiCiAgICB9CiAgXSwKICAiYW5ub3RhdGlvbnMiOiB7CiAgICAibGlzdCI6IFtdCiAgfSwKICAiZGVzY3JpcHRpb24iOiAiTExNIEFQSSBQcm94eSDigJQgYmFja3VwIGFnZW50IGhlYWx0aDogbGl2ZW5lc3MsIGxhc3Qtc3VjY2VzcyBhZ2UsIGFuZCBmYWlsdXJlIHN0YXRlIiwKICAiZWRpdGFibGUiOiB0cnVlLAogICJmaXNjYWxZZWFyU3RhcnRNb250aCI6IDAsCiAgImdyYXBoVG9vbHRpcCI6IDAsCiAgImlkIjogbnVsbCwKICAibGlua3MiOiBbXSwKICAicGFuZWxzIjogWwogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImRlc2NyaXB0aW9uIjogIkF1dGhvcml0YXRpdmUgYmFja3VwIHNpZ25hbCAoIzE3NTgpLiAxID0gdGhpcyBkZXBsb3ltZW50IGhhcyBOTyB1c2FibGUgcmVjb3ZlcnkgcG9pbnQg4oCUIGVpdGhlciBubyBiYWNrdXAgaGFzIGV2ZXIgc3VjY2VlZGVkLCBvciB0aGUgbGFzdCBzdWNjZXNzIGlzIG9sZGVyIHRoYW4gdHdvIHNjaGVkdWxlZCBpbnRlcnZhbHMuIEFnZW50IGxpdmVuZXNzIGlzIE5PVCBhIHN1YnN0aXR1dGUgZm9yIHRoaXMgcGFuZWwuIiwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsKICAgICAgICAgICAgIm1vZGUiOiAidGhyZXNob2xkcyIKICAgICAgICAgIH0sCiAgICAgICAgICAidGhyZXNob2xkcyI6IHsKICAgICAgICAgICAgIm1vZGUiOiAiYWJzb2x1dGUiLAogICAgICAgICAgICAic3RlcHMiOiBbCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAiZ3JlZW4iLCAidmFsdWUiOiBudWxsIH0sCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAicmVkIiwgInZhbHVlIjogMSB9CiAgICAgICAgICAgIF0KICAgICAgICAgIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIsCiAgICAgICAgICAibWFwcGluZ3MiOiBbCiAgICAgICAgICAgIHsgInR5cGUiOiAidmFsdWUiLCAib3B0aW9ucyI6IHsgIjAiOiB7ICJ0ZXh0IjogIlJFQ09WRVJZIFBPSU5UIENVUlJFTlQiIH0sICIxIjogeyAidGV4dCI6ICJOTyBDVVJSRU5UIFJFQ09WRVJZIFBPSU5UIiB9IH0gfQogICAgICAgICAgXQogICAgICAgIH0sCiAgICAgICAgIm92ZXJyaWRlcyI6IFtdCiAgICAgIH0sCiAgICAgICJncmlkUG9zIjogeyAiaCI6IDQsICJ3IjogMjQsICJ4IjogMCwgInkiOiAwIH0sCiAgICAgICJpZCI6IDYsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJyZWR1Y2VPcHRpb25zIjogeyAiY2FsY3MiOiBbImxhc3ROb3ROdWxsIl0gfSwKICAgICAgICAib3JpZW50YXRpb24iOiAiYXV0byIsCiAgICAgICAgInRleHRNb2RlIjogImF1dG8iLAogICAgICAgICJjb2xvck1vZGUiOiAiYmFja2dyb3VuZCIKICAgICAgfSwKICAgICAgInRhcmdldHMiOiBbCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAiYmFja3VwX3N0YWxlIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAiQmFja3VwIFN0YWxlIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkJhY2t1cCBSZWNvdmVyeSBQb2ludCIsCiAgICAgICJ0eXBlIjogInN0YXQiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImRlc2NyaXB0aW9uIjogIlByb2Nlc3MgbGl2ZW5lc3MgT05MWS4gVGhpcyBnYXVnZSByZWFkIE9OTElORSBmb3Igd2Vla3Mgd2hpbGUgemVybyBzbmFwc2hvdHMgZXhpc3RlZCAoIzE3NTgpLiBKdWRnZSBiYWNrdXBzIGJ5IHRoZSBCYWNrdXAgUmVjb3ZlcnkgUG9pbnQgcGFuZWwuIiwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsKICAgICAgICAgICAgIm1vZGUiOiAidGhyZXNob2xkcyIKICAgICAgICAgIH0sCiAgICAgICAgICAidGhyZXNob2xkcyI6IHsKICAgICAgICAgICAgIm1vZGUiOiAiYWJzb2x1dGUiLAogICAgICAgICAgICAic3RlcHMiOiBbCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAicmVkIiwgInZhbHVlIjogbnVsbCB9LAogICAgICAgICAgICAgIHsgImNvbG9yIjogImdyZWVuIiwgInZhbHVlIjogMSB9CiAgICAgICAgICAgIF0KICAgICAgICAgIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIsCiAgICAgICAgICAibWFwcGluZ3MiOiBbCiAgICAgICAgICAgIHsgInR5cGUiOiAidmFsdWUiLCAib3B0aW9ucyI6IHsgIjAiOiB7ICJ0ZXh0IjogIk9GRkxJTkUiIH0sICIxIjogeyAidGV4dCI6ICJPTkxJTkUiIH0gfSB9CiAgICAgICAgICBdCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogNCwgInciOiA4LCAieCI6IDAsICJ5IjogNCB9LAogICAgICAiaWQiOiAxLAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAicmVkdWNlT3B0aW9ucyI6IHsgImNhbGNzIjogWyJsYXN0Tm90TnVsbCJdIH0sCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJ0ZXh0TW9kZSI6ICJhdXRvIiwKICAgICAgICAiY29sb3JNb2RlIjogImJhY2tncm91bmQiCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9hZ2VudF9vbmxpbmUiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJBZ2VudCBPbmxpbmUiLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiQmFja3VwIEFnZW50IFByb2Nlc3MgTGl2ZW5lc3MgKE5PVCBiYWNrdXAgc3VjY2VzcykiLAogICAgICAidHlwZSI6ICJzdGF0IgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7CiAgICAgICAgICAgICJtb2RlIjogInRocmVzaG9sZHMiCiAgICAgICAgICB9LAogICAgICAgICAgInRocmVzaG9sZHMiOiB7CiAgICAgICAgICAgICJtb2RlIjogImFic29sdXRlIiwKICAgICAgICAgICAgInN0ZXBzIjogWwogICAgICAgICAgICAgIHsgImNvbG9yIjogImdyZWVuIiwgInZhbHVlIjogbnVsbCB9LAogICAgICAgICAgICAgIHsgImNvbG9yIjogInllbGxvdyIsICJ2YWx1ZSI6IDg2NDAwIH0sCiAgICAgICAgICAgICAgeyAiY29sb3IiOiAicmVkIiwgInZhbHVlIjogMTcyODAwIH0KICAgICAgICAgICAgXQogICAgICAgICAgfSwKICAgICAgICAgICJ1bml0IjogInMiCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogNCwgInciOiA4LCAieCI6IDgsICJ5IjogNCB9LAogICAgICAiaWQiOiAyLAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAicmVkdWNlT3B0aW9ucyI6IHsgImNhbGNzIjogWyJsYXN0Tm90TnVsbCJdIH0sCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJ0ZXh0TW9kZSI6ICJhdXRvIiwKICAgICAgICAiY29sb3JNb2RlIjogImJhY2tncm91bmQiCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9sYXN0X3N1Y2Nlc3NfYWdlX3NlY29uZHMiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJMYXN0IFN1Y2Nlc3MgQWdlIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkxhc3QgU3VjY2Vzc2Z1bCBCYWNrdXAgQWdlIChOYU4gPSBuZXZlciBzdWNjZWVkZWQpIiwKICAgICAgInR5cGUiOiAic3RhdCIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogewogICAgICAgICAgICAibW9kZSI6ICJ0aHJlc2hvbGRzIgogICAgICAgICAgfSwKICAgICAgICAgICJ0aHJlc2hvbGRzIjogewogICAgICAgICAgICAibW9kZSI6ICJhYnNvbHV0ZSIsCiAgICAgICAgICAgICJzdGVwcyI6IFsKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJyZWQiLCAidmFsdWUiOiAxIH0KICAgICAgICAgICAgXQogICAgICAgICAgfSwKICAgICAgICAgICJ1bml0IjogInNob3J0IiwKICAgICAgICAgICJtYXBwaW5ncyI6IFsKICAgICAgICAgICAgeyAidHlwZSI6ICJ2YWx1ZSIsICJvcHRpb25zIjogeyAiMCI6IHsgInRleHQiOiAiT0siIH0sICIxIjogeyAidGV4dCI6ICJGQUlMRUQiIH0gfSB9CiAgICAgICAgICBdCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogNCwgInciOiA4LCAieCI6IDE2LCAieSI6IDQgfSwKICAgICAgImlkIjogMywKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgInJlZHVjZU9wdGlvbnMiOiB7ICJjYWxjcyI6IFsibGFzdE5vdE51bGwiXSB9LAogICAgICAgICJvcmllbnRhdGlvbiI6ICJhdXRvIiwKICAgICAgICAidGV4dE1vZGUiOiAiYXV0byIsCiAgICAgICAgImNvbG9yTW9kZSI6ICJiYWNrZ3JvdW5kIgogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJiYWNrdXBfbGFzdF9ydW5fZmFpbGVkIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAiTGFzdCBSdW4gRmFpbGVkIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkxhc3QgQmFja3VwIFJ1biBTdGF0dXMiLAogICAgICAidHlwZSI6ICJzdGF0IgogICAgfSwKICAgIHsKICAgICAgImRhdGFzb3VyY2UiOiB7ICJ0eXBlIjogInByb21ldGhldXMiLCAidWlkIjogInByb21ldGhldXMiIH0sCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7ICJtb2RlIjogInBhbGV0dGUtY2xhc3NpYyIgfSwKICAgICAgICAgICJjdXN0b20iOiB7ICJsaW5lV2lkdGgiOiAxIH0sCiAgICAgICAgICAidW5pdCI6ICJzaG9ydCIKICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA4LCAidyI6IDEyLCAieCI6IDAsICJ5IjogOCB9LAogICAgICAiaWQiOiA0LAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAibGVnZW5kIjogeyAiZGlzcGxheU1vZGUiOiAibGlzdCIsICJwbGFjZW1lbnQiOiAiYm90dG9tIiB9LAogICAgICAgICJ0b29sdGlwIjogeyAibW9kZSI6ICJzaW5nbGUiIH0KICAgICAgfSwKICAgICAgInRhcmdldHMiOiBbCiAgICAgICAgewogICAgICAgICAgImV4cHIiOiAiYmFja3VwX2FnZW50X29ubGluZSIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogIkFnZW50IE9ubGluZSAoMT15ZXMpIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkJhY2t1cCBBZ2VudCBQcm9jZXNzIExpdmVuZXNzIE92ZXIgVGltZSAoTk9UIGJhY2t1cCBzdWNjZXNzKSIsCiAgICAgICJ0eXBlIjogInRpbWVzZXJpZXMiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImZpZWxkQ29uZmlnIjogewogICAgICAgICJkZWZhdWx0cyI6IHsKICAgICAgICAgICJjb2xvciI6IHsgIm1vZGUiOiAicGFsZXR0ZS1jbGFzc2ljIiB9LAogICAgICAgICAgImN1c3RvbSI6IHsgImxpbmVXaWR0aCI6IDEgfSwKICAgICAgICAgICJ1bml0IjogInMiCiAgICAgICAgfSwKICAgICAgICAib3ZlcnJpZGVzIjogW10KICAgICAgfSwKICAgICAgImdyaWRQb3MiOiB7ICJoIjogOCwgInciOiAxMiwgIngiOiAxMiwgInkiOiA4IH0sCiAgICAgICJpZCI6IDUsCiAgICAgICJvcHRpb25zIjogewogICAgICAgICJsZWdlbmQiOiB7ICJkaXNwbGF5TW9kZSI6ICJsaXN0IiwgInBsYWNlbWVudCI6ICJib3R0b20iIH0sCiAgICAgICAgInRvb2x0aXAiOiB7ICJtb2RlIjogInNpbmdsZSIgfQogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJiYWNrdXBfbGFzdF9zdWNjZXNzX2FnZV9zZWNvbmRzIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAiU2Vjb25kcyBzaW5jZSBsYXN0IHN1Y2Nlc3MiLAogICAgICAgICAgInJlZklkIjogIkEiCiAgICAgICAgfQogICAgICBdLAogICAgICAidGl0bGUiOiAiTGFzdCBTdWNjZXNzZnVsIEJhY2t1cCBBZ2UgT3ZlciBUaW1lIiwKICAgICAgInR5cGUiOiAidGltZXNlcmllcyIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZGVzY3JpcHRpb24iOiAiIzE3NTggcmVxdWlyZW1lbnQgNTogYSBiYWNrdXAgdGhhdCBjYW5ub3QgYmUgcmVzdG9yZWQgaXMgdHJlYXRlZCBhcyBubyBiYWNrdXAuIDAgPSBubyByZXN0b3JlIHJlaGVhcnNhbCBoYXMgRVZFUiBiZWVuIHJlY29yZGVkLCBzbyB0aGUgc25hcHNob3RzIGluIHRoZSByZXBvc2l0b3J5IGFyZSBhbiB1bnRlc3RlZCByZWNvdmVyeSBwb2ludC4gUHVibGlzaCBvbmUgd2l0aCBzY3JpcHRzL3Rlc3RfYmFja3VwX3Jlc3RvcmUuc2ggb3IgZG9ja2VyIGV4ZWMgbGxhcC1iYWNrdXAgL2FwcC9wdWJsaXNoLXJlc3RvcmUtcmVoZWFyc2FsLnNoLiIsCiAgICAgICJmaWVsZENvbmZpZyI6IHsKICAgICAgICAiZGVmYXVsdHMiOiB7CiAgICAgICAgICAiY29sb3IiOiB7CiAgICAgICAgICAgICJtb2RlIjogInRocmVzaG9sZHMiCiAgICAgICAgICB9LAogICAgICAgICAgInRocmVzaG9sZHMiOiB7CiAgICAgICAgICAgICJtb2RlIjogImFic29sdXRlIiwKICAgICAgICAgICAgInN0ZXBzIjogWwogICAgICAgICAgICAgIHsgImNvbG9yIjogInJlZCIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IDEgfQogICAgICAgICAgICBdCiAgICAgICAgICB9LAogICAgICAgICAgInVuaXQiOiAic2hvcnQiLAogICAgICAgICAgIm1hcHBpbmdzIjogWwogICAgICAgICAgICB7ICJ0eXBlIjogInZhbHVlIiwgIm9wdGlvbnMiOiB7ICIwIjogeyAidGV4dCI6ICJORVZFUiBSRUhFQVJTRUQiIH0sICIxIjogeyAidGV4dCI6ICJSRUNPUkRFRCIgfSB9IH0KICAgICAgICAgIF0KICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA0LCAidyI6IDgsICJ4IjogMCwgInkiOiAxNiB9LAogICAgICAiaWQiOiA3LAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAicmVkdWNlT3B0aW9ucyI6IHsgImNhbGNzIjogWyJsYXN0Tm90TnVsbCJdIH0sCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJ0ZXh0TW9kZSI6ICJhdXRvIiwKICAgICAgICAiY29sb3JNb2RlIjogImJhY2tncm91bmQiCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9yZXN0b3JlX3JlaGVhcnNhbF9rbm93biIsCiAgICAgICAgICAibGVnZW5kRm9ybWF0IjogIlJlaGVhcnNhbCBLbm93biIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJSZXN0b3JlIFJlaGVhcnNhbCBSZWNvcmRlZCAodW50ZXN0ZWQgYmFja3VwID0gdW50ZXN0ZWQgcmVjb3ZlcnkpIiwKICAgICAgInR5cGUiOiAic3RhdCIKICAgIH0sCiAgICB7CiAgICAgICJkYXRhc291cmNlIjogeyAidHlwZSI6ICJwcm9tZXRoZXVzIiwgInVpZCI6ICJwcm9tZXRoZXVzIiB9LAogICAgICAiZGVzY3JpcHRpb24iOiAiU2Vjb25kcyBzaW5jZSB0aGUgbmV3ZXN0IHJlc3RvcmUgcmVoZWFyc2FsLiBOYU4g4oCUIHJlbmRlcmVkIGFzIE5vIGRhdGEg4oCUIG1lYW5zIG5vbmUgaGFzIGV2ZXIgYmVlbiByZWNvcmRlZDsgaXQgaXMgZGVsaWJlcmF0ZWx5IE5PVCAwLCB3aGljaCB3b3VsZCByZWFkIGFzICdyZWhlYXJzZWQgYSBtb21lbnQgYWdvJy4gUmVkIHBhc3QgMzAgZGF5cywgbWF0Y2hpbmcgTExBUEJhY2t1cFJlc3RvcmVSZWhlYXJzYWxTdGFsZS4iLAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogewogICAgICAgICAgICAibW9kZSI6ICJ0aHJlc2hvbGRzIgogICAgICAgICAgfSwKICAgICAgICAgICJ0aHJlc2hvbGRzIjogewogICAgICAgICAgICAibW9kZSI6ICJhYnNvbHV0ZSIsCiAgICAgICAgICAgICJzdGVwcyI6IFsKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJyZWQiLCAidmFsdWUiOiAyNTkyMDAwIH0KICAgICAgICAgICAgXQogICAgICAgICAgfSwKICAgICAgICAgICJ1bml0IjogInMiLAogICAgICAgICAgIm1hcHBpbmdzIjogW10KICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA0LCAidyI6IDgsICJ4IjogOCwgInkiOiAxNiB9LAogICAgICAiaWQiOiA4LAogICAgICAib3B0aW9ucyI6IHsKICAgICAgICAicmVkdWNlT3B0aW9ucyI6IHsgImNhbGNzIjogWyJsYXN0Tm90TnVsbCJdIH0sCiAgICAgICAgIm9yaWVudGF0aW9uIjogImF1dG8iLAogICAgICAgICJ0ZXh0TW9kZSI6ICJhdXRvIiwKICAgICAgICAiY29sb3JNb2RlIjogImJhY2tncm91bmQiCiAgICAgIH0sCiAgICAgICJ0YXJnZXRzIjogWwogICAgICAgIHsKICAgICAgICAgICJleHByIjogImJhY2t1cF9sYXN0X3Jlc3RvcmVfcmVoZWFyc2FsX2FnZV9zZWNvbmRzIiwKICAgICAgICAgICJsZWdlbmRGb3JtYXQiOiAiUmVoZWFyc2FsIEFnZSIsCiAgICAgICAgICAicmVmSWQiOiAiQSIKICAgICAgICB9CiAgICAgIF0sCiAgICAgICJ0aXRsZSI6ICJMYXN0IFJlc3RvcmUgUmVoZWFyc2FsIEFnZSAoTmFOID0gbmV2ZXIgcmVoZWFyc2VkKSIsCiAgICAgICJ0eXBlIjogInN0YXQiCiAgICB9LAogICAgewogICAgICAiZGF0YXNvdXJjZSI6IHsgInR5cGUiOiAicHJvbWV0aGV1cyIsICJ1aWQiOiAicHJvbWV0aGV1cyIgfSwKICAgICAgImRlc2NyaXB0aW9uIjogIjEgPSB0aGUgbW9zdCByZWNlbnQgcmVzdG9yZSByZWhlYXJzYWwgcmFuIGFuZCBkaWQgTk9UIHJlc3RvcmUuIFRoaXMgaXMgZGlyZWN0IGV2aWRlbmNlIHRoZSByZWNvdmVyeSBwb2ludCBkb2VzIG5vdCB3b3JrLCBhbmQgaXQgZHJpdmVzIHRoZSBwcm94eSdzIGJhY2t1cCBoZWFsdGggbGV2ZWwgdG8gQ3JpdGljYWwuIERpc3RpbmN0IGZyb20gJ25ldmVyIHJlaGVhcnNlZCcsIHdoaWNoIGlzIG9ubHkgYW4gYWJzZW5jZSBvZiBldmlkZW5jZS4iLAogICAgICAiZmllbGRDb25maWciOiB7CiAgICAgICAgImRlZmF1bHRzIjogewogICAgICAgICAgImNvbG9yIjogewogICAgICAgICAgICAibW9kZSI6ICJ0aHJlc2hvbGRzIgogICAgICAgICAgfSwKICAgICAgICAgICJ0aHJlc2hvbGRzIjogewogICAgICAgICAgICAibW9kZSI6ICJhYnNvbHV0ZSIsCiAgICAgICAgICAgICJzdGVwcyI6IFsKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJncmVlbiIsICJ2YWx1ZSI6IG51bGwgfSwKICAgICAgICAgICAgICB7ICJjb2xvciI6ICJyZWQiLCAidmFsdWUiOiAxIH0KICAgICAgICAgICAgXQogICAgICAgICAgfSwKICAgICAgICAgICJ1bml0IjogInNob3J0IiwKICAgICAgICAgICJtYXBwaW5ncyI6IFsKICAgICAgICAgICAgeyAidHlwZSI6ICJ2YWx1ZSIsICJvcHRpb25zIjogeyAiMCI6IHsgInRleHQiOiAiUkVTVE9SRUQgT0siIH0sICIxIjogeyAidGV4dCI6ICJGQUlMRUQgVE8gUkVTVE9SRSIgfSB9IH0KICAgICAgICAgIF0KICAgICAgICB9LAogICAgICAgICJvdmVycmlkZXMiOiBbXQogICAgICB9LAogICAgICAiZ3JpZFBvcyI6IHsgImgiOiA0LCAidyI6IDgsICJ4IjogMTYsICJ5IjogMTYgfSwKICAgICAgImlkIjogOSwKICAgICAgIm9wdGlvbnMiOiB7CiAgICAgICAgInJlZHVjZU9wdGlvbnMiOiB7ICJjYWxjcyI6IFsibGFzdE5vdE51bGwiXSB9LAogICAgICAgICJvcmllbnRhdGlvbiI6ICJhdXRvIiwKICAgICAgICAidGV4dE1vZGUiOiAiYXV0byIsCiAgICAgICAgImNvbG9yTW9kZSI6ICJiYWNrZ3JvdW5kIgogICAgICB9LAogICAgICAidGFyZ2V0cyI6IFsKICAgICAgICB7CiAgICAgICAgICAiZXhwciI6ICJiYWNrdXBfbGFzdF9yZXN0b3JlX3JlaGVhcnNhbF9mYWlsZWQiLAogICAgICAgICAgImxlZ2VuZEZvcm1hdCI6ICJSZWhlYXJzYWwgRmFpbGVkIiwKICAgICAgICAgICJyZWZJZCI6ICJBIgogICAgICAgIH0KICAgICAgXSwKICAgICAgInRpdGxlIjogIkxhc3QgUmVzdG9yZSBSZWhlYXJzYWwgT3V0Y29tZSIsCiAgICAgICJ0eXBlIjogInN0YXQiCiAgICB9CiAgXSwKICAicmVmcmVzaCI6ICI2MHMiLAogICJzY2hlbWFWZXJzaW9uIjogMzgsCiAgInRhZ3MiOiBbImxsbSIsICJwcm94eSIsICJiYWNrdXAiXSwKICAidGltZSI6IHsgImZyb20iOiAibm93LTZoIiwgInRvIjogIm5vdyIgfSwKICAidGltZXBpY2tlciI6IHt9LAogICJ0aW1lem9uZSI6ICJicm93c2VyIiwKICAidGl0bGUiOiAiTExNIEFQSSBQcm94eSDigJQgQmFja3VwIEhlYWx0aCIsCiAgInVpZCI6ICJsbG0tYXBpLXByb3h5LWJhY2t1cC1oZWFsdGgiLAogICJ2ZXJzaW9uIjogMQp9Cg=="
 # FILE: docker/grafana/provisioning/datasources/prometheus.yml
 EMBED_grafana_datasources_yml="IyBkb2NrZXIvZ3JhZmFuYS9wcm92aXNpb25pbmcvZGF0YXNvdXJjZXMvcHJvbWV0aGV1cy55bWwKIyBBdXRvLXByb3Zpc2lvbnMgdGhlIFByb21ldGhldXMgZGF0YSBzb3VyY2UgaW4gR3JhZmFuYSBvbiBmaXJzdCBzdGFydHVwLgoKYXBpVmVyc2lvbjogMQoKZGF0YXNvdXJjZXM6CiAgLSBuYW1lOiBQcm9tZXRoZXVzCiAgICB0eXBlOiBwcm9tZXRoZXVzCiAgICBhY2Nlc3M6IHByb3h5CiAgICB1cmw6IGh0dHA6Ly9wcm9tZXRoZXVzOjkwOTAKICAgIGlzRGVmYXVsdDogdHJ1ZQogICAgZWRpdGFibGU6IGZhbHNlCg=="
 # FILE: config.example.toml
 EMBED_config_example_toml="IyBsbG0tYXBpLXByb3h5IGNvbmZpZ3VyYXRpb24gZXhhbXBsZQojIENvcHkgdG8gY29uZmlnLnRvbWwgYW5kIGZpbGwgaW4geW91ciB2YWx1ZXMuCiMgQWxsIHZhbHVlcyBjYW4gYWxzbyBiZSBzZXQgdmlhIFBST1hZXyogZW52aXJvbm1lbnQgdmFyaWFibGVzLgoKIyBQb3N0Z3JlU1FMIGNvbm5lY3Rpb24gVVJMIChyZXF1aXJlZCkKIyBkYXRhYmFzZV91cmwgPSAicG9zdGdyZXM6Ly91c2VyOnBhc3N3b3JkQFs6OjFdOjU0MzIvbGxtX3Byb3h5IgoKIyBBZGRyZXNzIHRvIGJpbmQgdGhlIG1hbmFnZW1lbnQgQVBJIGFuZCByZXZlcnNlIHByb3h5IHNlcnZlci4KIyBJUHY2LWZpcnN0OiAiOjoiIGJpbmRzIGFsbCBJUHY2IGludGVyZmFjZXMgKGR1YWwtc3RhY2sgd2hlcmUga2VybmVsIGhhcyBuZXQuaXB2Ni5jb25mLmFsbC5kaXNhYmxlX2lwdjY9MCkuCmxpc3Rlbl9hZGRyID0gIjo6IgoKIyBQb3J0IGZvciB0aGUgbWFuYWdlbWVudCBBUEkgYW5kIHJldmVyc2UgcHJveHkgKEhUVFAvSFRUUFMgdmlhIFRyYWVmaWspCmxpc3Rlbl9wb3J0ID0gMzAwMAoKIyBTb3VyY2UgZm9yIHRoZSBLZXkgRW5jcnlwdGlvbiBLZXk6ICJlbnYiIG9yICJ2YXVsdCIKa2VrX3NvdXJjZSA9ICJlbnYiCgojIFRoZSBLRUsgdmFsdWUgd2hlbiBrZWtfc291cmNlID0gImVudiIgKHJlcXVpcmVkLCBubyBkZWZhdWx0IOKAlCBzZXJ2ZXIgcmVmdXNlcyB0byBzdGFydCBpZiB1bnNldCkKIyBNdXN0IGJlIGV4YWN0bHkgNjQgbG93ZXJjYXNlIGhleCBjaGFyYWN0ZXJzICgzMiBieXRlcykuIEJhc2U2NCBpcyBOT1QgYWNjZXB0ZWQuCiMgR2VuZXJhdGUgd2l0aDogb3BlbnNzbCByYW5kIC1oZXggMzIKIyBrZWtfdmFsdWUgPSAiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIKCiMgSE1BQy1TSEEyNTYgcGVwcGVyIGZvciBwcm94eSBrZXkgaGFzaGluZyBhbmQgSEtERiBpbnB1dCBmb3IgY3JlZGVudGlhbCBleHBvcnQuCiMgTVVTVCBiZSBpZGVudGljYWwgb24gc291cmNlIGFuZCBkZXN0aW5hdGlvbiBzZXJ2ZXJzIGZvciBjcmVkZW50aWFsIG1pZ3JhdGlvbiB0byB3b3JrLgojIE1VU1QgYmUgYXQgbGVhc3QgMzIgY2hhcmFjdGVycyAoU0VDLU0wNyDigJQgc2hvcnRlciB2YWx1ZXMgZGVncmFkZSBoYXNoIHNlY3VyaXR5KS4KIyBHZW5lcmF0ZSB3aXRoOiBvcGVuc3NsIHJhbmQgLWhleCAzMgojIFNldCB2aWEgUFJPWFlfUFJPWFlfS0VZX1BFUFBFUiBlbnZpcm9ubWVudCB2YXJpYWJsZS4KIyBwcm94eV9rZXlfcGVwcGVyID0gIiIgICMgU2V0IHZpYSBQUk9YWV9QUk9YWV9LRVlfUEVQUEVSIGVudiB2YXIKCiMgUHVibGljIFVSTCBvZiB0aGlzIHByb3h5IGluc3RhbmNlLCB1c2VkIHdoZW4gZ2VuZXJhdGluZyBDb2RleCBkaXJlY3QtbW9kZSBjb25uZWN0aW9uIGluZm8uCiMgTXVzdCBpbmNsdWRlIHNjaGVtZSBhbmQgaG9zdCAoZS5nLiAiaHR0cHM6Ly9wcm94eS5leGFtcGxlLmNvbSIpLgojIFdoZW4gbm90IHNldCwgY29ubmVjdGlvbiBpbmZvIGZhbGxzIGJhY2sgdG8gdGhlIFRMUyBkb21haW4gc2V0dGluZy4KIyBFbnY6IFBST1hZX1BST1hZX1BVQkxJQ19VUkwKIyBwcm94eV9wdWJsaWNfdXJsID0gImh0dHBzOi8vcHJveHkuZXhhbXBsZS5jb20iCgojIExvZyBsZXZlbCBmaWx0ZXIKIyBFeGFtcGxlczogImluZm8iLCAiZGVidWciLCAid2FybiIsICJlcnJvciIsICJ3YXJuLHByb3h5X3NlcnZlcj1kZWJ1ZyIKbG9nX2xldmVsID0gImluZm8iCgojIExvZyBmb3JtYXQ6ICJ0ZXh0IiAoaHVtYW4gcmVhZGFibGUpIG9yICJqc29uIiAoc3RydWN0dXJlZCwgZm9yIHByb2R1Y3Rpb24pCmxvZ19mb3JtYXQgPSAidGV4dCIKCiMg4pSA4pSAIFdpbmRvdy1yZXNldCBwaW5nIHdvcmtlciAoaXNzdWUgIzE1MzgpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgU3Vic2NyaXB0aW9uIHByb3ZpZGVyIHdpbmRvd3MgYW5jaG9yIG9uIGZpcnN0IHRyYWZmaWMgYWZ0ZXIgYSByZXNldCwgc28gdGhlCiMgbmV4dCBBbnRocm9waWMgT0F1dGggNS1ob3VyIHNlc3Npb24gYmVnaW5zIHdoZW4gdGhlIGZpcnN0IHJlcXVlc3QgbGFuZHMuIFRoaXMKIyB3b3JrZXIgZmlyZXMgT05FIG1pbmltYWwgaW5mZXJlbmNlIHRoZSBpbnN0YW50IGEgNWggd2luZG93IGV4aXRzIGV4aGF1c3Rpb24sCiMgYW5jaG9yaW5nIHRoZSBuZXh0IHNlc3Npb24gdG8gIm5vdyIgYW5kIG1heGltaXNpbmcgdGhlIGFjY2VzcyB0aGUgc3Vic2NyaXB0aW9uCiMgYWxyZWFkeSBwYWlkIGZvci4gT25seSBBbnRocm9waWMgT0F1dGggYWNjb3VudHMgb24gdGhlIDVoIHdpbmRvdyBhcmUgcGluZ2VkCiMgKGRlZmF1bHQgb24gcGVyLW9yZyB2aWEgdGhlIGByZXNldF9waW5nX2VuYWJsZWRgIG9yZyBzZXR0aW5nKS4gVG9rZW4gYnVybiBpcwojIGJvdW5kZWQgYnkgYSBkdXJhYmxlIHBlci13aW5kb3cgZGVkdXBlLCB0aGUgY29vbGRvd24gZmxvb3IgYmVsb3csIG1heF90b2tlbnM9MSwKIyBhbmQgYSB2ZXJpZmllZC1tb2RlbCBnYXRlLiBUaGUgd2hvbGUgd29ya2VyIGNhbiBhbHNvIGJlIGtpbGxlZCBhdCBydW50aW1lIHZpYQojIHRoZSBMTEFQX1JFU0VUX1BJTkdfRU5BQkxFRCBlbnYgdmFyIChkZWZhdWx0IGVuYWJsZWQpLgojCiMgV29ya2VyIHRpY2sgKHNlY29uZHMpLiBEZWZhdWx0OiAzMC4gU2V0IHRvIDAgdG8gZGlzYWJsZSB0aGUgd29ya2VyIGVudGlyZWx5LgojIEVudjogUFJPWFlfUkVTRVRfUElOR19USUNLX1NFQ1MKcmVzZXRfcGluZ190aWNrX3NlY3MgPSAzMAojCiMgQ29vbGRvd24gZmxvb3IgKHNlY29uZHMpIGJldHdlZW4gcGluZ3MgZm9yIG9uZSBhY2NvdW50LiBEZWZhdWx0OiAxNDQwMCAoNGgpLgojIEVudjogUFJPWFlfUkVTRVRfUElOR19DT09MRE9XTl9TRUNTCnJlc2V0X3BpbmdfY29vbGRvd25fc2VjcyA9IDE0NDAwCgojIFRMUyBjb25maWd1cmF0aW9uIOKAlCBtYW5hZ2VkIGJ5IFRyYWVmaWsgKHNlZSBkb2NzL3Rscy1zZXR1cC5tZCkKIyBUbyBlbmFibGUgYXV0b21hdGVkIFRMUywgcnVuIHRoZSBzdGFjayB3aXRoIHRoZSBUTFMgY29tcG9zZSBvdmVycmlkZToKIyAgIGRvY2tlciBjb21wb3NlIC1mIGRvY2tlci9kb2NrZXItY29tcG9zZS55bWwgLWYgZG9ja2VyL2RvY2tlci1jb21wb3NlLnRscy55bWwgXAojICAgICAtLWVudi1maWxlIGRvY2tlci90bHMuZW52IHVwIC1kCiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9UTFNfX0VOQUJMRUQ9dHJ1ZSAgICAgICAgICAgIChub3QgUFJPWFlfVExTX0VOQUJMRUQg4oCUIHRoYXQgaXMgc2lsZW50bHkgaWdub3JlZCkKIyAgIFBST1hZX1RMU19fRE9NQUlOPXByb3h5LmV4YW1wbGUuY29tCiMgICBQUk9YWV9UTFNfX0FDTUVfRU1BSUw9YWRtaW5AZXhhbXBsZS5jb20KW3Rsc10KIyBXaGV0aGVyIGF1dG9tYXRlZCBUTFMgKEFDTUUvTGV0J3MgRW5jcnlwdCB2aWEgRE5TLTAxKSBpcyBhY3RpdmUuCiMgU2V0IHRvIHRydWUgd2hlbiB1c2luZyBkb2NrZXIvZG9ja2VyLWNvbXBvc2UudGxzLnltbC4KIyBFbnY6IFBST1hZX1RMU19fRU5BQkxFRCAoZG91YmxlIHVuZGVyc2NvcmUpCmVuYWJsZWQgPSBmYWxzZQoKIyBZb3VyIHB1YmxpYyBob3N0bmFtZSAoZS5nLiBwcm94eS5leGFtcGxlLmNvbSBvciAqLmV4YW1wbGUuY29tIGZvciB3aWxkY2FyZCkuCiMgVXNlZCBpbiAvLndlbGwta25vd24vcHJveHktaW5mby5qc29uIGFuZCBmb3IgSFRUUFMgVVJMIGdlbmVyYXRpb24uCiMgTXVzdCBiZSBhIGJhcmUgaG9zdG5hbWUgd2l0aG91dCBzY2hlbWUgb3IgcG9ydC4KIyBFbnY6IFBST1hZX1RMU19fRE9NQUlOIChkb3VibGUgdW5kZXJzY29yZSDigJQgZmlnbWVudCBuZXN0ZWQgc3RydWN0IGNvbnZlbnRpb24pCiMgZG9tYWluID0gInByb3h5LmV4YW1wbGUuY29tIgoKIyBFbWFpbCBhZGRyZXNzIGZvciBMZXQncyBFbmNyeXB0IEFDTUUgcmVnaXN0cmF0aW9uLgojIFJlcXVpcmVkIHdoZW4gZW5hYmxlZCA9IHRydWUuIEFsc28gY29uc3VtZWQgYnkgdGhlIFRyYWVmaWsgY29udGFpbmVyIHZpYQojIC0tY2VydGlmaWNhdGVzcmVzb2x2ZXJzLmNsb3VkZmxhcmUuYWNtZS5lbWFpbD0ke1BST1hZX1RMU19fQUNNRV9FTUFJTH0uCiMgT25lIGVudiB2YXIsIHR3byBjb25zdW1lcnMgKFJ1c3QgY29uZmlnICsgVHJhZWZpayBDTEkpLgojIEVudjogUFJPWFlfVExTX19BQ01FX0VNQUlMIChkb3VibGUgdW5kZXJzY29yZSkKIyBhY21lX2VtYWlsID0gImFkbWluQGV4YW1wbGUuY29tIgoKIyBBQ01FIENBIHNlcnZlciBVUkwuIERlZmF1bHRzIHRvIExldCdzIEVuY3J5cHQgcHJvZHVjdGlvbiB3aGVuIG5vdCBzZXQuCiMgRm9yIHRlc3RpbmcsIHVzZSB0aGUgc3RhZ2luZyBVUkwgdG8gYXZvaWQgcHJvZHVjdGlvbiByYXRlIGxpbWl0czoKIyAgIGh0dHBzOi8vYWNtZS1zdGFnaW5nLXYwMi5hcGkubGV0c2VuY3J5cHQub3JnL2RpcmVjdG9yeQojIFRoaXMgdmFsdWUgaXMgc3VyZmFjZWQgYnkgL21hbmFnZS92MS90bHMvc3RhdHVzIHNvIG9wZXJhdG9ycyBjYW4gdmVyaWZ5CiMgd2hpY2ggQ0EgaXMgaW4gdXNlIHdpdGhvdXQgaW5zcGVjdGluZyBUcmFlZmlrIGxvZ3MuCiMgRW52OiBQUk9YWV9UTFNfX0FDTUVfQ0EgKGRvdWJsZSB1bmRlcnNjb3JlKQojIGFjbWVfY2EgPSAiaHR0cHM6Ly9hY21lLXYwMi5hcGkubGV0c2VuY3J5cHQub3JnL2RpcmVjdG9yeSIKCiMg4pSA4pSAIG1ETlMgLyBETlMtU0Qgc2VydmljZSBkaXNjb3Zlcnkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiMKIyBUaGUgcHJveHkgYWR2ZXJ0aXNlcyBpdHNlbGYgb24gdGhlIGxvY2FsIG5ldHdvcmsgdmlhIG11bHRpY2FzdCBETlMgKG1ETlMgLwojIEROUy1TRCwgUkZDIDY3NjIgLyBSRkMgNjc2Mykgc28gdGhhdCBvcGVyYXRvciB0b29saW5nIGFuZCBjbGllbnRzIGNhbgojIGRpc2NvdmVyIGl0IGF1dG9tYXRpY2FsbHkgd2l0aG91dCBtYW51YWwgRE5TIGNvbmZpZ3VyYXRpb24uCiMKIyBtRE5TIGlzIE9OIGJ5IGRlZmF1bHQuIFRvIGRpc2FibGUgaXQgc2V0IGBlbmFibGVkID0gZmFsc2VgIGhlcmUgb3I6CiMgICBQUk9YWV9NRE5TX19FTkFCTEVEPWZhbHNlCiMKIyBOb3RlIG9uIGFkdmVydGlzZWQgcG9ydHM6IHRoZSBwb3J0cyBhbm5vdW5jZWQgaW4gRE5TLVNEIFRYVC9TUlYgcmVjb3JkcwojIGFyZSB0YWtlbiBmcm9tIGBsaXN0ZW5fcG9ydGAgKGRlZmF1bHQgMzAwMCwgdGhlIG1hbmFnZW1lbnQgQVBJICsgcmV2ZXJzZQojIHByb3h5KSBhbmQgYGZvcndhcmRfcHJveHkucG9ydGAgKGRlZmF1bHQgMzAwMSwgdGhlIENPTk5FQ1QgaGFuZGxlcikuICBXaGVuCiMgcnVubmluZyB3aXRoIGhvc3QgbmV0d29ya2luZyAoYXMgdGhlIERvY2tlciBDb21wb3NlIHN0YWNrIGRvZXMpIHRoZXNlIHBvcnRzCiMgYmluZCBkaXJlY3RseSBvbiB0aGUgaG9zdCBpbnRlcmZhY2UuICBJZiAzMDAwIG9yIDMwMDEgYXJlIGFscmVhZHkgaW4gdXNlIG9uCiMgeW91ciBob3N0LCBvdmVycmlkZSB0aGVtIHZpYToKIyAgIFBST1hZX0xJU1RFTl9QT1JUPTxmcmVlX3BvcnQ+CiMgICBQUk9YWV9GT1JXQVJEX1BST1hZX19QT1JUPTxmcmVlX3BvcnQ+CiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9NRE5TX19FTkFCTEVEPWZhbHNlICAgICAgICAgICAgICAgKG5vdCBQUk9YWV9NRE5TX0VOQUJMRUQg4oCUIHNpbGVudGx5IGlnbm9yZWQpCiMgICBQUk9YWV9NRE5TX19JTlNUQU5DRV9OQU1FPW15LXByb3h5CiMgICBQUk9YWV9NRE5TX19TRVJWSUNFX1RZUEU9X2xsbS1wcm94eS5fdGNwCiMgICBQUk9YWV9NRE5TX19SRUZSRVNIX0lOVEVSVkFMX1NFQ1M9MzAKW21kbnNdCiMgV2hldGhlciB0byBhZHZlcnRpc2UgdGhpcyBwcm94eSB2aWEgbUROUyBvbiB0aGUgbG9jYWwgbmV0d29yay4KIyBEZWZhdWx0cyB0byB0cnVlLiBTZXQgdG8gZmFsc2UgaW4gY2xvdWQgLyByZXN0cmljdGVkLW11bHRpY2FzdCBlbnZpcm9ubWVudHMuCiMgRW52OiBQUk9YWV9NRE5TX19FTkFCTEVEIChkb3VibGUgdW5kZXJzY29yZSkKZW5hYmxlZCA9IHRydWUKCiMgSHVtYW4tcmVhZGFibGUgaW5zdGFuY2UgbmFtZSBmb3IgRE5TLVNEIHJlY29yZHMuCiMgV2hlbiBlbXB0eSAodGhlIGRlZmF1bHQpIHRoZSBtRE5TIHNlcnZpY2UgbGF5ZXIgdXNlcyAie2hvc3RuYW1lfS17bGlzdGVuX3BvcnR9Ii4KIyBNdXN0IGJlIOKJpCA2MyBjaGFyYWN0ZXJzIGFuZCBjb250YWluIG9ubHkgbGV0dGVycywgZGlnaXRzLCBhbmQgaHlwaGVucyB3aGVuIHNldC4KIyBFbnY6IFBST1hZX01ETlNfX0lOU1RBTkNFX05BTUUgKGRvdWJsZSB1bmRlcnNjb3JlKQojIGluc3RhbmNlX25hbWUgPSAibXktbGxtLXByb3h5IgoKIyBETlMtU0Qgc2VydmljZSB0eXBlIFdJVEhPVVQgdGhlICIubG9jYWwuIiBzdWZmaXggKGFwcGVuZGVkIGJ5IHRoZSBzZXJ2aWNlIGxheWVyKS4KIyBEZWZhdWx0OiAiX2xsbS1wcm94eS5fdGNwIgojIE11c3QgbWF0Y2ggIl88bmFtZT4uX3RjcCIgb3IgIl88bmFtZT4uX3VkcCIgcGF0dGVybi4KIyBFbnY6IFBST1hZX01ETlNfX1NFUlZJQ0VfVFlQRSAoZG91YmxlIHVuZGVyc2NvcmUpCnNlcnZpY2VfdHlwZSA9ICJfbGxtLXByb3h5Ll90Y3AiCgojIEhvdyBvZnRlbiAoaW4gc2Vjb25kcykgdGhlIG1ETlMgc2VydmljZSByZS1hbm5vdW5jZXMgdGhlIHJlY29yZC4KIyBNdXN0IGJlID4gMC4gVmFsaWRhdGVkIGF0IHNlcnZpY2UtbGF5ZXIgc3RhcnR1cCwgbm90IGR1cmluZyBjb25maWcgcGFyc2luZy4KIyBFbnY6IFBST1hZX01ETlNfX1JFRlJFU0hfSU5URVJWQUxfU0VDUyAoZG91YmxlIHVuZGVyc2NvcmUpCnJlZnJlc2hfaW50ZXJ2YWxfc2VjcyA9IDMwCgojIOKUgOKUgCBNb2RlbCBkaXNjb3ZlcnkgKGNhY2hlICsgYmFja2dyb3VuZCByZWZyZXNoKSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIENvbnRyb2xzIHRoZSBmcmVzaG5lc3Mgb2YgdGhlIERCLXBlcnNpc3RlZCBtb2RlbC0+YWNjb3VudCBpbmRleCB0aGF0IGJhY2tzCiMgYm90aCBtb2RlbCBsaXN0aW5nIGFuZCBtb2RlbC1kb21pbmFudCByb3V0aW5nLiBCb3RoIGtub2JzIGRlZmF1bHQgdG8gMzYwMAojIHNlY29uZHMgKDEgaG91cikuCiMKIyBOb3RlIG9uIGVudiB2YXIgbmFtaW5nOiBuZXN0ZWQgc3RydWN0IGZpZWxkcyByZXF1aXJlIERPVUJMRS1VTkRFUlNDT1JFIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9NT0RFTF9ESVNDT1ZFUllfX1RUTF9TRUNTPTM2MDAKIyAgIFBST1hZX01PREVMX0RJU0NPVkVSWV9fUkVGUkVTSF9JTlRFUlZBTF9TRUNTPTM2MDAKW21vZGVsX2Rpc2NvdmVyeV0KIyBDYWNoZSBmcmVzaG5lc3MgKHNlY29uZHMpIGZvciB0aGUgbW9kZWwgbGlzdGluZy9pbmRleC4gRGVmYXVsdDogMzYwMCAoMSBob3VyKS4KIyBFbnY6IFBST1hZX01PREVMX0RJU0NPVkVSWV9fVFRMX1NFQ1MgKGRvdWJsZSB1bmRlcnNjb3JlKQp0dGxfc2VjcyA9IDM2MDAKCiMgQmFja2dyb3VuZCByZWZyZXNoIGNhZGVuY2UgKHNlY29uZHMpIGZvciBwZXItYWNjb3VudCBjYXRhbG9ndWVzLgojIERlZmF1bHQ6IDM2MDAgKDEgaG91cikuCiMgRW52OiBQUk9YWV9NT0RFTF9ESVNDT1ZFUllfX1JFRlJFU0hfSU5URVJWQUxfU0VDUyAoZG91YmxlIHVuZGVyc2NvcmUpCnJlZnJlc2hfaW50ZXJ2YWxfc2VjcyA9IDM2MDAKCiMg4pSA4pSAIERhdGFiYXNlIGNvbm5lY3Rpb24gcG9vbCAmIGJhY2tncm91bmQtd3JpdGVyIGJ1ZGdldCAoaXNzdWUgIzEyODgpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgU2l6ZXMgdGhlIHR3byBjb25uZWN0aW9uIHBvb2xzLCBib3VuZHMgaG93IGxvbmcgYSBjYWxsZXIgd2FpdHMgZm9yIGEgZnJlZQojIGNvbm5lY3Rpb24sIGFuZCBjYXBzIGhvdyBtYW55IGJhY2tncm91bmQgd29ya2VycyBtYXkgaG9sZCBhIGNvbm5lY3Rpb24gYXQgb25jZS4KIyBUaGVzZSBkZWZhdWx0cyByZXByb2R1Y2UgdGhlIHByZXZpb3VzIHN0ZWFkeS1zdGF0ZSBwb29sIHNpemluZzsgdGhlIGFkZGl0aXZlCiMgcHJvdGVjdGlvbnMgKGEgc2hvcnQgYWNxdWlyZSB0aW1lb3V0IGFuZCB0aGUgYmFja2dyb3VuZC13cml0ZXIgY2FwKSBwcmV2ZW50IHRoZQojIHBvc3QtZGVwbG95IHN0YXJ0dXAgd3JpdGUgc3Rvcm0g4oCUIG1vZGVsIGRpc2NvdmVyeSwgcHJpY2luZyByZWNvbmNpbGUsIENvZGV4CiMgY3JlZGVudGlhbCBzZWxmLXJlcGFpciwgcmF0ZS1saW1pdCBwb2xsaW5nIGFsbCBmaXJpbmcgYXQgb25jZSDigJQgZnJvbSBleGhhdXN0aW5nCiMgdGhlIGNvbm5lY3Rpb24gYnVkZ2V0IGFuZCBzdGFydmluZyB0aGUgcmVxdWVzdCBwYXRoICh0aGUgY2F1c2Ugb2YgdGhlIGJyaWVmCiMgSFRUUCA1MDAgYnVyc3Qgc2VlbiBvbiBldmVyeSBkZXBsb3kpLgojCiMgSU5WQVJJQU5UUyAodmFsaWRhdGVkIGF0IHN0YXJ0dXApOgojICAgKiBjb250cm9sX3Bvb2xfc2l6ZSArIGRhdGFfcG9vbF9zaXplICBNVVNUIGJlIHdlbGwgYmVsb3cgdGhlIFBvc3RncmVzIHNlcnZlcgojICAgICBtYXhfY29ubmVjdGlvbnMgKHRoZSBpbi1yZXBvIGNvbXBvc2UgZmlsZXMgc2V0IG1heF9jb25uZWN0aW9ucyA9IDEwMCkuCiMgICAqIGJhY2tncm91bmRfd3JpdGVyX21heF9jb25jdXJyZW5jeSAgTVVTVCBiZSBzdHJpY3RseSBsZXNzIHRoYW4KIyAgICAgY29udHJvbF9wb29sX3NpemUsIHNvIGF0IGxlYXN0CiMgICAgIChjb250cm9sX3Bvb2xfc2l6ZSAtIGJhY2tncm91bmRfd3JpdGVyX21heF9jb25jdXJyZW5jeSkgY29ubmVjdGlvbnMgYXJlCiMgICAgIGFsd2F5cyByZXNlcnZlZCBmb3IgdGhlIGhvdCByZXF1ZXN0IHBhdGggZHVyaW5nIHRoZSBib290IHdyaXRlIHN0b3JtLgojCiMgRW52IHZhcnMgdXNlIHRoZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3IuCltkYXRhYmFzZV0KIyBDb250cm9sLXBsYW5lIHBvb2w6IG1hbmFnZW1lbnQgQVBJICsgdGhlIGhvdCByZXF1ZXN0LXBhdGggcHJveHkta2V5IGxvb2t1cCArCiMgYmFja2dyb3VuZCBjb250cm9sLXBsYW5lIHdyaXRlcnMuIERlZmF1bHQ6IDUuCiMgRW52OiBQUk9YWV9EQVRBQkFTRV9fQ09OVFJPTF9QT09MX1NJWkUKY29udHJvbF9wb29sX3NpemUgPSA1CgojIERhdGEtcGxhbmUgcG9vbDogaGlnaC10aHJvdWdocHV0IHJlcXVlc3QgbG9nZ2luZy4gRGVmYXVsdDogMjAuCiMgRW52OiBQUk9YWV9EQVRBQkFTRV9fREFUQV9QT09MX1NJWkUKZGF0YV9wb29sX3NpemUgPSAyMAoKIyBIb3cgbG9uZyAoc2Vjb25kcykgYSBjYWxsZXIgd2FpdHMgZm9yIGEgZnJlZSBjb25uZWN0aW9uIGJlZm9yZSBmYWlsaW5nIGZhc3QuCiMgRGVmYXVsdDogNSAoZGVsaWJlcmF0ZWx5IHJlcGxhY2VzIHNxbHgncyAzMCBzIGRlZmF1bHQgc28gYSB0cmFuc2llbnQgc3Rvcm0KIyBzdGFsbCBkZWdyYWRlcyB0byBhIHF1aWNrIHJldHJ5YWJsZSBlcnJvciByYXRoZXIgdGhhbiBhIDMwIHMgaGFuZyAvIEhUVFAgNTAwKS4KIyBFbnY6IFBST1hZX0RBVEFCQVNFX19BQ1FVSVJFX1RJTUVPVVRfU0VDUwphY3F1aXJlX3RpbWVvdXRfc2VjcyA9IDUKCiMgTWF4IGJhY2tncm91bmQgd29ya2VycyB0aGF0IG1heSBob2xkIGEgY29udHJvbC1wbGFuZSBjb25uZWN0aW9uIGZvciBhIHdyaXRlIGF0CiMgb25jZS4gRGVmYXVsdDogMyAod2l0aCBjb250cm9sX3Bvb2xfc2l6ZSA9IDUgdGhpcyByZXNlcnZlcyA+PSAyIGNvbm5lY3Rpb25zCiMgZm9yIHRoZSByZXF1ZXN0IHBhdGggbm8gbWF0dGVyIGhvdyBidXN5IHRoZSBiYWNrZ3JvdW5kIHdyaXRlcnMgYXJlKS4KIyBFbnY6IFBST1hZX0RBVEFCQVNFX19CQUNLR1JPVU5EX1dSSVRFUl9NQVhfQ09OQ1VSUkVOQ1kKYmFja2dyb3VuZF93cml0ZXJfbWF4X2NvbmN1cnJlbmN5ID0gMwoKIyBVcHBlciBib3VuZCAobXMpIG9uIHRoZSByYW5kb20gc3RhcnR1cCBkZWxheSBhcHBsaWVkIHRvIGVhY2ggYmFja2dyb3VuZCB3b3JrZXIKIyBzbyB0aGV5IGRvIG5vdCBhbGwgaGFtbWVyIHRoZSBkYXRhYmFzZSBzaW11bHRhbmVvdXNseSBvbiBib290LiBEZWZhdWx0OiAyMDAwLgojIE9ubHkgc3RhZ2dlcnMgYmFja2dyb3VuZCB3b3JrOyBuZXZlciBkZWxheXMgbGlzdGVuZXIgYmluZCwgcmVhZGluZXNzLCBvciB0aGUKIyByZXF1ZXN0IHBhdGguIFNldCB0byAwIHRvIGRpc2FibGUgaml0dGVyLgojIEVudjogUFJPWFlfREFUQUJBU0VfX0JBQ0tHUk9VTkRfU1RBUlRVUF9KSVRURVJfTVMKYmFja2dyb3VuZF9zdGFydHVwX2ppdHRlcl9tcyA9IDIwMDAKCiMg4pSA4pSAIEFudGhyb3BpYyBwcm92aWRlciBjb25maWd1cmF0aW9uIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgT3V0Ym91bmQgbW9kZWwgc3Vic3RpdHV0aW9uIChpc3N1ZXMgIzEyNzAsICMxMjc3KS4gV2hlbiBhbiBBbnRocm9waWMgcHJpbWFyeQojIG1vZGVsIGlzIGV4cG9ydC1kaXNhYmxlZCAoZS5nLiBjbGF1ZGUtZmFibGUtNSAvIGNsYXVkZS1teXRob3MtNSwgVVMgZGlyZWN0aXZlCiMgMjAyNi0wNi0xMiksIExMQVAgcmV3cml0ZXMgaXQgdG8gYSBzYWZlIHJlcGxhY2VtZW50IEJFRk9SRSB0aGUgcHJlLXNlbmQKIyBjaG9rZXBvaW50IHNvIHJlYWwgQ2xhdWRlIENvZGUgMi4xLjE3MyB0cmFmZmljIG5ldmVyIGRlcGVuZHMgb24gQW50aHJvcGljJ3MKIyBzZXJ2ZXItc2lkZSBmYWxsYmFjay4gSXQgQUxTTyBzdHJpcHMgZXZlcnkgZXhwb3J0LWRpc2FibGVkIG1vZGVsIGZyb20gdGhlCiMgdG9wLWxldmVsIGZhbGxiYWNrc1tdIGFycmF5IHVuY29uZGl0aW9uYWxseSAoZXZlbiB3aGVuIHRoZSBwcmltYXJ5IGlzIGEgc2FmZQojIHZlcmlmaWVkIG1vZGVsKSwgc28gYSBkaXNhYmxlZCBtb2RlbCBjYW4gbmV2ZXIgYmUgcmVhY2hlZCB2aWEgc2VydmVyLXNpZGUKIyBmYWxsYmFjay4gVGhpcyBpcyBjY2gtc2FmZSAobW9kZWwgKyBmYWxsYmFja3MgYXJlIGV4Y2x1ZGVkIGZyb20gdGhlIGJpbGxpbmcKIyBzaWduYXR1cmUpIGFuZCBydW5zIGJlZm9yZSB0aGUgdmVyaWZpZWQtc3VyZmFjZSB0b2tlbi1idXJuIGd1YXJkLgojCiMgRGVmYXVsdHMgKGFwcGxpZWQgd2hlbiB0aGlzIGJsb2NrIGlzIG9taXR0ZWQgZW50aXJlbHkpOgojICAgY2xhdWRlLWZhYmxlLTUgIC0+IGNsYXVkZS1vcHVzLTQtOAojICAgY2xhdWRlLW15dGhvcy01IC0+IGNsYXVkZS1vcHVzLTQtOAojCiMgUkVWRVJUIChjb25maWctb25seSwgbm8gY29kZSBjaGFuZ2UpOiB3aGVuIEFudGhyb3BpYyByZXN0b3JlcyB0aGUgbW9kZWxzLCBzZXQKIyB0aGUga2lsbCBzd2l0Y2ggKGEgc2NhbGFyIG92ZXJyaWRlIGNvbmZpZyBsYXllcnMgYWx3YXlzIGhvbm91cik6CiMgICBbYW50aHJvcGljXQojICAgbW9kZWxfc3Vic3RpdHV0aW9uc19lbmFibGVkID0gZmFsc2UKIyBPciB2aWEgZW52IChkb3VibGUtdW5kZXJzY29yZSBzZXBhcmF0b3IpOgojICAgUFJPWFlfQU5USFJPUElDX19NT0RFTF9TVUJTVElUVVRJT05TX0VOQUJMRUQ9ZmFsc2UKIyBDb25maWcgaXMgbG9hZGVkIG9uY2UgYXQgc3RhcnR1cCAodGhlcmUgaXMgbm8gU0lHSFVQIC8gaG90LXJlbG9hZCksIHNvIGFmdGVyCiMgY2hhbmdpbmcgdGhpcyB5b3UgbXVzdCBSRVNUQVJUIFRIRSBQUk9DRVNTIGZvciBpdCB0byB0YWtlIGVmZmVjdC4KIwojIFRPS0VOLUJVUk4gV0FSTklORzogd2hpbGUgY2xhdWRlLWZhYmxlLTUgLyBjbGF1ZGUtbXl0aG9zLTUgcmVtYWluIHZlcmlmaWVkCiMgQW50aHJvcGljIHN1cmZhY2VzLCB0aGlzIHN1YnN0aXR1dGlvbiBpcyB0aGUgT05MWSB0aGluZyBrZWVwaW5nIHRoZW0gb2ZmIGEgcmVhbAojIGFjY291bnQuIERpc2FibGluZyBpdCAobW9kZWxfc3Vic3RpdHV0aW9uc19lbmFibGVkID0gZmFsc2UpIGxldHMgYSByZXF1ZXN0CiMgY2Fycnlpbmcgb25lIG9mIHRoZXNlIChhcyBwcmltYXJ5IG9yIGluc2lkZSBmYWxsYmFja3NbXSkgcmVhY2ggQW50aHJvcGljIGFuZAojIHBlcm1hbmVudGx5IGJ1cm4gdGhlIGFjY291bnQgdG9rZW4uIE9ubHkgZGlzYWJsZSBvbmNlIEFudGhyb3BpYyBoYXMgY29uZmlybWVkCiMgdGhlIG1vZGVscyBhcmUgcmVzdG9yZWQg4oCUIHN0YXJ0dXAgbG9ncyBhIGxvdWQgd2FybmluZyBpZiB5b3UgZGlzYWJsZSBpdCB3aGlsZSBhCiMgZGlzYWJsZWQgbW9kZWwgaXMgc3RpbGwgdmVyaWZpZWQuCiMKIyBUbyBjaGFuZ2UgYSBzaW5nbGUgbWFwcGluZyBpbnN0ZWFkIG9mIGRpc2FibGluZyBldmVyeXRoaW5nLCBvdmVycmlkZSB0aGUgcGFpcgojIGluIHRoaXMgVE9NTCBibG9jayAocGVyLXBhaXIgZW52IG92ZXJyaWRlcyBhcmUgbm90IHN1cHBvcnRlZCDigJQgbW9kZWwgaWRzCiMgY29udGFpbiBoeXBoZW5zLCB3aGljaCBhcmUgbm90IHZhbGlkIFBPU0lYIHNoZWxsIHZhcmlhYmxlIG5hbWVzKToKIyAgIFthbnRocm9waWMubW9kZWxfc3Vic3RpdHV0aW9uc10KIyAgIGNsYXVkZS1mYWJsZS01ID0gImNsYXVkZS1vcHVzLTQtOCIKIyAgIGNsYXVkZS1teXRob3MtNSA9ICJjbGF1ZGUtb3B1cy00LTgiCiMKIyBbYW50aHJvcGljXQojIG1vZGVsX3N1YnN0aXR1dGlvbnNfZW5hYmxlZCA9IHRydWUKCiMg4pSA4pSAIEZvcndhcmQgcHJveHkgVENQIGxpc3RlbmVyIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgQ29udHJvbHMgdGhlIHJhdyBUQ1AgbGlzdGVuZXIgZm9yIEhUVFAgQ09OTkVDVCB0dW5uZWxsaW5nLgojIENsaWVudHMgc2V0IEhUVFBTX1BST1hZPWh0dHA6Ly9ob3N0OjMwMDEgdG8gdXNlIHRoaXMgbW9kZS4KIwojIE5vdGUgb24gZW52IHZhciBuYW1pbmc6IG5lc3RlZCBzdHJ1Y3QgZmllbGRzIHJlcXVpcmUgRE9VQkxFLVVOREVSU0NPUkUgc2VwYXJhdG9ycy4KIyAgIFBST1hZX0ZPUldBUkRfUFJPWFlfX0VOQUJMRUQ9dHJ1ZQojICAgUFJPWFlfRk9SV0FSRF9QUk9YWV9fUE9SVD04MDgwCiMgICBQUk9YWV9GT1JXQVJEX1BST1hZX19SRVFVSVJFX0FVVEg9dHJ1ZQpbZm9yd2FyZF9wcm94eV0KIyBXaGV0aGVyIHRoZSByYXcgVENQIENPTk5FQ1QgbGlzdGVuZXIgaXMgYWN0aXZlLiBEZWZhdWx0OiB0cnVlLgojIEVudjogUFJPWFlfRk9SV0FSRF9QUk9YWV9fRU5BQkxFRCAoZG91YmxlIHVuZGVyc2NvcmUpCmVuYWJsZWQgPSB0cnVlCgojIFBvcnQgZm9yIHRoZSBUQ1AgQ09OTkVDVCBsaXN0ZW5lci4gRGVmYXVsdDogMzAwMS4KIyBFbnY6IFBST1hZX0ZPUldBUkRfUFJPWFlfX1BPUlQgKGRvdWJsZSB1bmRlcnNjb3JlKQpwb3J0ID0gMzAwMQoKIyBXaGV0aGVyIGEgdmFsaWQgUHJveHktQXV0aG9yaXphdGlvbiBpcyByZXF1aXJlZCBvbiBldmVyeSBDT05ORUNUIHJlcXVlc3QuCiMgRGVmYXVsdDogdHJ1ZSAoZGVmYXVsdC1zZWN1cmUpLiBXaGVuIHRydWUsIGV2ZXJ5IENPTk5FQ1QgbXVzdCBjYXJyeSBhIHZhbGlkCiMgUHJveHktQXV0aG9yaXphdGlvbjogQmFzaWMgYmFzZTY0KHByeC1rZXk6KSBoZWFkZXIgb3IgaXQgaXMgcmVqZWN0ZWQgd2l0aCA0MDcuCiMgU2V0IHRvIGZhbHNlIE9OTFkgaW4gZGV2ZWxvcG1lbnQvdGVzdGluZyBlbnZpcm9ubWVudHMgd2hlcmUgdGhlIGZvcndhcmQgcHJveHkKIyBpcyBub3QgcmVhY2hhYmxlIGZyb20gdW50cnVzdGVkIG5ldHdvcmtzOiB0aGF0IHBlcm1pdHMgYW5vbnltb3VzICh1bmF1dGhlbi0KIyB0aWNhdGVkKSBDT05ORUNUIHR1bm5lbHMgYW5kIGVtaXRzIGEgc3RhcnR1cCB3YXJuaW5nLiBBIGNyZWRlbnRpYWwgdGhhdCBJUwojIHByZXNlbnRlZCBpcyBhbHdheXMgdmFsaWRhdGVkIChmYWlsLWNsb3NlZCkgcmVnYXJkbGVzcyBvZiB0aGlzIGZsYWcuCiMgRW52OiBQUk9YWV9GT1JXQVJEX1BST1hZX19SRVFVSVJFX0FVVEggKGRvdWJsZSB1bmRlcnNjb3JlKQpyZXF1aXJlX2F1dGggPSB0cnVlCgojIFdoZXRoZXIgVExTIGludGVyY2VwdGlvbiAoTUlUTSBtb2RlKSBpcyBhY3RpdmUuIERlZmF1bHQ6IHRydWUuCiMKIyBUaGUgcHJveHkgTUlUTXMgQUxMIHRyYWZmaWMgKEhUVFAsIEhUVFBTLCBXZWJTb2NrZXRzKSBieSBkZWZhdWx0IOKAlCB0aGlzIGlzCiMgdGhlIGludGVuZGVkIG9wZXJhdGluZyBtb2RlLiBJbnNwZWN0aW9uIGlzIHJlcXVpcmVkIHRvIGVuZm9yY2UgcGVyLWtleSBtb2RlbAojIHJlc3RyaWN0aW9ucywgcmF0ZSBsaW1pdHMsIHVzYWdlIGFjY291bnRpbmcsIGFuZCByZXF1ZXN0IGxvZ2dpbmcuCiMKIyBTZXQgdG8gZmFsc2Ugb25seSB3aGVuIE1JVE0gaXMgZXhwbGljaXRseSB1bmRlc2lyZWQgKGUuZy4gbm9uLUxMTSBwYXNzdGhyb3VnaAojIG9yIGVudmlyb25tZW50cyB0aGF0IHByb2hpYml0IFRMUyBpbnRlcmNlcHRpb24pLiBSZXF1aXJlcyBhIENBIGNlcnRpZmljYXRlCiMgKGNhX3N0b3JhZ2VfZGlyIG9yIGNhX2NlcnRfcGVtIC8gY2Ffa2V5X3BlbSkgd2hlbiB0cnVlLgojCiMgRW52OiBQUk9YWV9GT1JXQVJEX1BST1hZX19UTFNfSU5URVJDRVBUIChkb3VibGUgdW5kZXJzY29yZSkKdGxzX2ludGVyY2VwdCA9IHRydWUKCiMg4pSA4pSAIFVuZXhwZWN0ZWQgcmVxdWVzdCB0cmFwIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgVGhlIHRyYXAgc3lzdGVtIGRldGVjdHMgYW5kIGxvZ3MgcmVxdWVzdHMgdGhhdCBkbyBub3QgbWF0Y2ggYW55IGtub3duCiMgcHJvdmlkZXIgcm91dGUuICBJdCBzYW1wbGVzIHRoZXNlICJ1bmV4cGVjdGVkIiByZXF1ZXN0cywgc3RvcmVzIG1ldGFkYXRhCiMgZm9yIGRlYnVnZ2luZywgYW5kIGNhbiBvcHRpb25hbGx5IGZpbGUgR2l0SHViIGlzc3VlcyBmb3IgbmV3IHBhdHRlcm5zLgojCiMgTm90ZSBvbiBlbnYgdmFyIG5hbWluZzogbmVzdGVkIHN0cnVjdCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBzZXBhcmF0b3JzLgojICAgUFJPWFlfVFJBUF9fRU5BQkxFRD10cnVlCiMgICBQUk9YWV9UUkFQX19TQU1QTElOR19SQVRFPTAuMDEKIyAgIFBST1hZX1RSQVBfX01BWF9TQU1QTEVTX1BFUl9QQVRURVJOPTEwMAojICAgUFJPWFlfVFJBUF9fQk9EWV9TVU1NQVJZX01BWF9CWVRFUz0xMDI0CiMgICBQUk9YWV9UUkFQX19HSVRIVUJfX0RFRkFVTFRfUkVQTz1vd25lci9yZXBvCiMgICBQUk9YWV9UUkFQX19HSVRIVUJfX1RPS0VOX0VOVj1UUkFQX0dJVEhVQl9UT0tFTgpbdHJhcF0KIyBNYXN0ZXIgc3dpdGNoIGZvciB0cmFwIGRldGVjdGlvbi4gRGVmYXVsdDogdHJ1ZS4KIyBFbnY6IFBST1hZX1RSQVBfX0VOQUJMRUQgKGRvdWJsZSB1bmRlcnNjb3JlKQplbmFibGVkID0gdHJ1ZQoKIyBTYW1wbGluZyByYXRlIGFmdGVyIGZpcnN0IG9jY3VycmVuY2UgKDAuMC0xLjApLgojIEZpcnN0IG9jY3VycmVuY2UgaXMgYWx3YXlzIGNhcHR1cmVkOyBzdWJzZXF1ZW50IG9uZXMgYXJlIHNhbXBsZWQgYXQgdGhpcyByYXRlLgojIERlZmF1bHQ6IDAuMDEgKDElKS4gU2V0IHRvIDEuMCB0byBjYXB0dXJlIGV2ZXJ5IG9jY3VycmVuY2UuCiMgRW52OiBQUk9YWV9UUkFQX19TQU1QTElOR19SQVRFIChkb3VibGUgdW5kZXJzY29yZSkKc2FtcGxpbmdfcmF0ZSA9IDAuMDEKCiMgTWF4aW11bSBzYW1wbGVzIHN0b3JlZCBwZXIgdW5pcXVlIHRyYXAgcGF0dGVybi4gTXVzdCBiZSA+PSAxLgojIEVudjogUFJPWFlfVFJBUF9fTUFYX1NBTVBMRVNfUEVSX1BBVFRFUk4gKGRvdWJsZSB1bmRlcnNjb3JlKQptYXhfc2FtcGxlc19wZXJfcGF0dGVybiA9IDEwMAoKIyBNYXggYnl0ZXMgb2YgYm9keSBzdHJ1Y3R1cmUgc3VtbWFyeSB0byBzdG9yZSBwZXIgc2FtcGxlLiBNdXN0IGJlID49IDY0LgojIEJvZHkgY29udGVudCBpcyBuZXZlciBzdG9yZWQgdmVyYmF0aW0g4oCUIG9ubHkgc3RydWN0dXJhbCBzdW1tYXJpZXMuCiMgRW52OiBQUk9YWV9UUkFQX19CT0RZX1NVTU1BUllfTUFYX0JZVEVTIChkb3VibGUgdW5kZXJzY29yZSkKYm9keV9zdW1tYXJ5X21heF9ieXRlcyA9IDEwMjQKCiMgQWRkaXRpb25hbCByZWRhY3Rpb24gcGF0dGVybnMgYmV5b25kIGJ1aWx0LWluIGRlZmF1bHRzLgojIEFwcGxpZWQgdG8gcmVxdWVzdCBtZXRhZGF0YSBiZWZvcmUgc3RvcmFnZS4KIyByZWRhY3Rpb25fcGF0dGVybnMgPSBbIkJlYXJlciAiLCAicHJ4LSIsICJzay1hbnQtIl0KClt0cmFwLmdpdGh1Yl0KIyBEZWZhdWx0IEdpdEh1YiByZXBvIGZvciBpc3N1ZSBmaWxpbmcgKG93bmVyL3JlcG8gZm9ybWF0KS4KIyBMZWF2ZSBlbXB0eSB0byBkaXNhYmxlIEdpdEh1YiBpc3N1ZSBmaWxpbmcuCiMgRW52OiBQUk9YWV9UUkFQX19HSVRIVUJfX0RFRkFVTFRfUkVQTyAoZG91YmxlIHVuZGVyc2NvcmUpCiMgZGVmYXVsdF9yZXBvID0gIm15b3JnL215LXByb3h5IgoKIyBFbnZpcm9ubWVudCB2YXJpYWJsZSBuYW1lIGhvbGRpbmcgdGhlIEdpdEh1YiBQQVQuCiMgVGhlIHRva2VuIHZhbHVlIGlzIE5FVkVSIHN0b3JlZCBpbiBjb25maWcg4oCUIG9ubHkgdGhlIGVudiB2YXIgbmFtZS4KIyBFbnY6IFBST1hZX1RSQVBfX0dJVEhVQl9fVE9LRU5fRU5WIChkb3VibGUgdW5kZXJzY29yZSkKdG9rZW5fZW52ID0gIlRSQVBfR0lUSFVCX1RPS0VOIgoKIyDilIDilIAgR0VMRiBMb2dnaW5nIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgAojCiMgR0VMRiAoR3JheWxvZyBFeHRlbmRlZCBMb2cgRm9ybWF0KSBzZW5kcyBzdHJ1Y3R1cmVkIGV2ZW50cyB0byBhIGNvbXBhdGlibGUKIyBsb2cgYWdncmVnYXRpb24gc3lzdGVtIChHcmF5bG9nLCBMb2tpIHdpdGggR0VMRiBpbnB1dCwgTG9nc3Rhc2gsIGV0Yy4pLgojCiMgQ29uZmlndXJhdGlvbiBzZXQgaGVyZSBpcyB1c2VkIGF0IHN0YXJ0dXAuIFJ1bnRpbWUgY29uZmlnICh2aWEgV2ViVUkvVFVJIG9yCiMgdGhlIG1hbmFnZW1lbnQgQVBJIGF0IC9tYW5hZ2UvdjEvc2V0dGluZ3MvZ2VsZikgdGFrZXMgcHJlY2VkZW5jZSBvbmNlIHRoZQojIGRhdGFiYXNlIGlzIGF2YWlsYWJsZS4KIwojIE5vdGU6IG5lc3RlZCBmaWVsZHMgcmVxdWlyZSBET1VCTEUtVU5ERVJTQ09SRSBlbnYgdmFyIHNlcGFyYXRvcnMuCiMgICBQUk9YWV9HRUxGX19IT1NUPWdyYXlsb2cuZXhhbXBsZS5jb20gICAobm90IFBST1hZX0dFTEZfSE9TVCkKW2dlbGZdCiMgV2hldGhlciBHRUxGIGxvZ2dpbmcgaXMgZW5hYmxlZCBhdCBzdGFydHVwLgojIEVudjogUFJPWFlfR0VMRl9fRU5BQkxFRAplbmFibGVkID0gZmFsc2UKCiMgR0VMRiBzZXJ2ZXIgaG9zdG5hbWUgb3IgSVAgYWRkcmVzcy4KIyBFbnY6IFBST1hZX0dFTEZfX0hPU1QKIyBob3N0ID0gImdyYXlsb2cuZXhhbXBsZS5jb20iCgojIEdFTEYgc2VydmVyIHBvcnQuIERlZmF1bHQ6IDEyMjAxLgojIEVudjogUFJPWFlfR0VMRl9fUE9SVApwb3J0ID0gMTIyMDEKCiMgVHJhbnNwb3J0IHByb3RvY29sOiAidWRwIiwgInRjcCIsIG9yICJ0Y3BfdGxzIi4KIyBFbnY6IFBST1hZX0dFTEZfX1BST1RPQ09MCnByb3RvY29sID0gInVkcCIKCiMgUGF0aCB0byBhIFBFTS1lbmNvZGVkIENBIGNlcnRpZmljYXRlIGZvciBUTFMgdmVyaWZpY2F0aW9uLgojIFJlcXVpcmVkIHdoZW4gcHJvdG9jb2wgPSAidGNwX3RscyIuCiMgRW52OiBQUk9YWV9HRUxGX19UTFNfQ0FfQ0VSVF9QQVRICiMgdGxzX2NhX2NlcnRfcGF0aCA9ICIvZXRjL3NzbC9jZXJ0cy9nZWxmLWNhLnBlbSIKCiMgRmFjaWxpdHkgc3RyaW5nIGluY2x1ZGVkIGluIGV2ZXJ5IEdFTEYgbWVzc2FnZS4KIyBFbnY6IFBST1hZX0dFTEZfX0ZBQ0lMSVRZCmZhY2lsaXR5ID0gImxsbS1wcm94eSIKCiMgU3Vic2NyaXB0aW9uIHVzYWdlIHRocmVzaG9sZCBwZXJjZW50YWdlcyAoc29ydGVkLCBkZWR1cGxpY2F0ZWQsIDDigJMxMDApLgojIEVudjogUFJPWFlfR0VMRl9fU1VCU0NSSVBUSU9OX1RIUkVTSE9MRFMgKEpTT04gYXJyYXkpCnN1YnNjcmlwdGlvbl90aHJlc2hvbGRzID0gWzc1LjAsIDkwLjAsIDk1LjBdCgojIE1pbmltdW0gcGVyY2VudGFnZSBkZWx0YSBiZWZvcmUgYSBzdWJzY3JpcHRpb24gdXNhZ2UgZXZlbnQgZmlyZXMgYWdhaW4uCiMgRW52OiBQUk9YWV9HRUxGX19TVUJTQ1JJUFRJT05fREVMVEFfUENUCiMgc3Vic2NyaXB0aW9uX2RlbHRhX3BjdCA9IDUuMAoKIyBNaW5pbXVtIFVTRCBjb3N0IGRlbHRhIGJlZm9yZSBhbiBBUEkga2V5IGNvc3QgZXZlbnQgZmlyZXMgYWdhaW4uCiMgRW52OiBQUk9YWV9HRUxGX19BUElLRVlfRE9MTEFSX0RFTFRBCiMgYXBpa2V5X2RvbGxhcl9kZWx0YSA9ICIxLjAwIgoKIyBFdmVudCBjYXRlZ29yeSB0b2dnbGVzLgplbWl0X2F1dGhfZXZlbnRzICAgID0gdHJ1ZQplbWl0X2tleV9ldmVudHMgICAgID0gdHJ1ZQplbWl0X2FjY291bnRfZXZlbnRzID0gdHJ1ZQplbWl0X2hlYWx0aF9ldmVudHMgID0gdHJ1ZQplbWl0X3VzYWdlX2V2ZW50cyAgID0gdHJ1ZQplbWl0X2JhY2t1cF9ldmVudHMgID0gdHJ1ZQoKIyDilIDilIAgUHJvdmlkZXIgbm90ZXMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiMKIyBQcm92aWRlciBhY2NvdW50cyAoQW50aHJvcGljLCB6LmFpLCBPcGVuQUksIE9wZW5Sb3V0ZXIsIE9sbGFtYSwgZXRjLikgYXJlCiMgY29uZmlndXJlZCB2aWEgdGhlIG1hbmFnZW1lbnQgQVBJIG9yIHdlYiBkYXNoYm9hcmQg4oCUIG5vdCBpbiB0aGlzIGNvbmZpZyBmaWxlLgojIEVhY2ggcHJvdmlkZXIgYWNjb3VudCBzdG9yZXMgaXRzIGNyZWRlbnRpYWwgKEFQSSBrZXkgb3IgT0F1dGggdG9rZW4pIGVuY3J5cHRlZAojIGluIHRoZSBkYXRhYmFzZSB1c2luZyBlbnZlbG9wZSBlbmNyeXB0aW9uIChzZWUga2VrX3NvdXJjZSBhYm92ZSkuCiMKIyBBbnRocm9waWM6IEZ1bGwgT0F1dGggbGlmZWN5Y2xlIHN1cHBvcnQgKGJhY2tncm91bmQgcmVmcmVzaCwgdG9rZW4gcm90YXRpb24pLAojIGFsb25nIHdpdGggdGhlIDQtdGllciBoZWFkZXIgcG9saWN5IGZvciBzYWZlIGNyZWRlbnRpYWwgaGFuZGxpbmcuCiMKIyB6LmFpOiB6LmFpIGlzIERVQUwtRU5EUE9JTlQg4oCUIHRoZSBwcm94eSByb3V0ZXMgYnkgdGhlIElOQk9VTkQgY29uc3VtZXIKIyBwcm90b2NvbCB0byB0aGUgbWF0Y2hpbmcgei5haSBOQVRJVkUgZW5kcG9pbnQsIHdpdGggbm8gY3Jvc3MtcHJvdG9jb2wKIyB0cmFuc2xhdGlvbiBpbiBlaXRoZXIgZGlyZWN0aW9uOgojICAgKiBBbnRocm9waWMgaW5ib3VuZCAoUE9TVCAvdjEvbWVzc2FnZXMsIGUuZy4gQ2xhdWRlIENvZGUpIC0+IHouYWkncwojICAgICBBbnRocm9waWMgTWVzc2FnZXMgZW5kcG9pbnQgaHR0cHM6Ly9hcGkuei5haS9hcGkvYW50aHJvcGljIChmdWxsIDQtdGllcgojICAgICBDbGF1ZGUgQ29kZSBoZWFkZXIgcG9saWN5LCByZXF1ZXN0IHNoYXBlIGlkZW50aWNhbCB0byBBbnRocm9waWMpLgojICAgKiBPcGVuQUkgaW5ib3VuZCAoUE9TVCAvdjEvY2hhdC9jb21wbGV0aW9ucykgLT4gei5haSdzIE9wZW5BSS1jb21wYXRpYmxlCiMgICAgIGVuZHBvaW50IGh0dHBzOi8vYXBpLnouYWkvYXBpL3BhYXMvdjQvY2hhdC9jb21wbGV0aW9ucyAocGxhaW4gT3BlbkFJLXN0eWxlCiMgICAgIEJlYXJlciBoZWFkZXJzLCBuYXRpdmUgcGFzc3Rocm91Z2g7IHRoZSAvdjQgYmFzZSBtZWFucyB0aGUgaW5ib3VuZCAvdjEgcGF0aAojICAgICBpcyByZXdyaXR0ZW4gdG8gdGhlIGJhcmUgL2NoYXQvY29tcGxldGlvbnMgc3VmZml4KS4gVGhlIENvZGluZy1QbGFuIE9wZW5BSQojICAgICBiYXNlICgvYXBpL2NvZGluZy9wYWFzL3Y0KSBpcyBvdXQgb2Ygc2NvcGUuCiMgQm90aCBzdXJmYWNlcyB1c2UgYmVhcmVyLXRva2VuIGF1dGggKEFQSSBrZXkgb25seTsgT0F1dGggaXMgbm90IHN1cHBvcnRlZCksCiMgYXBwbHkgdGhlIHZlcmlmaWVkLXN1cmZhY2UgZ3VhcmQgKCMxMjQzLyMxNDIxKSBmb3IgdG9rZW4tYnVybiBzYWZldHkgb24gRUFDSAojIGVuZHBvaW50LCBhbmQgc291cmNlIG1vZGVsIGVudGl0bGVtZW50IGZyb20gei5haSdzIG93biBgL3YxL21vZGVsc2AgY2F0YWxvZ3VlCiMgKGNhY2hlZCBpbiBwcm92aWRlcl9tb2RlbHM7IGJhY2tncm91bmQgcmVmcmVzaGVyIHBvbGxzIG9uIGEgVFRMKS4gei5haSBhY2NlcHRzCiMgQkFSRSBHTE0gaWRzIG9ubHkgKGdsbS01LjIsIGdsbS00LjYsIGdsbS01LjJbMW1dKTsgYW4gT3BlblJvdXRlci1zdHlsZSBgei1haS9gCiMgcHJlZml4IGlzIHN0cmlwcGVkIGJlZm9yZSB0aGUgcmVxdWVzdCBsZWF2ZXMgZm9yIHouYWkuIENvbmZpZ3VyYXRpb246IG9uIHRoZQojIEFQSSBvciB3ZWIvVFVJIGRhc2hib2FyZHMsIGNyZWF0ZSBhIHByb3ZpZGVyIGFjY291bnQsIHNlbGVjdCAiei5haSIgYXMgdGhlCiMgcHJvdmlkZXIgdHlwZSwgY2hvb3NlICJBUEkga2V5IiBhdXRoIG1ldGhvZCwgYW5kIHBhc3RlIHlvdXIgei5haSBBUEkga2V5LgojIFNhdmUgdGhlIGFjY291bnQgYW5kIGNvbmZpcm0gdGhlIGJhY2tncm91bmQgbW9kZWwgZGlzY292ZXJ5IHBvcHVsYXRlZCB0aGUKIyBwcm92aWRlcl9tb2RlbHMgdGFibGUgKHZpc2libGUgaW4gdGhlIGFjY291bnQgZGV0YWlscyBvciBtYW5hZ2VtZW50IEFQSSkuIFRoZW4KIyBhZGQgdGhlIHouYWkgYWNjb3VudCB0byBhIHByb3h5IGtleSdzIHJvdXRpbmcgcG9saWN5LgojCiMgU2FrYW5hOiBTYWthbmEgQUkgaXMgT1BFTkFJLU5BVElWRSBhbmQgU1VCU0NSSVBUSU9OLU9OTFkuIFRoZSBwcm94eSBzZXJ2ZXMKIyBldmVyeSBpbmJvdW5kIGRpYWxlY3QgYWdhaW5zdCBTYWthbmEncyBPcGVuQUktY29tcGF0aWJsZSBiYXNlCiMgaHR0cHM6Ly9hcGkuc2FrYW5hLmFpL3YxIChiZWFyZXItdG9rZW4gYXV0aDsgQVBJIGtleSBvbmx5IOKAlCBPQXV0aCBpcyBub3QKIyBzdXBwb3J0ZWQpOgojICAgKiBPcGVuQUkgQ2hhdCBDb21wbGV0aW9ucyBpbmJvdW5kIChQT1NUIC92MS9jaGF0L2NvbXBsZXRpb25zKSBhbmQgT3BlbkFJCiMgICAgIFJlc3BvbnNlcyBpbmJvdW5kIChQT1NUIC92MS9yZXNwb25zZXMpIGFyZSBwYXNzdGhyb3VnaCDigJQgbm8gYm9keQojICAgICB0cmFuc2xhdGlvbi4gVGhlIFJlc3BvbnNlcyBBUEkgaXMgdGhlIGRvbWluYW50IGBmdWd1LXVsdHJhYCBwYXRoLgojICAgKiBBbnRocm9waWMgaW5ib3VuZCAoUE9TVCAvdjEvbWVzc2FnZXMsIGUuZy4gQ2xhdWRlIENvZGUpIGlzIHRyYW5zbGF0ZWQgdG8KIyAgICAgT3BlbkFJIENoYXQgQ29tcGxldGlvbnMgSU5URVJOQUxMWSBieSB0aGUgU2FrYW5hIHByb3ZpZGVyIGFuZCByb3V0ZWQgdG8KIyAgICAgL3YxL2NoYXQvY29tcGxldGlvbnM7IHRoZSByZXNwb25zZSBpcyB0cmFuc2xhdGVkIGJhY2sgdG8gdGhlIEFudGhyb3BpYwojICAgICBzaGFwZSBmb3IgdGhlIGNsaWVudC4KIyBSb3V0aW5nIGNvc3Q6IGEgU2FrYW5hIGFjY291bnQgaXMgYSAkMCBTVUJTQ1JJUFRJT04uIFRoZSByb3V0ZXIgY29zdC1yYW5rcyBpdAojIGF0ICQwIChoYW5kbGVyIGBjb21wdXRlX2FjY291bnRfY29zdHNgIHNob3J0LWNpcmN1aXRzIEJFRk9SRSBhbnkgcHJpY2luZwojIGxvb2t1cCksIHNvIGEgU2FrYW5hIGFjY291bnQgYWx3YXlzIHdpbnMgb24gY29zdCBhZ2FpbnN0IGEgbWV0ZXJlZCBjb21wZXRpdG9yCiMgb2ZmZXJpbmcgdGhlIHNhbWUgbW9kZWwg4oCUIFNha2FuYSBpcyBuZXZlciB0YWJsZS1wcmljZWQgZm9yIFJPVVRJTkcuCiMgUHJpY2luZyByb3dzIGFyZSBSRUZFUkVOQ0UtT05MWSAob2JzZXJ2YWJpbGl0eSk6IG1pZ3JhdGlvbiAwMDg3IHNlZWRzIHRoZQojIGVxdWl2YWxlbnQgUEFZRyBsaXN0IHByaWNlIGZvciBgZnVndWAgYW5kIGBmdWd1LXVsdHJhYCBzbyBlYWNoIHJlcXVlc3QgUkVDT1JEUwojIGl0cyBlcXVpdmFsZW50IGNvc3QgaW4gcmVxdWVzdF9sb2cgKGNvc3RfdXNkKSwgc3VyZmFjaW5nIHRoZSBzdWJzY3JpcHRpb24ncwojIHZhbHVlLiBUaGVzZSByb3dzIE1VU1QgTk9UIGFmZmVjdCByb3V0aW5nIOKAlCByb3V0aW5nIHN0YXlzICQwLgojIFJlYXNvbmluZyBlZmZvcnQ6IFNha2FuYSBhY2NlcHRzIG9ubHkgYGhpZ2hgLCBgeGhpZ2hgLCBhbmQgYG1heGAKIyAoYHhoaWdoYCA9PSBgbWF4YCkuIGBsb3dgL2BtZWRpdW1gIGFyZSBjbGFtcGVkIFVQIHRvIGBoaWdoYCAobmV2ZXIgc2lsZW50bHkKIyBkb3duZ3JhZGVkKTsgYGhpZ2hgL2B4aGlnaGAvYG1heGAgcGFzcyB0aHJvdWdoIHVuY2hhbmdlZC4gT24gdGhlIEFudGhyb3BpYwojIGluYm91bmQgcGF0aCB0aGUgc2hhcmVkIEFudGhyb3BpYy0+T3BlbkFJIHRyYW5zbGF0aW9uIHdvdWxkIGNsYW1wIGB4aGlnaGAvYG1heGAKIyBkb3duIHRvIGBoaWdoYCwgc28gdGhlIFNha2FuYSBwcm92aWRlciBjYXB0dXJlcyB0aGUgY2xpZW50J3MgT1JJR0lOQUwgZWZmb3J0CiMgYW5kIHJlLWluamVjdHMgdGhlIHRvcCB0aWVyIGFmdGVyd2FyZCDigJQgYHhoaWdoYC9gbWF4YCBTVVJWSVZFIGVuZC10by1lbmQuCiMgTW9kZWxzOiBgZnVndWAgKHRoZSB2YXJpYWJsZS1yYXRlIHJvdXRlcikgYW5kIGBmdWd1LXVsdHJhYCAodGhlIGZsYWdzaGlwLAojIG11bHRpLWFnZW50OyByZXBvcnRzIG9yY2hlc3RyYXRpb24gdG9rZW5zIHVuZGVyIHVzYWdlLnRva2VuX2RldGFpbHMsIHdoaWNoIHRoZQojIHByb3h5IHN1bXMgaW50byB0aGUgcmVjb3JkZWQgdG90YWxzKS4gTW9kZWwgZW50aXRsZW1lbnQgaXMgc291cmNlZCBmcm9tCiMgU2FrYW5hJ3Mgb3duIC92MS9tb2RlbHMgY2F0YWxvZ3VlIChjYWNoZWQgaW4gcHJvdmlkZXJfbW9kZWxzOyBiYWNrZ3JvdW5kCiMgcmVmcmVzaGVyIHBvbGxzIG9uIGEgVFRMKS4gQ29uZmlndXJhdGlvbjogb24gdGhlIEFQSSBvciB3ZWIvVFVJIGRhc2hib2FyZHMsCiMgY3JlYXRlIGEgcHJvdmlkZXIgYWNjb3VudCwgc2VsZWN0ICJTYWthbmEiIGFzIHRoZSBwcm92aWRlciB0eXBlLCBjaG9vc2UKIyAiQVBJIGtleSIgYXV0aCBtZXRob2QsIGFuZCBwYXN0ZSB5b3VyIFNha2FuYSBBUEkga2V5LiBTYXZlIHRoZSBhY2NvdW50IGFuZAojIGNvbmZpcm0gYmFja2dyb3VuZCBtb2RlbCBkaXNjb3ZlcnkgcG9wdWxhdGVkIHByb3ZpZGVyX21vZGVscywgdGhlbiBhZGQgdGhlCiMgU2FrYW5hIGFjY291bnQgdG8gYSBwcm94eSBrZXkncyByb3V0aW5nIHBvbGljeS4gVGhlIGJhc2UgVVJMCiMgKGh0dHBzOi8vYXBpLnNha2FuYS5haS92MSkgaXMgdGhlIGZpeGVkIGRlZmF1bHQgYW5kIG5lZWRzIG5vIGNvbmZpZ3VyYXRpb24uCiMKIyBPcGVuUm91dGVyOiB1c2VzIHRoZSBzdGFuZGFyZCBhcGlfa2V5IGF1dGggcGF0aC4gTm8gcHJvdmlkZXItc3BlY2lmaWMgY29uZmlnCiMga2V5cyBhcmUgcmVxdWlyZWQuIFRoZSBtb2RlbCBjYXRhbG9ndWUgaXMgY2FjaGVkIHBlci1hY2NvdW50IGluIHRoZQojIHByb3ZpZGVyX21vZGVscyB0YWJsZSBhbmQgcmVmcmVzaGFibGUgdmlhIHRoZSBtYW5hZ2VtZW50IEFQSS4KCiMg4pSA4pSAIFN0cmVhbWluZyBsaXZlbmVzcyAmIHBlci1wcm92aWRlciBkZWNsYXJlZCB0aW1lb3V0cyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIChpc3N1ZSAjMTUwNCAvIHNwZWMgZG9jcy9zdXBlcnBvd2Vycy9zcGVjcy8yMDI2LTA2LTI0LXN0cmVhbWluZy1saXZlbmVzcy1hbmQtCiMgIHByb3ZpZGVyLXRpbWVvdXRzLWRlc2lnbi5tZCkKIwojIFRoZSBwcm94eSBkaXN0aW5ndWlzaGVzIFRSQU5TUE9SVCBsaXZlbmVzcyAodGhlIHVwc3RyZWFtIHNvY2tldCBpcyBhbGl2ZTogVENQCiMgdXAsIFRMUyB1cCwgcGVlciBwcmVzZW50KSBmcm9tIEFQUExJQ0FUSU9OIHByb2dyZXNzICh0aGUgbW9kZWwgaXMgYWN0dWFsbHkKIyBlbWl0dGluZyBoZWFkZXJzIC8gU1NFIGZyYW1lcyAvIGNvbnRlbnQgdG9rZW5zKS4gVGhlc2UgYXJlIG93bmVkIGJ5IGRpZmZlcmVudAojIHRpbWVvdXRzIGFuZCBNVVNUIE5PVCBiZSBjb25mbGF0ZWQ6CiMKIyAgICogVFJBTlNQT1JUIGxpdmVuZXNzIGlzIG93bmVkIGV4Y2x1c2l2ZWx5IGJ5IHRoZSBzaGFyZWQgdXBzdHJlYW0gY2xpZW50CiMgICAgIChjb25uZWN0IH44cywgcGVyLXJlYWQgaWRsZSB+MjQwcywgVENQIGtlZXBhbGl2ZSB+MzBzKS4gQSByZWFsIHNvY2tldAojICAgICBkZWF0aCBhbHdheXMgc3VyZmFjZXMgYXMgYW4gdXBzdHJlYW0gZXJyb3IgYW5kIGZhaWxzIG92ZXIgZmFzdC4gVGhlc2UKIyAgICAgYXJlIG5vdCBjb25maWd1cmFibGUgaGVyZSAodGhleSBhcmUgdHJhbnNwb3J0IGNlaWxpbmdzLCBub3QgZGVhZGxpbmVzKS4KIyAgICogQVBQTElDQVRJT04gcHJvZ3Jlc3MgaXMgYm91bmRlZCBieSBhIHBlci1wcm92aWRlciBERUNMQVJFRCBUSU1FT1VUOiB0aGUKIyAgICAgbWF4aW11bSB3YWxsLWNsb2NrIHRoZSBwcm94eSB3aWxsIHdhaXQgZm9yIGEgcmVxdWVzdCB0byBtYWtlIHByb2dyZXNzCiMgICAgIGJlZm9yZSByZXR1cm5pbmcgYSBjbGVhbiB0aW1lb3V0IHRvIHRoZSBjb25zdW1lci4gV2lyZS1zaWxlbmNlIG9uIGEgTElWRQojICAgICBzb2NrZXQgaXMgTk9UIGEgZmFpbHVyZSDigJQgYSByZWFzb25pbmcgbW9kZWwgKGUuZy4gU2FrYW5hIGZ1Z3UvZnVndS11bHRyYSkKIyAgICAgY2FuIHRoaW5rIGZvciBtaW51dGVzLXRvLWhvdXJzIGFuZCBpcyBoZWFsdGh5OyB0aGUgcHJveHkgY29tbWl0cyAyMDAgKwojICAgICBTU0Uga2VlcGFsaXZlIGFuZCBob2xkcyB0aGUgcmVxdWVzdCB1bnRpbCB0aGUgbW9kZWwgc3BlYWtzLCB0aGUgc29ja2V0CiMgICAgIGRpZXMsIG9yIHRoZSBkZWNsYXJlZCB0aW1lb3V0IGVsYXBzZXMuCiMKIyBFYWNoIFByb3ZpZGVyVHlwZSBoYXMgYSBERUZBVUxUIGRlY2xhcmVkIHRpbWVvdXQgbWF0Y2hpbmcgaXRzIGxhdGVuY3kKIyBwcm9maWxlLCByZXNvbHZlZCBwZXIgcmVxdWVzdCBhczoKIyAgICAgZGVjbGFyZWQgPSBjbGFtcChjb25zdW1lcl9zdXBwbGllZF90aW1lb3V0LnVud3JhcF9vcihwcm92aWRlcl9kZWZhdWx0KSwKIyAgICAgICAgICAgICAgICAgICAgICBsb3dlciA9IE1JTl9ERUNMQVJFRF9USU1FT1VULCAgICMgZmxvb3IKIyAgICAgICAgICAgICAgICAgICAgICB1cHBlciA9IEhBUkRfQ0VJTElORykgICAgICAgICAgICMgYWJzb2x1dGUgbWF4aW11bQojIEEgY29uc3VtZXItc3VwcGxpZWQgdGltZW91dCBvdmVycmlkZXMgdGhlIHByb3ZpZGVyIGRlZmF1bHQgRE9XTldBUkQgKGEgY2xpZW50CiMgbWF5IGFzayBmb3IgbGVzcyk7IGEgcmVxdWVzdCBmb3IgTU9SRSBpcyBob25vdXJlZCBvbmx5IHVwIHRvIEhBUkRfQ0VJTElORy4KIwojIFByb3ZpZGVyIGRlZmF1bHRzIChQTEFDRUhPTERFUiB2YWx1ZXMg4oCUIHRoZSBleGFjdCBwZXItcHJvdmlkZXIgdGFibGUgaXMgYmVpbmcKIyBmaW5hbGlzZWQgYnkgYSBzZXBhcmF0ZSByZXNlYXJjaCBwYXNzOyB0aGUgbW9kZWwgKyB0aGUgU2FrYW5hIGFuY2hvciBhcmUKIyBmaXhlZCkuIFRoZXNlIGtleXMgYXJlIE5PVCB5ZXQgcmVhZCBieSB0aGUgc2VydmVyOyB0aGlzIGJsb2NrIGRvY3VtZW50cyB0aGUKIyBpbnRlbmRlZCBzaGFwZSBhbmQgcmVzZXJ2ZXMgdGhlIG5hbWVzLiBEdXJhdGlvbnMgYWNjZXB0IGEgaHVtYW50aW1lIHN0cmluZwojIChlLmcuICIyaCIsICIxNW0iLCAiNDVzIikuCiMKIyBbcmV2ZXJzZV9wcm94eS5kZWNsYXJlZF90aW1lb3V0c10KIyAjIFNsb3cgbXVsdGktYWdlbnQgcmVhc29uaW5nIHByb3ZpZGVyIOKAlCBtYXRjaGVzIFNha2FuYSdzIHB1Ymxpc2hlZAojICMgc3RyZWFtX2lkbGVfdGltZW91dF9tcy4gQU5DSE9SIHZhbHVlLCBkbyBub3QgbG93ZXIgYmVsb3cgdGhpcy4KIyBzYWthbmEgICAgICAgPSAiMmgiCiMgIyBUeXBpY2FsIGNoYXQvY29tcGxldGlvbnMgcHJvdmlkZXJzIOKAlCBwbGFjZWhvbGRlciwgcGVuZGluZyByZXNlYXJjaC4KIyBhbnRocm9waWMgICAgPSAiMTVtIgojIG9wZW5haSAgICAgICA9ICIxNW0iCiMgb3BlbmFpX2NvZGV4ID0gIjE1bSIKIyBvcGVucm91dGVyICAgPSAiMTVtIgojIHphaSAgICAgICAgICA9ICIxNW0iCiMgIyBGYXN0L2xvY2FsIHByb3ZpZGVycyBtYXkgYmUgc2hvcnRlci4KIyBvbGxhbWEgICAgICAgPSAiMTBtIgojIGxvY2FsX2xsbSAgICA9ICIxMG0iCiMgIyBGYWxsYmFjayBmb3IgYW55IHByb3ZpZGVyIHdpdGhvdXQgYW4gZXhwbGljaXQgZW50cnkgYWJvdmUuCiMgZGVmYXVsdCAgICAgID0gIjE1bSIKIyAjIEFic29sdXRlIGJvdW5kcyBhcHBsaWVkIHRvIGV2ZXJ5IHJlc29sdmVkIHRpbWVvdXQgKHByb3ZpZGVyIGRlZmF1bHQgQU5EIGFueQojICMgY29uc3VtZXIgb3ZlcnJpZGUpLiBIQVJEX0NFSUxJTkcgaXMgdGhlIGxhc3QgbGluZSBvZiB0aGUgYW50aS1oYW5nCiMgIyBndWFyYW50ZWU6IGV2ZW4gYSBtaXNjb25maWd1cmVkIDJoIHJlcXVlc3QgY2Fubm90IHdhaXQgZm9yZXZlci4KIyBmbG9vciAgICAgICAgPSAiOHMiCiMgaGFyZF9jZWlsaW5nID0gIjJoIgojCiMgT3BlcmF0b3IgLyB0ZXN0IGVzY2FwZSBoYXRjaDogdGhlIGxlZ2FjeSBmbGVldC13aWRlIG92ZXJsb2FkIGJ1ZGdldCByZXRhaW5zCiMgaXRzIGVudiBvdmVycmlkZSwgbGF5ZXJlZCBVTkRFUiB0aGUgcGVyLXByb3ZpZGVyIGRlZmF1bHQgKGFuIGV4cGxpY2l0IGVudgojIG92ZXJyaWRlIHN0aWxsIHdpbnMsIGZvciBkZXRlcm1pbmlzdGljIHRlc3Qgd2FsbC1jbG9ja3MpOgojICAgRW52OiBMTEFQX1NFUlZJQ0VfT1ZFUkxPQURfVE9UQUxfQlVER0VUX1NFQ1MgICAoZGVmYXVsdCA1MDsgcmVwbGFjZWQgYnkgdGhlCiMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwZXItcHJvdmlkZXIgZGVjbGFyZWQgdGltZW91dAojICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZm9yIHRoZSBzZWxlY3RlZCBQcm92aWRlclR5cGUpCiMgICBFbnY6IExMQVBfU1NFX0VBUkxZX0ZMVVNIX0RFQURMSU5FX1NFQ1MgICAgICAgIChjb250ZW50LWRlYWRsaW5lIGJlZm9yZQojICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY29tbWl0LTIwMCArIGtlZXBhbGl2ZTsgZGVmYXVsdCAxNSkKIyAgIEVudjogTExBUF9TU0VfQ0xJRU5UX0tFRVBBTElWRV9TRUNTICAgICAgICAgICAgKGNsaWVudC1mYWNpbmcgU1NFIGtlZXBhbGl2ZQojICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY2FkZW5jZTsgZGVmYXVsdCAxMCkKIyAgIEVudjogTExBUF9DT0RFWF9TVFJFQU1fSURMRV9ERUFETElORV9TRUNTICAgICAgIChDb2RleCBhcHBsaWNhdGlvbi1ldmVudCBpZGxlCiMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBib3VuZGFyeSBhZnRlciBoYW5kb2ZmOyBwb3NpdGl2ZQojICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdmFsdWVzIHVwIHRvIGRlZmF1bHQgMjQwIG9ubHk7CiMgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBQaW5nL1BvbmcgZG8gbm90IHJlc2V0IGl0KQoKIyDilIDilIAgRm9yd2FyZCBwcm94eSBDQSBjZXJ0aWZpY2F0ZSBwZXJzaXN0ZW5jZSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKIwojIFBhdGggdG8gZGlyZWN0b3J5IGZvciBwZXJzaXN0aW5nIHRoZSBmb3J3YXJkIHByb3h5IENBIGNlcnRpZmljYXRlLgojIE9uIGZpcnN0IHN0YXJ0dXA6IENBIGNlcnQgYW5kIGtleSBhcmUgZ2VuZXJhdGVkIGFuZCB3cml0dGVuIGhlcmUuCiMgT24gc3Vic2VxdWVudCBzdGFydHVwczogdGhlIGV4aXN0aW5nIHBhaXIgaXMgbG9hZGVkIGZyb20gdGhpcyBkaXJlY3RvcnkuCiMgUGFydGlhbCBzdGF0ZSAob25lIGZpbGUgd2l0aG91dCB0aGUgb3RoZXIpIGNhdXNlcyBhIHN0YXJ0dXAgZXJyb3IuCiMgRXhwaXJlZCBDQSBjYXVzZXMgYSBzdGFydHVwIGVycm9yIOKAlCBkZWxldGUgYm90aCBmaWxlcyBhbmQgcmVzdGFydCB0byByb3RhdGUuCiMgV2hlbiB1bnNldDogZXBoZW1lcmFsIENBIGlzIGdlbmVyYXRlZCBvbiBlYWNoIHN0YXJ0dXAgKGRldmVsb3BtZW50IG9ubHkpLgojIEluIHByb2R1Y3Rpb24sIHNldCB0byB0aGUgcHJveHlfY2FfZGF0YSB2b2x1bWUgbW91bnQgcGF0aCAoL2NhKS4KIyBFbnY6IFBST1hZX0NBX1NUT1JBR0VfRElSCiMgY2Ffc3RvcmFnZV9kaXIgPSAiL2NhIgojCiMgQWx0ZXJuYXRpdmUgdG8gY2Ffc3RvcmFnZV9kaXI6IHN1cHBseSB0aGUgQ0EgY2VydCBhbmQga2V5IGRpcmVjdGx5IGFzIFBFTQojIHN0cmluZ3MuIEJvdGggTVVTVCBiZSBzZXQgdG9nZXRoZXIgKHNldHRpbmcgb25seSBvbmUgaXMgYSBzdGFydHVwIGVycm9yKS4KIyBXaGVuIGJvdGggYXJlIHNldCB0aGV5IHRha2UgcHJlY2VkZW5jZSBvdmVyIGNhX3N0b3JhZ2VfZGlyLiBVc2UgdGhpcyB3aGVuIHRoZQojIENBIG1hdGVyaWFsIGlzIG1hbmFnZWQgZXh0ZXJuYWxseSAoVmF1bHQsIEtNUywgYSBtb3VudGVkIHNlY3JldCkuIFRoZSBzdGFydHVwCiMgcHJlY2VkZW5jZSBpczogKDEpIGNhX2NlcnRfcGVtICsgY2Ffa2V5X3BlbSwgKDIpIGNhX3N0b3JhZ2VfZGlyLCAoMykgZXBoZW1lcmFsLgojIEVudjogUFJPWFlfQ0FfQ0VSVF9QRU0gLyBQUk9YWV9DQV9LRVlfUEVNCiMgY2FfY2VydF9wZW0gPSAiLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tXG4uLi5cbi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS1cbiIKIyBjYV9rZXlfcGVtICA9ICItLS0tLUJFR0lOIFBSSVZBVEUgS0VZLS0tLS1cbi4uLlxuLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLVxuIgo="
 EMBED_gpg_public_key="LS0tLS1CRUdJTiBQR1AgUFVCTElDIEtFWSBCTE9DSy0tLS0tCgptRE1FYWNFQ25CWUpLd1lCQkFIYVJ3OEJBUWRBZTJ0amhjTVNBbGd0UnJHMmdGdW9UOFRZNUZPTzBMUGJOeXZGCkZudkhicWUwT2t4TVRTQkJVRWtnVUhKdmVIa2dVbVZzWldGelpTQlRhV2R1YVc1bklEeHlaV3hsWVhObGMwQnMKYkcwdFlYQnBMWEJ5YjNoNUxtTnZiVDZJbGdRVEZnb0FQaFloQkU4cnZOa3ZldXlDYS9UQlZ0WkVQU3RMYXJjZgpCUUpwd1FLY0Foc2pCUWtKWmdHQUJRc0pDQWNDQmhVS0NRZ0xBZ1FXQWdNQkFoNEJBaGVBQUFvSkVOWkVQU3RMCmFyY2YzaU1BLzNHSDFwNWE3cEtxKytzaHlDYlNSdVJ2RFBWNkh0K3VFV1ZaQm1tNjhybS9BUDBmOG9rQVVrSFQKRStReUdnYXRaMXhhYmtYNi9NVllXK1BuQlJMSFVXVWtBcmd6QkduQkFwd1dDU3NHQVFRQjJrY1BBUUVIUUtnTwpjTTlCblBLSk5CUTJ5OXl3RWcxd2txZFgxL25odno3QnNlVy9VZnBVaVBVRUdCWUtBQ1lXSVFSUEs3elpMM3JzCmdtdjB3VmJXUkQwclMycTNId1VDYWNFQ25BSWJJZ1VKQ1dZQmdBQ0JDUkRXUkQwclMycTNIM1lnQkJrV0NnQWQKRmlFRWZVWkxlSWxSbHhpY2RWQ0ZFNGQvbEFHc3c2OEZBbW5CQXB3QUNna1FFNGQvbEFHc3c2OTQ3QUQrSnhNMgpOa1pFN0hCOHB2WGt3VFByWjlYZHlSK2p6WlFMOFkxSkNZY2FTUmdBLzNUajNmM3RGdUtTcWVTMU43S3NyMWFyCnBhanNtQm1LN3VLMHNhMG5kZHNGVExRQkFPWC9FTkJoanh0RUM1cUtzS3ZnQmR4ZGJieG51VEV6UWFjeC96cWcKTXZnRkFRRDg2MXVnWS9xZldLZDI3NVB6a2QyOUZMQ0FPaHVjSEw5WGtTcW4rbHMvREE9PQo9Z3VnagotLS0tLUVORCBQR1AgUFVCTElDIEtFWSBCTE9DSy0tLS0tCg=="
-# SELF_CHECKSUM: 171f87cdb355b4bd34502c1b43f5434b0d95c6aea0a68fd327655fc5875b8b71
+# SELF_CHECKSUM: be3d97224eca0758e25e69ffed730b12e7c51baa63442749c18f6b26a3df1d2f
 # --- END EMBEDDED FILES ---
 
 main "$@"

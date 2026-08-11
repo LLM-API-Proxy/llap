@@ -26,6 +26,47 @@
   "panels": [
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Authoritative backup signal (#1758). 1 = this deployment has NO usable recovery point — either no backup has ever succeeded, or the last success is older than two scheduled intervals. Agent liveness is NOT a substitute for this panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "RECOVERY POINT CURRENT" }, "1": { "text": "NO CURRENT RECOVERY POINT" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "id": 6,
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "backup_stale",
+          "legendFormat": "Backup Stale",
+          "refId": "A"
+        }
+      ],
+      "title": "Backup Recovery Point",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Process liveness ONLY. This gauge read ONLINE for weeks while zero snapshots existed (#1758). Judge backups by the Backup Recovery Point panel.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -45,7 +86,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 4 },
       "id": 1,
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -60,7 +101,7 @@
           "refId": "A"
         }
       ],
-      "title": "Backup Agent Liveness",
+      "title": "Backup Agent Process Liveness (NOT backup success)",
       "type": "stat"
     },
     {
@@ -82,7 +123,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 4 },
       "id": 2,
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -97,7 +138,7 @@
           "refId": "A"
         }
       ],
-      "title": "Last Successful Backup Age",
+      "title": "Last Successful Backup Age (NaN = never succeeded)",
       "type": "stat"
     },
     {
@@ -121,7 +162,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 4 },
       "id": 3,
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"] },
@@ -149,7 +190,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "id": 4,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -162,7 +203,7 @@
           "refId": "A"
         }
       ],
-      "title": "Backup Agent Liveness Over Time",
+      "title": "Backup Agent Process Liveness Over Time (NOT backup success)",
       "type": "timeseries"
     },
     {
@@ -175,7 +216,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "id": 5,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -190,6 +231,124 @@
       ],
       "title": "Last Successful Backup Age Over Time",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "#1758 requirement 5: a backup that cannot be restored is treated as no backup. 0 = no restore rehearsal has EVER been recorded, so the snapshots in the repository are an untested recovery point. Publish one with scripts/test_backup_restore.sh or docker exec llap-backup /app/publish-restore-rehearsal.sh.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NEVER REHEARSED" }, "1": { "text": "RECORDED" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
+      "id": 7,
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "backup_restore_rehearsal_known",
+          "legendFormat": "Rehearsal Known",
+          "refId": "A"
+        }
+      ],
+      "title": "Restore Rehearsal Recorded (untested backup = untested recovery)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Seconds since the newest restore rehearsal. NaN — rendered as No data — means none has ever been recorded; it is deliberately NOT 0, which would read as 'rehearsed a moment ago'. Red past 30 days, matching LLAPBackupRestoreRehearsalStale.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 2592000 }
+            ]
+          },
+          "unit": "s",
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 16 },
+      "id": 8,
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "backup_last_restore_rehearsal_age_seconds",
+          "legendFormat": "Rehearsal Age",
+          "refId": "A"
+        }
+      ],
+      "title": "Last Restore Rehearsal Age (NaN = never rehearsed)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "1 = the most recent restore rehearsal ran and did NOT restore. This is direct evidence the recovery point does not work, and it drives the proxy's backup health level to Critical. Distinct from 'never rehearsed', which is only an absence of evidence.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "RESTORED OK" }, "1": { "text": "FAILED TO RESTORE" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 16 },
+      "id": 9,
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "backup_last_restore_rehearsal_failed",
+          "legendFormat": "Rehearsal Failed",
+          "refId": "A"
+        }
+      ],
+      "title": "Last Restore Rehearsal Outcome",
+      "type": "stat"
     }
   ],
   "refresh": "60s",

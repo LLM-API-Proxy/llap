@@ -46,7 +46,27 @@ services:
     #   TIMESCALEDB_SHARED_BUFFERS=4GB
     #   TIMESCALEDB_EFFECTIVE_CACHE_SIZE=8GB
     #   TIMESCALEDB_WORK_MEM=64MB
-    command: -c max_connections=100 ${TIMESCALEDB_SHARED_BUFFERS:+-c shared_buffers=${TIMESCALEDB_SHARED_BUFFERS}} ${TIMESCALEDB_EFFECTIVE_CACHE_SIZE:+-c effective_cache_size=${TIMESCALEDB_EFFECTIVE_CACHE_SIZE}} ${TIMESCALEDB_WORK_MEM:+-c work_mem=${TIMESCALEDB_WORK_MEM}}
+    #
+    # ── Columnstore allocation guard (issue #1765) ────────────────────────────
+    # A columnstore batch materialises one array per column across the whole
+    # batch, and PostgreSQL refuses any single allocation of 1 GB or more
+    # (MaxAllocSize). With the old 2 MiB per-body capture cap the
+    # request_payloads_v2 policy job crashed on 31 of its 41 production runs
+    # with `invalid memory alloc request size 1444158396`.
+    #
+    # enable_compressor_batch_limit is ADAPTIVE — it shrinks only a batch that
+    # would exceed the limit — so it is safe to set server-wide and costs
+    # nothing on tables that never approach it. Verified present and settable on
+    # the pinned image above (TimescaleDB 2.27.2-pg18: `SHOW` returns `on`, the
+    # server starts clean).
+    #
+    # NOT set here: timescaledb.compression_batch_size_limit. That one is a
+    # fixed cap, and request_log compresses 74 of its 82 chunks perfectly well
+    # at the default 1000 — capping the whole server would permanently degrade
+    # it. Migration 0108 scopes the transitional cap to the LLAP database with
+    # ALTER DATABASE instead. See
+    # docs/runbooks/request-payload-storage-containment.md.
+    command: -c max_connections=100 -c timescaledb.enable_compressor_batch_limit=on ${TIMESCALEDB_SHARED_BUFFERS:+-c shared_buffers=${TIMESCALEDB_SHARED_BUFFERS}} ${TIMESCALEDB_EFFECTIVE_CACHE_SIZE:+-c effective_cache_size=${TIMESCALEDB_EFFECTIVE_CACHE_SIZE}} ${TIMESCALEDB_WORK_MEM:+-c work_mem=${TIMESCALEDB_WORK_MEM}}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
