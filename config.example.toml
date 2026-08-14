@@ -471,6 +471,20 @@ emit_backup_events  = true
 # OpenRouter: uses the standard api_key auth path. No provider-specific config
 # keys are required. The model catalogue is cached per-account in the
 # provider_models table and refreshable via the management API.
+#
+# xAI / Grok Build (epic #1794): two provider types, not one.
+#   * `xai` — paid API-key account at https://api.x.ai (Chat Completions,
+#     Responses, embeddings). Create via the dashboard or POST /manage/v1/accounts
+#     with provider="xai", auth_method="api_key".
+#   * `xai_grok` — Grok Build OAuth subscription at
+#     https://cli-chat-proxy.grok.com. Onboard via RFC 8628 device-auth
+#     (POST /manage/v1/provider-accounts/grok/auth/initiate + poll). The public
+#     Grok OAuth client_id is never invented: set LLAP_XAI_OAUTH_CLIENT_ID or
+#     GROK_OAUTH2_CLIENT_ID. Operator owns xAI / Grok terms (this is not a
+#     change to LLAP's own licence or ToS).
+# CLI setup: see docs/grok-cli-setup.md. Export GROK_CLI_CHAT_PROXY_BASE_URL
+# (IPv6 example: http://[::1]:3000) and sign in with `grok login --device-auth`.
+# Bare `grok login` is not intercepted. Host examples are IPv6-only (`[::1]`).
 
 # ── Streaming liveness & per-provider declared timeouts ──────────────────────
 #
