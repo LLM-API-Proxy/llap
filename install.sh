@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.143"
+INSTALLER_VERSION="0.0.144"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -2234,8 +2234,13 @@ verify_gpg_signature() {
     local status valid_fingerprint primary_fingerprint
     if [[ "$gpg_cmd" == "gpg" ]]; then
         local actual_fingerprint tmpring
+        tmpring=$(mktemp -d); CLEANUP_FILES+=("$tmpring")
+        chmod 0700 "$tmpring"
+        printf 'no-autostart\n' > "${tmpring}/common.conf"
+
         actual_fingerprint="$(
-            gpg --batch --no-autostart --show-keys --with-colons \
+            gpg --batch --no-autostart --homedir "$tmpring" \
+                --show-keys --with-colons \
                 "$keyring_file" 2>/dev/null \
                 | awk -F: '$1 == "fpr" { print $10; exit }'
         )" || true
@@ -2244,9 +2249,6 @@ verify_gpg_signature() {
         [[ "${actual_fingerprint^^}" == "$RELEASE_SIGNING_FINGERPRINT" ]] \
             || die "Embedded release signing public key fingerprint mismatch."
 
-        tmpring=$(mktemp -d); CLEANUP_FILES+=("$tmpring")
-        chmod 0700 "$tmpring"
-        printf 'no-autostart\n' > "${tmpring}/common.conf"
         gpg --batch --no-autostart --homedir "$tmpring" \
             --import "$keyring_file" >/dev/null 2>&1 \
             || die "Embedded release signing public key is invalid."
