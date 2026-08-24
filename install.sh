@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.144"
+INSTALLER_VERSION="0.0.145"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -4163,7 +4163,8 @@ verify_receipt_authorized_recovery_source() {
         legacy_source_identity="${RELEASE_RECOVERY_IMAGE_LOCK_VERSION}:${RELEASE_RECOVERY_IMAGE_LOCK_SOURCE_SHA}"
         case "$legacy_source_identity" in
             "0.0.130:f44021ca645c0ad3c46ff3ba0c6bfcf0b205458d" | \
-            "0.0.131:80ad7513f5fe849246c655b8384fae3881934e3b")
+            "0.0.131:80ad7513f5fe849246c655b8384fae3881934e3b" | \
+            "0.0.142:1fa01cb653083cd7315d2dbf5491ffcedde0b548")
                 ;;
             *)
                 die "An unpinned source is not an authorized legacy recovery release."
