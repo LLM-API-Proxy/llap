@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.147"
+INSTALLER_VERSION="0.0.148"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -4648,7 +4648,14 @@ readonly NFT_TEMPLATE_MARKER="# Managed by llm-api-proxy installer — do not ed
 #
 # One `port/proto` token per line:
 #   - 22/tcp     SSH (always — prevents lockout)
-#   - 443/tcp    HTTPS (TLS on) OR 80/tcp (TLS off)
+#   - 443/tcp    HTTPS — Traefik's `websecure` entrypoint (docker-compose.yml's
+#                base `--entrypoints.websecure.address=[::]:443`) is defined
+#                unconditionally, independent of whether the TLS/ACME overlay
+#                is applied — with TLS off it serves a self-signed cert
+#                instead of a real one, but it always listens. Opening this
+#                port must never be conditional on $OPT_TLS (#1869).
+#   - 80/tcp     HTTP — only meaningful once the TLS overlay's `web` entrypoint
+#                and HTTP->HTTPS redirect are configured.
 #   - 8443/tcp   forward proxy CONNECT entrypoint
 #   - 5353/udp   mDNS (only when enabled)
 #
@@ -4657,11 +4664,8 @@ readonly NFT_TEMPLATE_MARKER="# Managed by llm-api-proxy installer — do not ed
 # and the hardened nftables template, so they cannot drift.
 firewall_service_ports() {
     echo "22/tcp"
-    if [[ "$OPT_TLS" == "true" ]]; then
-        echo "443/tcp"
-    else
-        echo "80/tcp"
-    fi
+    echo "443/tcp"
+    [[ "$OPT_TLS" == "true" ]] && echo "80/tcp"
     echo "8443/tcp"
     [[ "$OPT_MDNS" == "true" ]] && echo "5353/udp"
     return 0
@@ -7696,6 +7700,50 @@ deploy_write_container_dns_overlay() {
     info "Container DNS overlay written with ${#servers[@]} upstream(s)"
 }
 
+# compose_active_overlays — print the compose override files active for this
+# deployment, one filename per line, in the order they must be passed as `-f`
+# flags. Single source of truth for deploy_write_compose_command (the actual
+# runtime invocation) and collect_active_bind_mount_sources (bind-mount
+# preflight) — they must never independently drift on which overlays are
+# considered active.
+#
+# TLS defense-in-depth (#1869): a previously-working TLS configuration must
+# never be silently dropped from the overlay list on upgrade just because
+# $OPT_TLS did not resolve to "true" by this point. Mirrors the existing
+# have_backup_config pattern in configure_backup() (#1306) — hard evidence on
+# disk (the overlay file plus a usable domain/credential in the existing .env)
+# wins over a possibly-stale in-memory flag.
+compose_active_overlays() {
+    local include_tls_overlay="$OPT_TLS"
+    if [[ "$include_tls_overlay" != "true" ]] \
+        && $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.tls.yml" \
+        && $SUDO grep -q "^PROXY_TLS__DOMAIN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null \
+        && { $SUDO grep -q "^CF_DNS_API_TOKEN=.\+" "${INSTALL_DIR}/docker/.env" 2>/dev/null \
+            || $SUDO grep -q "^CF_API_KEY=.\+" "${INSTALL_DIR}/docker/.env" 2>/dev/null; }; then
+        warn "TLS overlay re-included from existing .env evidence (\$OPT_TLS=${OPT_TLS}) — see #1869"
+        include_tls_overlay="true"
+    fi
+
+    echo "docker-compose.yml"
+    echo "docker-compose.hardened.yml"
+    [[ "$OPT_WAF" == "true" ]] && echo "docker-compose.waf.yml"
+    [[ "$include_tls_overlay" == "true" ]] && echo "docker-compose.tls.yml"
+    [[ "$OPT_MONITORING" == "true" ]] && echo "docker-compose.monitoring.yml"
+    [[ "$OPT_BACKUP" == "true" ]] && echo "docker-compose.backup.yml"
+    $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.dns.yml" \
+        && echo "docker-compose.dns.yml"
+    if [[ "$IS_MACOS" == "true" ]] && [[ "$MACOS_HOST_NETWORKING" == "true" ]]; then
+        # Host networking available — no bridge overlay needed.
+        # mDNS disabled via PROXY_MDNS__ENABLED=false in .env
+        :
+    elif [[ "$IS_MACOS" == "true" ]] || [[ "$OPT_MDNS" != "true" ]]; then
+        echo "docker-compose.no-mdns.yml"
+    fi
+    # Debug overlay must be last — overrides hardened overlay settings
+    [[ "$OPT_DEBUG" == "true" ]] && echo "docker-compose.debug.yml"
+    return 0
+}
+
 deploy_write_compose_command() {
     step "  Generating compose-command.sh..."
     local cmd_file="${INSTALL_DIR}/compose-command.sh"
@@ -7703,22 +7751,11 @@ deploy_write_compose_command() {
     local runtime_output runtime_value
     local -a runtime_contract=()
 
-    local -a overlays=("docker-compose.yml" "docker-compose.hardened.yml")
-    [[ "$OPT_WAF" == "true" ]] && overlays+=("docker-compose.waf.yml")
-    [[ "$OPT_TLS" == "true" ]] && overlays+=("docker-compose.tls.yml")
-    [[ "$OPT_MONITORING" == "true" ]] && overlays+=("docker-compose.monitoring.yml")
-    [[ "$OPT_BACKUP" == "true" ]] && overlays+=("docker-compose.backup.yml")
-    $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.dns.yml" \
-        && overlays+=("docker-compose.dns.yml")
-    if [[ "$IS_MACOS" == "true" ]] && [[ "$MACOS_HOST_NETWORKING" == "true" ]]; then
-        # Host networking available — no bridge overlay needed.
-        # mDNS disabled via PROXY_MDNS__ENABLED=false in .env
-        :
-    elif [[ "$IS_MACOS" == "true" ]] || [[ "$OPT_MDNS" != "true" ]]; then
-        overlays+=("docker-compose.no-mdns.yml")
-    fi
-    # Debug overlay must be last — overrides hardened overlay settings
-    [[ "$OPT_DEBUG" == "true" ]] && overlays+=("docker-compose.debug.yml")
+    local -a overlays=()
+    local overlay_line
+    while IFS= read -r overlay_line; do
+        [[ -n "$overlay_line" ]] && overlays+=("$overlay_line")
+    done < <(compose_active_overlays)
     docker_executable="$(installer_docker_executable)" \
         || die "Could not resolve a trusted Docker executable."
     runtime_output="$(installer_compose_runtime_contract)" \
@@ -12748,19 +12785,11 @@ bind_mount_expected_type() {
 # source path per line (with the leading `./` stripped), de-duplicated.
 # Reads the compose files already extracted under ${INSTALL_DIR}/docker.
 collect_active_bind_mount_sources() {
-    local -a overlays=("docker-compose.yml" "docker-compose.hardened.yml")
-    [[ "$OPT_WAF" == "true" ]] && overlays+=("docker-compose.waf.yml")
-    [[ "$OPT_TLS" == "true" ]] && overlays+=("docker-compose.tls.yml")
-    [[ "$OPT_MONITORING" == "true" ]] && overlays+=("docker-compose.monitoring.yml")
-    [[ "$OPT_BACKUP" == "true" ]] && overlays+=("docker-compose.backup.yml")
-    $SUDO test -f "${INSTALL_DIR}/docker/docker-compose.dns.yml" \
-        && overlays+=("docker-compose.dns.yml")
-    if [[ "$IS_MACOS" == "true" ]] && [[ "$MACOS_HOST_NETWORKING" == "true" ]]; then
-        :
-    elif [[ "$IS_MACOS" == "true" ]] || [[ "$OPT_MDNS" != "true" ]]; then
-        overlays+=("docker-compose.no-mdns.yml")
-    fi
-    [[ "$OPT_DEBUG" == "true" ]] && overlays+=("docker-compose.debug.yml")
+    local -a overlays=()
+    local overlay_line
+    while IFS= read -r overlay_line; do
+        [[ -n "$overlay_line" ]] && overlays+=("$overlay_line")
+    done < <(compose_active_overlays)
 
     local overlay path
     for overlay in "${overlays[@]}"; do
