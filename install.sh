@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.148"
+INSTALLER_VERSION="0.0.149"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -11965,7 +11965,7 @@ database_prepare_forward_upgrade() {
 # The timeout runs INSIDE the container: an unreachable object store must cost
 # seconds, not a stalled upgrade.
 database_resolve_upgrade_recovery_point() {
-    local snapshot_output="" snapshot_id="" snapshot_time=""
+    local snapshot_output="" snapshot_id="" snapshot_time="" selection_state=""
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
     # Distinguishes "the operator opted out of backups" from "backups are on and
@@ -11979,9 +11979,14 @@ database_resolve_upgrade_recovery_point() {
         return 0
     fi
     DATABASE_ROLLBACK_RECOVERY_EXPECTED="true"
+    # Deliberately NOT `--latest 1`: restic groups that per (host, path), and
+    # both vary here — the dump filename carries the UTC date and the hostname
+    # is the backup container's ID — so every snapshot lands in its own group
+    # and the flag degrades to "return the whole history" (#1874). The full
+    # listing is asked for explicitly and narrowed below, by time.
     # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
     if ! snapshot_output=$(installer_run_live_compose exec -T backup \
-        sh -ceu 'exec timeout 60 restic snapshots --json --latest 1 --tag postgres' \
+        sh -ceu 'exec timeout 60 restic snapshots --json --tag postgres' \
         </dev/null 2>> "$LOG_FILE"); then
         warn "Could not read the restic repository; this in-place upgrade has no recorded recovery point."
         return 0
@@ -11995,16 +12000,73 @@ database_resolve_upgrade_recovery_point() {
         return 0
     fi
     DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ="true"
+    # Selection contract (#1874): newest by TIME across the whole listing, and
+    # never an empty dump. restic does not promise array order, so `.[0]` is not
+    # a selection — production proved it by naming a 4.5-month-old 0-byte
+    # snapshot while that morning's 2.4 GiB snapshot sat in the same listing.
+    #
+    # `total_bytes_processed` present and 0 proves an empty dump. An ABSENT
+    # summary means unknown size (restic began emitting it in 0.17), not
+    # proven-empty, so it stays eligible rather than stranding upgrades on
+    # repositories written by an older restic.
+    #
+    # The state token keeps "no snapshots at all" distinguishable from "every
+    # snapshot is empty": both leave the caller with no recovery point, but they
+    # are different operator situations and deserve different words.
     if ! snapshot_output=$(
         printf '%s' "$snapshot_output" \
-            | jq -er 'if (type == "array" and length > 0) then
-                          (.[0] | [(.short_id // .id), .time] | @tsv)
-                      else error("no snapshot") end' 2>> "$LOG_FILE"
+            | jq -er '
+                # Compare INSTANTS, not strings. restic serialises snapshot
+                # time in the local zone of the machine that took the backup,
+                # offset included — it is not guaranteed to be UTC. As strings,
+                # "2026-08-26T02:00:00+10:00" (= 2026-08-25T16:00Z) sorts above
+                # "2026-08-26T00:00:00Z", so a lexicographic max returns the
+                # OLDER snapshot. Differing fractional-second widths misorder
+                # the same way. Normalise to epoch seconds before comparing.
+                def tsec:
+                  (.time // "")
+                  | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<frac>\\.[0-9]+)?(?<off>Z|[+-][0-9]{2}:[0-9]{2})$") as $m
+                  | (($m.d + "Z") | fromdateiso8601)
+                    + (("0" + ($m.frac // ".0")) | tonumber)
+                    - (if $m.off == "Z" then 0
+                       else (($m.off[1:3] | tonumber) * 3600
+                             + ($m.off[4:6] | tonumber) * 60)
+                            * (if ($m.off[0:1] == "-") then -1 else 1 end)
+                       end);
+                [ .[] | select((.summary.total_bytes_processed // -1) != 0) ] as $nonempty
+                | [ $nonempty[]
+                    | . + { _t: (try tsec catch null) }
+                    | select(._t != null) ] as $usable
+                | if (length == 0) then ["none", "", ""]
+                  elif ($nonempty | length) == 0 then ["empty", "", ""]
+                  elif ($usable | length) == 0 then ["untimed", "", ""]
+                  else ($usable | max_by(._t) | ["ok", (.short_id // .id), .time])
+                  end
+                | @tsv' 2>> "$LOG_FILE"
     ); then
-        warn "The restic repository reported no PostgreSQL snapshot; this in-place upgrade has no recorded recovery point."
+        warn "The restic repository returned an unusable snapshot listing; this in-place upgrade has no recorded recovery point."
         return 0
     fi
-    IFS=$'\t' read -r snapshot_id snapshot_time <<< "$snapshot_output"
+    IFS=$'\t' read -r selection_state snapshot_id snapshot_time <<< "$snapshot_output"
+    case "$selection_state" in
+        ok) ;;
+        none)
+            warn "The restic repository reported no PostgreSQL snapshot; this in-place upgrade has no recorded recovery point."
+            return 0
+            ;;
+        empty)
+            warn "Every PostgreSQL snapshot in the restic repository is empty (0 bytes); this in-place upgrade has no usable recovery point."
+            return 0
+            ;;
+        untimed)
+            warn "No PostgreSQL snapshot carries a parseable timestamp; this in-place upgrade has no usable recovery point."
+            return 0
+            ;;
+        *)
+            warn "The restic repository returned an unusable snapshot selection; this in-place upgrade has no recorded recovery point."
+            return 0
+            ;;
+    esac
     if [[ ! "$snapshot_id" =~ ^[0-9a-f]{8,64}$ ]] \
         || [[ ! "$snapshot_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ ]]; then
         warn "The restic repository returned an unusable snapshot identity; this in-place upgrade has no recorded recovery point."
@@ -13231,6 +13293,43 @@ UNITEOF
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable llm-api-proxy >> "$LOG_FILE" 2>&1
     info "systemd service installed and enabled"
+    installer_reconcile_service_unit_state
+}
+
+# installer_reconcile_service_unit_state — make the unit's reported state match
+# reality, and prove the boot path still works (#1859).
+#
+# The stack is brought up by this installer's own `compose-command.sh` call, not
+# by `systemctl start`. Neither `daemon-reload` nor `enable` clears a stored
+# unit result, so a unit that failed once stays latched `failed` indefinitely.
+# Production carried a 15-day-old `failed` record across several successful
+# upgrades exactly that way while every container was healthy.
+#
+# That is not cosmetic. The unit is `enabled`, so the next reboot really does
+# run ExecStart, and a stale `failed` leaves `systemctl is-active` unable to
+# distinguish "fine" from "will not bring the stack back" — the very check an
+# operator reaches for. Clearing the latch and then genuinely starting the unit
+# exercises the boot path now, at deploy time, instead of at 03:00 unattended.
+#
+# The start is safe and idempotent: ExecStart is `compose-command.sh up -d`
+# against containers this installer just started, and the unit is Type=oneshot
+# with RemainAfterExit=yes, so it settles to `active` without churning anything.
+#
+# A failure here must never fail the install — the stack is already up and
+# serving. It is surfaced loudly instead, because it is precisely the latent
+# boot failure this reconciliation exists to catch.
+installer_reconcile_service_unit_state() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    $SUDO systemctl reset-failed llm-api-proxy >> "$LOG_FILE" 2>&1 || true
+    if $SUDO systemctl start llm-api-proxy >> "$LOG_FILE" 2>&1; then
+        info "systemd service state reconciled (active)"
+        return 0
+    fi
+    warn "The llm-api-proxy systemd unit could not be started after deployment."
+    warn "  The stack itself is up — this installer started it directly — but the"
+    warn "  unit is what restores it after a reboot, so this is a latent boot failure."
+    warn "  Inspect: systemctl status llm-api-proxy; journalctl -u llm-api-proxy -n 50"
+    return 0
 }
 
 # ── Deploy: install metadata ─────────────────────────────────────────────────
