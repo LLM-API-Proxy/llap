@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.149"
+INSTALLER_VERSION="0.0.151"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -529,7 +529,22 @@ installer_compose_runtime_contract() {
     platform="$(uname -s 2>/dev/null || true)"
     case "$platform" in
         Linux)
-            docker_home="/root"
+            # Deliberately NOT /root (#1878). This contract renders
+            # compose-command.sh, which has two callers at different
+            # privileges: the installer and operators via sudo as root, and
+            # llm-api-proxy.service as ${SERVICE_USER}. /root is mode 0700, so
+            # the service user cannot traverse it; docker then fails reading
+            # $HOME/.docker/config.json, and that failure breaks CLI *plugin*
+            # resolution — `docker compose --project-name ...` degrades to bare
+            # `docker --project-name ...` and exits 125. The unit could
+            # therefore never start the stack, and only ever looked healthy
+            # because every working path ran as root.
+            #
+            # The install tree is root-owned and service-group readable, so
+            # both callers can traverse it. installer_local_docker_host ignores
+            # this value on Linux, so the pinned socket is unaffected.
+            docker_home="${INSTALL_DIR%/}"
+            database_recovery_install_dir_is_safe "$docker_home" || return 1
             docker_path="/usr/bin:/bin"
             ;;
         Darwin)
@@ -3722,7 +3737,7 @@ installer_collect_canonical_compose_overlays() {
     local content line prefix='  -f ' suffix=" \\" overlay path
     local legacy_exec_line="exec docker compose \\"
     local hardened_exec_line="exec docker compose --project-name docker \\"
-    local embedded_docker_executable expected_line runtime_output
+    local embedded_docker_executable expected_line runtime_output legacy_home_line
     local env_line="  --env-file .env \\"
     local index=0 last_allowed=-1 found allowed_index
     local -a lines=() overlays=() runtime_contract=()
@@ -3782,7 +3797,15 @@ installer_collect_canonical_compose_overlays() {
         [[ "${lines[index++]:-}" == "$expected_line" ]] || return 1
         printf -v expected_line "  %q \\\\" \
             "HOME=${runtime_contract[1]}"
-        [[ "${lines[index++]:-}" == "$expected_line" ]] || return 1
+        # Recovery and rollback parse the compose-command.sh captured in an
+        # OLDER snapshot, and every file written before #1878 pinned
+        # HOME=/root. Accepting that one documented historical value keeps
+        # recovery to a pre-fix version possible; any other HOME is still
+        # rejected, so this is not a general escape hatch.
+        printf -v legacy_home_line "  %q \\\\" "HOME=/root"
+        [[ "${lines[index]:-}" == "$expected_line" \
+            || "${lines[index]:-}" == "$legacy_home_line" ]] || return 1
+        index=$((index + 1))
         printf -v expected_line "  %q \\\\" "LC_ALL=C"
         [[ "${lines[index++]:-}" == "$expected_line" ]] || return 1
         printf -v expected_line "  %q \\\\" \
