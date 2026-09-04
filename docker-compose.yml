@@ -557,13 +557,9 @@ services:
 
 networks:
   proxy_net:
-    # IPv6-enabled internal network for service-to-service communication.
-    # ULA prefix (fc00::/7) — not routable on the public internet.
-    # Dual-stack: Docker also assigns an IPv4 subnet on this bridge by default.
+    # Docker allocates both subnets from the host's DHCPv6-PD-backed pools.
+    # Never pin an address range in project source.
     enable_ipv6: true
-    ipam:
-      config:
-        - subnet: "fd00:edde:acdc::/48"
 
 volumes:
   timescaledb_data:
