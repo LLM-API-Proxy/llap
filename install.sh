@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.154"
+INSTALLER_VERSION="0.0.155"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -266,12 +266,19 @@ warn()  { echo "${YELLOW}  ⚠${RESET} $*"; log "WARN: $*"; }
 fail()  { echo "${RED}  ✗${RESET} $*"; log "FAIL: $*"; }
 step()  { echo "${BOLD}$*${RESET}"; log "STEP: $*"; }
 
+# die writes to STDERR. Several producer functions have their stdout consumed
+# as a data channel by a caller (process substitution, command substitution).
+# A fatal message emitted on stdout there is read back as data — it was seen
+# turning a diagnostic into a bind-mount source path and having the preflight
+# mkdir it (#1924). `die` never returns, so nothing can depend on its stdout.
 die() {
-    fail "$1"
-    echo ""
-    if [[ -n "${LOG_FILE:-}" ]]; then
-        echo "Full log: ${LOG_FILE}"
-    fi
+    {
+        fail "$1"
+        echo ""
+        if [[ -n "${LOG_FILE:-}" ]]; then
+            echo "Full log: ${LOG_FILE}"
+        fi
+    } >&2
     exit "${2:-1}"
 }
 
@@ -7723,6 +7730,16 @@ deploy_write_container_dns_overlay() {
     info "Container DNS overlay written with ${#servers[@]} upstream(s)"
 }
 
+# compose_overlay_line_is_valid — true only for a bare compose overlay
+# filename. compose_active_overlays() writes its result to stdout, so any
+# diagnostic accidentally emitted on that same channel would otherwise be
+# spliced into the `-f` flags of the generated compose-command.sh and produce
+# a syntactically invalid script that fails at `docker compose` time (#1924).
+# Every consumer validates each line and fails closed instead.
+compose_overlay_line_is_valid() {
+    [[ "$1" =~ ^docker-compose[A-Za-z0-9._-]*\.yml$ ]]
+}
+
 # compose_active_overlays — print the compose override files active for this
 # deployment, one filename per line, in the order they must be passed as `-f`
 # flags. Single source of truth for deploy_write_compose_command (the actual
@@ -7743,7 +7760,10 @@ compose_active_overlays() {
         && $SUDO grep -q "^PROXY_TLS__DOMAIN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null \
         && { $SUDO grep -q "^CF_DNS_API_TOKEN=.\+" "${INSTALL_DIR}/docker/.env" 2>/dev/null \
             || $SUDO grep -q "^CF_API_KEY=.\+" "${INSTALL_DIR}/docker/.env" 2>/dev/null; }; then
-        warn "TLS overlay re-included from existing .env evidence (\$OPT_TLS=${OPT_TLS}) — see #1869"
+        # stdout is this function's DATA channel — the caller reads it as the
+        # overlay list. Diagnostics MUST go to stderr or they are spliced into
+        # the `-f` flags of the generated compose-command.sh (#1924).
+        warn "TLS overlay re-included from existing .env evidence (\$OPT_TLS=${OPT_TLS}) — see #1869" >&2
         include_tls_overlay="true"
     fi
 
@@ -7777,7 +7797,10 @@ deploy_write_compose_command() {
     local -a overlays=()
     local overlay_line
     while IFS= read -r overlay_line; do
-        [[ -n "$overlay_line" ]] && overlays+=("$overlay_line")
+        [[ -n "$overlay_line" ]] || continue
+        compose_overlay_line_is_valid "$overlay_line" \
+            || die "Compose overlay list was polluted with non-overlay output: ${overlay_line}"
+        overlays+=("$overlay_line")
     done < <(compose_active_overlays)
     docker_executable="$(installer_docker_executable)" \
         || die "Could not resolve a trusted Docker executable."
@@ -12873,7 +12896,10 @@ collect_active_bind_mount_sources() {
     local -a overlays=()
     local overlay_line
     while IFS= read -r overlay_line; do
-        [[ -n "$overlay_line" ]] && overlays+=("$overlay_line")
+        [[ -n "$overlay_line" ]] || continue
+        compose_overlay_line_is_valid "$overlay_line" \
+            || die "Compose overlay list was polluted with non-overlay output: ${overlay_line}"
+        overlays+=("$overlay_line")
     done < <(compose_active_overlays)
 
     local overlay path
@@ -12921,6 +12947,14 @@ deploy_verify_bind_mounts() {
     local docker_dir="${INSTALL_DIR}/docker"
     local -a problems=()
     local src abs expected
+    local bind_mount_sources
+
+    # Collected up front, NOT via `done < <(collect_active_bind_mount_sources)`:
+    # process substitution runs the producer in a subshell whose exit status
+    # the loop never sees, so a fatal error there would be silently downgraded
+    # to an empty source list and the preflight would report success (#1924).
+    bind_mount_sources="$(collect_active_bind_mount_sources)" \
+        || die "Could not resolve the active bind-mount sources."
 
     while IFS= read -r src; do
         [[ -z "$src" ]] && continue
@@ -12956,7 +12990,7 @@ deploy_verify_bind_mounts() {
             continue
         fi
         problems+=("config file missing: docker/${src}")
-    done < <(collect_active_bind_mount_sources)
+    done <<< "$bind_mount_sources"
 
     if [[ ${#problems[@]} -gt 0 ]]; then
         local -a box_lines=(
