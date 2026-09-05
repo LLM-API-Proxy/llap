@@ -1,12 +1,12 @@
 # LLAP — The Tactical LLM API Proxy for Secure Orchestration
 
-[![Version](https://img.shields.io/badge/version-0.0.156-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.156)
+[![Version](https://img.shields.io/badge/version-0.0.157-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.157)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-llm--api--proxy.com-informational)](https://llm-api-proxy.com)
 
 **LLAP** is a multi-tenant LLM API proxy that centralises credential management, enforces RBAC, and provides observability across all LLM traffic — without touching your application code.
 
-> Release **v0.0.156** · 2026-09-05T14:23:33Z · `704493beb4e3e18de3b940179ff62d605da7a0f6`
+> Release **v0.0.157** · 2026-09-05T19:05:25Z · `430fcb7efe1c31966bf35b0b8bf1646a4010af06`
 
 ---
 
@@ -32,7 +32,7 @@ cleanup_install() {
 trap cleanup_install EXIT
 base_url="https://llm-api-proxy.com"
 # GitHub fallback for this release:
-# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156"
+# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157"
 
 command -v gpg >/dev/null 2>&1 || {
   printf '%s\n' 'Install GnuPG first (macOS: brew install gnupg; Linux: use your package manager).' >&2
@@ -182,16 +182,16 @@ Pre-built binaries are available for all supported platforms:
 
 | Platform | Download |
 |---|---|
-| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156/llap-linux-amd64) |
-| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156/llap-linux-arm64) |
-| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156/llap-darwin-amd64) |
-| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156/llap-darwin-arm64) |
+| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157/llap-linux-amd64) |
+| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157/llap-linux-arm64) |
+| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157/llap-darwin-amd64) |
+| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157/llap-darwin-arm64) |
 
 Verify the checksum after downloading:
 
 ```bash
 # Download the checksum file
-curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.156/llap-SHA256SUMS -o llap-SHA256SUMS
+curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.157/llap-SHA256SUMS -o llap-SHA256SUMS
 
 # Verify (Linux / macOS with sha256sum)
 sha256sum --check --ignore-missing llap-SHA256SUMS
@@ -215,23 +215,23 @@ All images are published to the GitHub Container Registry:
 
 | Image | Tag |
 |---|---|
-| `ghcr.io/llm-api-proxy/server:0.0.156` | Proxy server |
-| `ghcr.io/llm-api-proxy/cli:0.0.156` | Management CLI |
-| `ghcr.io/llm-api-proxy/backup:0.0.156` | Restic backup agent |
+| `ghcr.io/llm-api-proxy/server:0.0.157` | Proxy server |
+| `ghcr.io/llm-api-proxy/cli:0.0.157` | Management CLI |
+| `ghcr.io/llm-api-proxy/backup:0.0.157` | Restic backup agent |
 
 ### Tag Conventions
 
 | Tag | Meaning |
 |---|---|
 | `latest` | Most recent stable release |
-| `0.0.156` | Exact version (e.g. `1.2.3`) |
+| `0.0.157` | Exact version (e.g. `1.2.3`) |
 | `X.Y` | Latest patch for this minor (e.g. `1.2`) |
 | `X` | Latest minor for this major (e.g. `1`) |
 
 Pull a specific version to avoid unexpected upgrades:
 
 ```bash
-docker pull ghcr.io/llm-api-proxy/server:0.0.156
+docker pull ghcr.io/llm-api-proxy/server:0.0.157
 ```
 
 ---
