@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.155"
+INSTALLER_VERSION="0.0.156"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -1093,6 +1093,15 @@ RELEASE_RECOVERY_IMAGE_LOCK_SOURCE_SHA=""
 RELEASE_RECOVERY_SERVER_IMAGE=""
 RELEASE_RECOVERY_CLI_IMAGE=""
 RELEASE_RECOVERY_BACKUP_IMAGE=""
+# Set by verify_receipt_authorized_recovery_source when this host is resuming a
+# deploy that this same receipt interrupted after the environment write and
+# before the metadata write (#1931). It is never set from operator input.
+RECEIPT_MID_DEPLOY_RESUME="false"
+# Set by verify_receipt_authorized_recovery_source when the recorded metadata
+# version has been left behind by an interruption an older installer could not
+# resume, and the signed evidence on disk proves the host is in fact on this
+# receipt's recovery release (#1943). It is never set from operator input.
+RECEIPT_STALE_METADATA_REPAIR="false"
 
 # Installer-managed database recovery state. These flags let the EXIT/INT/TERM
 # cleanup path restore the active database name and resume the prior proxy when
@@ -3631,12 +3640,22 @@ installer_recovery_env_is_authorized() {
             if [[ "$RELEASE_IMAGE_LOCK_ACTIVE" == "true" \
                 && "$skip_release_image_lock" != "true" ]]; then
                 local key expected
+                local -a authorized_images=()
+                # The snapshot records whichever receipt half the live tree
+                # actually described — the recovery half for an untouched
+                # source, the target half when an interrupted deploy had
+                # already advanced .env (#1931).
+                if ! mapfile -t authorized_images < <(
+                    receipt_image_lock_set_for_version "$source_version"
+                ) || (( ${#authorized_images[@]} != 3 )); then
+                    return 1
+                fi
                 for key in \
                     PROXY_SERVER_IMAGE PROXY_CLI_IMAGE PROXY_BACKUP_IMAGE; do
                     case "$key" in
-                        PROXY_SERVER_IMAGE) expected="$RELEASE_RECOVERY_SERVER_IMAGE" ;;
-                        PROXY_CLI_IMAGE) expected="$RELEASE_RECOVERY_CLI_IMAGE" ;;
-                        PROXY_BACKUP_IMAGE) expected="$RELEASE_RECOVERY_BACKUP_IMAGE" ;;
+                        PROXY_SERVER_IMAGE) expected="${authorized_images[0]}" ;;
+                        PROXY_CLI_IMAGE) expected="${authorized_images[1]}" ;;
+                        PROXY_BACKUP_IMAGE) expected="${authorized_images[2]}" ;;
                     esac
                     count="$(
                         $SUDO grep -c "^${key}=" "$env_file" 2>/dev/null \
@@ -4035,6 +4054,50 @@ database_run_trusted_recovered_compose() {
     )
 }
 
+# Resolve the single receipt-signed digest the recovery overlay pins for one
+# service at a given installed source version. Fails closed for any service the
+# overlay does not pin and for any version outside the presented receipt.
+receipt_recovery_overlay_image_for_service() {
+    local service="$1" source_version="$2"
+    local -a lock_images=()
+    mapfile -t lock_images < <(
+        receipt_image_lock_set_for_version "$source_version"
+    ) || return 1
+    (( ${#lock_images[@]} == 3 )) || return 1
+    case "$service" in
+        proxy) printf '%s\n' "${lock_images[0]}" ;;
+        backup) printf '%s\n' "${lock_images[2]}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Emit the receipt-signed server/CLI/backup digest triple that describes a given
+# installed source version, one per line. Only the two halves of the presented
+# receipt resolve: the recovery half describes an untouched source, and the
+# target half describes a tree an interrupted deploy already advanced before it
+# could record the matching metadata (#1931). Anything else fails closed.
+receipt_image_lock_set_for_version() {
+    local version="$1"
+    [[ -n "$version" ]] || return 1
+    if [[ -n "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" \
+        && "$version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]]; then
+        printf '%s\n%s\n%s\n' \
+            "$RELEASE_RECOVERY_SERVER_IMAGE" \
+            "$RELEASE_RECOVERY_CLI_IMAGE" \
+            "$RELEASE_RECOVERY_BACKUP_IMAGE"
+        return 0
+    fi
+    if [[ -n "$RELEASE_IMAGE_LOCK_VERSION" \
+        && "$version" == "$RELEASE_IMAGE_LOCK_VERSION" ]]; then
+        printf '%s\n%s\n%s\n' \
+            "$RELEASE_SERVER_IMAGE" \
+            "$RELEASE_CLI_IMAGE" \
+            "$RELEASE_BACKUP_IMAGE"
+        return 0
+    fi
+    return 1
+}
+
 verify_receipt_recovery_image() {
     local image_name="$1"
     local image_ref="$2"
@@ -4083,11 +4146,16 @@ verify_receipt_recovery_image() {
         }
 }
 
+# Bind the running container to one of the receipt's own image digests. More
+# than one ref is authorized only while resuming an interrupted deploy, where
+# the proxy may already have been started on this receipt's target half.
 verify_receipt_recovery_running_container() {
     local service="$1"
-    local image_ref="$2"
+    shift
+    local -a image_refs=("$@")
+    local image_ref
     local candidate_ids candidate_id labels label_service working_dir project
-    local container_id="" container_image_id authorized_image_id
+    local container_id="" container_image_id authorized_image_id matched="false"
 
     # Never execute the legacy install-root command during preflight: released
     # v0.0.130/v0.0.131 directories may still be service-owned. Discover the
@@ -4125,11 +4193,18 @@ verify_receipt_recovery_running_container() {
         installer_docker container inspect --format '{{.Image}}' \
             "$container_id" 2>/dev/null
     )" || return 1
-    authorized_image_id="$(
-        installer_docker image inspect --format '{{.Id}}' \
-            "$image_ref" 2>/dev/null
-    )" || return 1
-    [[ "$container_image_id" == "$authorized_image_id" ]] \
+    for image_ref in "${image_refs[@]}"; do
+        [[ -n "$image_ref" ]] || continue
+        authorized_image_id="$(
+            installer_docker image inspect --format '{{.Id}}' \
+                "$image_ref" 2>/dev/null
+        )" || continue
+        [[ -n "$authorized_image_id" \
+            && "$container_image_id" == "$authorized_image_id" ]] || continue
+        matched="true"
+        break
+    done
+    [[ "$matched" == "true" ]] \
         || {
             fail "Running source ${service} container is not the receipt-authorized recovery image."
             return 1
@@ -4167,11 +4242,57 @@ verify_receipt_authorized_recovery_source() {
     )"
     count="$($SUDO grep -c '^PROXY_VERSION=' "$env_file" 2>/dev/null || true)"
     env_version="$(existing_env_value PROXY_VERSION)"
-    [[ "$metadata_version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" \
-        && "$metadata_install_dir" == "$INSTALL_DIR" \
-        && "$count" == "1" \
-        && "$env_version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]] \
+    # A receipt presented against a host it does not describe, and an ambiguous
+    # environment that cannot state one version, are rejected outright. Neither
+    # of these ever relaxes for any mode below.
+    [[ "$metadata_install_dir" == "$INSTALL_DIR" && "$count" == "1" ]] \
         || die "Installed source identity is not the receipt-authorized recovery release."
+
+    RECEIPT_MID_DEPLOY_RESUME="false"
+    RECEIPT_STALE_METADATA_REPAIR="false"
+    if [[ "$metadata_version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]]; then
+        # deploy_upgrade_env publishes the target selectors well before
+        # deploy_write_metadata records the target, so any deploy-phase
+        # interruption in between leaves metadata at the recovery release and
+        # .env at this receipt's target. That split is reachable only from this
+        # installer, mid-run, for this exact target, and repairing it is
+        # precisely what the resume the installer itself prescribes has to do
+        # (#1931). Every other .env version — including another receipt's
+        # target — is still rejected.
+        if [[ "$env_version" != "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]]; then
+            [[ -n "$RELEASE_IMAGE_LOCK_VERSION" \
+                && "$env_version" == "$RELEASE_IMAGE_LOCK_VERSION" ]] \
+                || die "Installed source identity is not the receipt-authorized recovery release."
+            RECEIPT_MID_DEPLOY_RESUME="true"
+        fi
+    else
+        # The same interruption window, seen from a host wedged by an installer
+        # that predates the resume above: that run reached the environment
+        # write, so .env names the release it deployed, and never reached the
+        # metadata write, so install.json still names the one before it. Its
+        # own receipt can no longer be presented — that bundle is immutable and
+        # carries no resume — and every later receipt names the deployed
+        # release as its recovery half, which the metadata disagrees with. The
+        # host is then permanently unupgradable (#1943).
+        #
+        # The disagreement is resolvable because the two records are not equally
+        # strong. .env carries the receipt's own signed digest triple, verified
+        # below against pulled image provenance and the running containers;
+        # install.json carries an unsigned version string written last. When
+        # the strong evidence says this host is on the recovery release, that
+        # is what the host is on, and the stale string is the thing to repair.
+        [[ "$env_version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]] \
+            || die "Installed source identity is not the receipt-authorized recovery release."
+        # Only a lagging record is explainable this way. Metadata naming a
+        # release newer than the one the signed evidence proves is running is a
+        # different corruption, and this mode is not a licence to overwrite it.
+        if ! is_stable_semver "$metadata_version" \
+            || ! stable_semver_gt \
+                "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" "$metadata_version"; then
+            die "Installed source identity is not the receipt-authorized recovery release."
+        fi
+        RECEIPT_STALE_METADATA_REPAIR="true"
+    fi
 
     for key in PROXY_SERVER_IMAGE PROXY_CLI_IMAGE PROXY_BACKUP_IMAGE; do
         count="$($SUDO grep -c "^${key}=" "$env_file" 2>/dev/null || true)"
@@ -4185,11 +4306,33 @@ verify_receipt_authorized_recovery_source() {
         server_image="$(existing_env_value PROXY_SERVER_IMAGE)"
         cli_image="$(existing_env_value PROXY_CLI_IMAGE)"
         backup_image="$(existing_env_value PROXY_BACKUP_IMAGE)"
-        [[ "$server_image" == "$RELEASE_RECOVERY_SERVER_IMAGE" \
-            && "$cli_image" == "$RELEASE_RECOVERY_CLI_IMAGE" \
-            && "$backup_image" == "$RELEASE_RECOVERY_BACKUP_IMAGE" ]] \
-            || die "Installed source image lock does not match the signed recovery set."
+        if [[ "$RECEIPT_MID_DEPLOY_RESUME" == "true" ]]; then
+            # deploy_upgrade_env writes PROXY_VERSION and the three selectors as
+            # one published inode, so a resumable split carries this receipt's
+            # target set — never a mix, and never a third release's digests.
+            [[ "$server_image" == "$RELEASE_SERVER_IMAGE" \
+                && "$cli_image" == "$RELEASE_CLI_IMAGE" \
+                && "$backup_image" == "$RELEASE_BACKUP_IMAGE" ]] \
+                || die "Interrupted deploy image lock does not match the signed target set."
+        else
+            # Also the only shape a stale-metadata repair may present: the
+            # signed triple is the whole reason .env is believed over the
+            # record it contradicts.
+            [[ "$server_image" == "$RELEASE_RECOVERY_SERVER_IMAGE" \
+                && "$cli_image" == "$RELEASE_RECOVERY_CLI_IMAGE" \
+                && "$backup_image" == "$RELEASE_RECOVERY_BACKUP_IMAGE" ]] \
+                || die "Installed source image lock does not match the signed recovery set."
+        fi
     else
+        # An interrupted receipt-bound deploy always publishes the selectors
+        # alongside PROXY_VERSION, so the unpinned shape can never be a resume.
+        [[ "$RECEIPT_MID_DEPLOY_RESUME" != "true" ]] \
+            || die "An unpinned source cannot be an interrupted receipt-bound deploy."
+        # An unpinned .env carries no signed digests, so its version string is
+        # exactly as weak as the metadata string it would be overriding.
+        # Nothing here can decide between them.
+        [[ "$RECEIPT_STALE_METADATA_REPAIR" != "true" ]] \
+            || die "An unpinned source cannot outrank the recorded metadata identity."
         legacy_source_identity="${RELEASE_RECOVERY_IMAGE_LOCK_VERSION}:${RELEASE_RECOVERY_IMAGE_LOCK_SOURCE_SHA}"
         case "$legacy_source_identity" in
             "0.0.130:f44021ca645c0ad3c46ff3ba0c6bfcf0b205458d" | \
@@ -4215,16 +4358,159 @@ verify_receipt_authorized_recovery_source() {
         verify_receipt_recovery_image backup "$RELEASE_RECOVERY_BACKUP_IMAGE" \
             || die "Could not stage the receipt-authorized recovery backup image."
     fi
+    # An interrupted deploy may have reached `compose up`, so the running
+    # containers may legitimately be either half of this same receipt. Both
+    # halves are signed digests from the receipt being presented; nothing
+    # outside it is ever accepted.
+    local -a authorized_server_images=("$RELEASE_RECOVERY_SERVER_IMAGE")
+    local -a authorized_backup_images=("$RELEASE_RECOVERY_BACKUP_IMAGE")
+    if [[ "$RECEIPT_MID_DEPLOY_RESUME" == "true" ]]; then
+        authorized_server_images+=("$RELEASE_SERVER_IMAGE")
+        authorized_backup_images+=("$RELEASE_BACKUP_IMAGE")
+    fi
     verify_receipt_recovery_running_container \
-        proxy "$RELEASE_RECOVERY_SERVER_IMAGE" \
+        proxy "${authorized_server_images[@]}" \
         || die "Running source proxy failed receipt recovery verification."
 
     if [[ "$backup_enabled" == "true" ]]; then
         verify_receipt_recovery_running_container \
-            backup "$RELEASE_RECOVERY_BACKUP_IMAGE" \
+            backup "${authorized_backup_images[@]}" \
             || die "Running source backup failed receipt recovery verification."
     fi
+    if [[ "$RECEIPT_MID_DEPLOY_RESUME" == "true" ]]; then
+        info "Resuming a deploy this receipt interrupted after the environment write"
+    fi
+    # Last, and only once every check above has passed. Eight later callers read
+    # existing_install_version — the downgrade contract, the rollback-artifact
+    # target labels, the deploy transition and the source snapshot among them —
+    # and each of them would otherwise reason about a release this host is
+    # provably not on. Converging here, before run_configure, means the rest of
+    # the run is an ordinary upgrade from the release the receipt describes.
+    receipt_converge_source_version_records "$metadata_version"
     info "Receipt-authorized source and immutable recovery images verified"
+}
+
+# Bring this host's two source-version records — the ${INSTALL_DIR}/.version
+# marker and the authoritative install.json — into agreement with the release
+# the receipt proves it is running.
+#
+# In the stale-metadata repair mode the recorded metadata is the thing being
+# corrected: the signed digest triple in .env, the pulled image provenance and
+# the running container identities all name the receipt's recovery release, and
+# the unsigned version string an interrupted pre-#1931 deploy left behind does
+# not. The value written always comes from the presented receipt, never from
+# .env and never from operator input.
+#
+# In every other mode install.json already names that release and only the
+# marker can lag, because deploy_write_metadata publishes the two records
+# separately and an interruption between them leaves exactly that. Realigning
+# it here costs one comparison on a healthy host.
+#
+# The write order is load-bearing. The gate above branches on install.json, so
+# install.json is published last: while it still reads stale, an interrupted
+# repair re-enters this path on the next run and finishes. Publishing it first
+# would make a half-finished repair indistinguishable from a completed one and
+# strand the marker permanently.
+#
+# If the run dies after either write the host is left recording a release it is
+# provably on, which is consistent and strictly better than the split this
+# repairs — so the writes are safe to take before the upgrade rather than after.
+receipt_converge_source_version_records() {
+    local recorded="$1"
+    local repaired="$RELEASE_RECOVERY_IMAGE_LOCK_VERSION"
+    local version_file="${INSTALL_DIR}/.version"
+    local metadata_staging="${EXISTING_INSTALL}.stale-metadata-repair"
+    local marker="" realign_marker="false"
+
+    # This runs only on the receipt-bound recovery path, where an unsafe
+    # managed path fails the run closed rather than being worked around.
+    # installer_managed_source_tree_is_safe refuses the same shapes later.
+    if $SUDO test -e "$version_file" || $SUDO test -L "$version_file"; then
+        if ! $SUDO test -f "$version_file" \
+            || $SUDO test -L "$version_file" \
+            || ! installer_path_has_single_link "$version_file"; then
+            die "Installed version marker is unsafe to repair."
+        fi
+        marker="$($SUDO cat "$version_file" 2>/dev/null || true)"
+        [[ "$marker" == "$repaired" ]] || realign_marker="true"
+    fi
+    # A healthy host, a resume whose records already agree, and a host with no
+    # marker at all leave here having written nothing. An absent marker is not
+    # the split this repairs — deploy_write_metadata creates it later in this
+    # same run.
+    if [[ "$RECEIPT_STALE_METADATA_REPAIR" != "true" \
+        && "$realign_marker" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ "$RECEIPT_STALE_METADATA_REPAIR" == "true" ]]; then
+        installer_path_has_single_link "$EXISTING_INSTALL" \
+            || die "Installed metadata is unsafe to repair."
+        if $SUDO test -e "$metadata_staging" \
+            || $SUDO test -L "$metadata_staging"; then
+            # Residue from a convergence killed between the staging write and
+            # the publish below. Clearing it is what makes that interruption
+            # re-enterable: refusing would strand the host on the exact split
+            # this function exists to undo, and the staged bytes are worthless
+            # anyway since the block below regenerates them from the same
+            # inputs. Only a plain single-linked regular file could have been
+            # written there by that block, so nothing else is ours to remove: a
+            # symlink would redirect the write, and a second hard link is
+            # somebody else's handle on the bytes that unlinking would not take
+            # away.
+            if $SUDO test -L "$metadata_staging" \
+                || ! $SUDO test -f "$metadata_staging" \
+                || ! installer_path_has_single_link "$metadata_staging"; then
+                die "Stale metadata repair staging is already present."
+            fi
+            $SUDO rm -f "$metadata_staging" \
+                || die "Stale metadata repair staging is already present."
+        fi
+    fi
+
+    step "  Repairing the recorded source version..."
+    if [[ "$realign_marker" == "true" ]]; then
+        # Written in place, exactly as deploy_write_metadata writes it, so the
+        # marker keeps the mode and ownership the installer already chose for
+        # it. This file is a marker, not a decision input — nothing branches on
+        # it — so a truncated write is recoverable on the next run, which is
+        # why it is safe to take first.
+        printf '%s\n' "$repaired" \
+            | $SUDO /usr/bin/tee "$version_file" >/dev/null
+        marker="$($SUDO cat "$version_file" 2>/dev/null || true)"
+        [[ "$marker" == "$repaired" ]] \
+            || die "Could not publish the repaired source version marker."
+    fi
+
+    if [[ "$RECEIPT_STALE_METADATA_REPAIR" != "true" ]]; then
+        info "Recorded source version marker realigned to ${repaired}"
+        return 0
+    fi
+
+    # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
+    $SUDO jq --arg version "$repaired" '.version = $version' \
+        "$EXISTING_INSTALL" \
+        | $SUDO /usr/bin/tee "$metadata_staging" >/dev/null
+    # Validate the staged bytes rather than the pipeline status: this file is
+    # what every later phase reads, and a truncated write must never reach it.
+    # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
+    if ! $SUDO jq -e --arg version "$repaired" --arg dir "$INSTALL_DIR" \
+        '.version == $version and .install_dir == $dir' \
+        "$metadata_staging" >/dev/null 2>&1; then
+        $SUDO rm -f "$metadata_staging"
+        die "Could not stage the repaired install metadata."
+    fi
+    # 0644 rather than the replaced file's mode, and a replace rather than the
+    # in-place write the marker takes: both are deploy_write_metadata's own
+    # convention for this file, which sets 0644 explicitly every time it writes
+    # it. The asymmetry with the marker above is deliberate — each record is
+    # written the way its owner writes it.
+    if ! $SUDO chmod 0644 "$metadata_staging" \
+        || ! $SUDO mv "$metadata_staging" "$EXISTING_INSTALL"; then
+        $SUDO rm -f "$metadata_staging"
+        die "Could not publish the repaired install metadata."
+    fi
+    info "Recorded source version repaired from ${recorded} to ${repaired}"
 }
 
 # Verify the installer and the host privilege boundary before inspecting any
@@ -8670,13 +8956,19 @@ database_validate_staged_compose_bind_sources() {
 }
 
 installer_existing_receipt_recovery_files_are_authorized() {
-    local root="${1%/}" backup_enabled="$2"
+    local root="${1%/}" backup_enabled="$2" source_version="$3"
     local wrapper="${root}/compose-command.sh"
     local overlay="${root}/docker/docker-compose.receipt-recovery.yml"
-    local actual expected
+    local actual expected overlay_server_image overlay_backup_image
     [[ "$backup_enabled" == "true" \
         || "$backup_enabled" == "false" ]] || return 1
     [[ "$RELEASE_IMAGE_LOCK_ACTIVE" == "true" ]] || return 1
+    overlay_server_image="$(
+        receipt_recovery_overlay_image_for_service proxy "$source_version"
+    )" || return 1
+    overlay_backup_image="$(
+        receipt_recovery_overlay_image_for_service backup "$source_version"
+    )" || return 1
     if ! $SUDO test -f "$wrapper" || $SUDO test -L "$wrapper" \
         || ! $SUDO test -x "$wrapper" \
         || ! installer_path_has_single_link "$wrapper" \
@@ -8698,10 +8990,10 @@ installer_existing_receipt_recovery_files_are_authorized() {
         printf '# docker-compose.receipt-recovery.yml — signed receipt recovery only\n'
         printf 'services:\n'
         printf '  proxy:\n'
-        printf '    image: %s\n' "$RELEASE_RECOVERY_SERVER_IMAGE"
+        printf '    image: %s\n' "$overlay_server_image"
         if [[ "$backup_enabled" == "true" ]]; then
             printf '  backup:\n'
-            printf '    image: %s\n' "$RELEASE_RECOVERY_BACKUP_IMAGE"
+            printf '    image: %s\n' "$overlay_backup_image"
         fi
     )"
     [[ "$actual" == "$expected" ]]
@@ -8709,6 +9001,7 @@ installer_existing_receipt_recovery_files_are_authorized() {
 
 database_capture_running_source_image_lock() {
     local config_json="$1" expected_config_files="$2" destination="$3"
+    local source_version="$4"
     local expected_services candidate_ids candidate_id container_json row
     local service working_dir project config_files image_ref image_id
     local rendered_image inspected_id
@@ -8940,7 +9233,7 @@ database_validate_staged_compose_against_running_stack() {
     if $SUDO test -f "${root}/compose-command.source.sh"; then
         include_receipt="true"
         installer_existing_receipt_recovery_files_are_authorized \
-            "$root" "$backup_enabled" || return 1
+            "$root" "$backup_enabled" "$source_version" || return 1
         expected_config_files+=",${INSTALL_DIR%/}/docker/docker-compose.receipt-recovery.yml"
     fi
     database_run_staged_source_compose \
@@ -9009,12 +9302,13 @@ database_validate_staged_compose_against_running_stack() {
             [[ -z "$image_lock_destination" ]] \
                 || database_capture_running_source_image_lock \
                     "$config_json" "$expected_config_files" \
-                    "$image_lock_destination"
+                    "$image_lock_destination" "$source_version"
         }
 }
 
 database_validate_source_image_lock_against_base_config() {
     local root="${1%/}" base_config_json="$2" include_receipt="$3"
+    local source_version="$4"
     local lock_file="${root}/docker/docker-compose.source-recovery-images.yml"
     local entries expected_services locked_services
     local service image_id receipt_image inspected_id
@@ -9054,11 +9348,11 @@ database_validate_source_image_lock_against_base_config() {
         receipt_image=""
         if [[ "$include_receipt" == "true" ]]; then
             case "$service" in
-                proxy)
-                    receipt_image="$RELEASE_RECOVERY_SERVER_IMAGE"
-                    ;;
-                backup)
-                    receipt_image="$RELEASE_RECOVERY_BACKUP_IMAGE"
+                proxy|backup)
+                    receipt_image="$(
+                        receipt_recovery_overlay_image_for_service \
+                            "$service" "$source_version"
+                    )" || return 1
                     ;;
             esac
         fi
@@ -9079,6 +9373,7 @@ database_validate_source_image_lock_against_base_config() {
 
 database_validate_rendered_source_image_lock() {
     local root="${1%/}" config_json="$2" include_receipt="$3"
+    local source_version="$4"
     local lock_file="${root}/docker/docker-compose.source-recovery-images.yml"
     local entries service image_id rendered_image expected_image
     [[ "$include_receipt" == "true" \
@@ -9091,11 +9386,11 @@ database_validate_rendered_source_image_lock() {
         expected_image="$image_id"
         if [[ "$include_receipt" == "true" ]]; then
             case "$service" in
-                proxy)
-                    expected_image="$RELEASE_RECOVERY_SERVER_IMAGE"
-                    ;;
-                backup)
-                    expected_image="$RELEASE_RECOVERY_BACKUP_IMAGE"
+                proxy|backup)
+                    expected_image="$(
+                        receipt_recovery_overlay_image_for_service \
+                            "$service" "$source_version"
+                    )" || return 1
                     ;;
             esac
         fi
@@ -9124,7 +9419,8 @@ database_validate_staged_recovery_compose() {
             config --format json 2>> "$LOG_FILE"
     )" || return 1
     database_validate_source_image_lock_against_base_config \
-        "$root" "$base_config_json" "$include_receipt" || return 1
+        "$root" "$base_config_json" "$include_receipt" "$source_version" \
+        || return 1
     database_run_staged_source_compose \
         "$root" "$source_version" "$include_receipt" config --quiet \
         >> "$LOG_FILE" 2>&1 || return 1
@@ -9135,7 +9431,7 @@ database_validate_staged_recovery_compose() {
     )" || return 1
     database_validate_staged_compose_bind_sources "$root" "$config_json" \
         && database_validate_rendered_source_image_lock \
-            "$root" "$config_json" "$include_receipt"
+            "$root" "$config_json" "$include_receipt" "$source_version"
 }
 
 database_bind_recovery_image_lock_to_archive() {
@@ -9146,12 +9442,18 @@ database_bind_recovery_image_lock_to_archive() {
         "docker"
         "compose-command.sh"
     )
-    [[ "$RELEASE_IMAGE_LOCK_ACTIVE" != "true" \
-        || "$source_version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]] \
-        || {
-            fail "Installed source version is not the receipt-authorized recovery version."
+    local -a authorized_images=()
+    if [[ "$RELEASE_IMAGE_LOCK_ACTIVE" == "true" ]]; then
+        # A resume snapshots a tree the interrupted deploy already advanced to
+        # this receipt's target half, so bind whichever half the tree actually
+        # is. Both are digests of the presented receipt (#1931).
+        if ! mapfile -t authorized_images < <(
+            receipt_image_lock_set_for_version "$source_version"
+        ) || (( ${#authorized_images[@]} != 3 )); then
+            fail "Installed source version is outside the presented receipt."
             return 1
-        }
+        fi
+    fi
     suffix="$(installer_private_staging_suffix)" || return 1
     DATABASE_ROLLBACK_IMAGE_LOCK_STAGING_DIR="/tmp/llap-image-lock-recovery.${suffix}"
     staging="$DATABASE_ROLLBACK_IMAGE_LOCK_STAGING_DIR"
@@ -9272,9 +9574,9 @@ database_bind_recovery_image_lock_to_archive() {
             exit 1
         fi
         if ! {
-            printf 'PROXY_SERVER_IMAGE=%s\n' "$RELEASE_RECOVERY_SERVER_IMAGE"
-            printf 'PROXY_CLI_IMAGE=%s\n' "$RELEASE_RECOVERY_CLI_IMAGE"
-            printf 'PROXY_BACKUP_IMAGE=%s\n' "$RELEASE_RECOVERY_BACKUP_IMAGE"
+            printf 'PROXY_SERVER_IMAGE=%s\n' "${authorized_images[0]}"
+            printf 'PROXY_CLI_IMAGE=%s\n' "${authorized_images[1]}"
+            printf 'PROXY_BACKUP_IMAGE=%s\n' "${authorized_images[2]}"
         } | $SUDO /usr/bin/tee -a "$env_staging" >/dev/null; then
             exit 1
         fi
@@ -9329,10 +9631,10 @@ database_bind_recovery_image_lock_to_archive() {
             printf '# docker-compose.receipt-recovery.yml — signed receipt recovery only\n'
             printf 'services:\n'
             printf '  proxy:\n'
-            printf '    image: %s\n' "$RELEASE_RECOVERY_SERVER_IMAGE"
+            printf '    image: %s\n' "${authorized_images[0]}"
             if [[ "$backup_enabled" == "true" ]]; then
                 printf '  backup:\n'
-                printf '    image: %s\n' "$RELEASE_RECOVERY_BACKUP_IMAGE"
+                printf '    image: %s\n' "${authorized_images[2]}"
             fi
         } | $SUDO /usr/bin/tee "$overlay_staging" >/dev/null; then
             exit 1
@@ -9601,6 +9903,18 @@ database_snapshot_source_deploy_state() {
         entries+=(".version")
     fi
     source_version=$(existing_install_version 2>/dev/null || true)
+    if [[ "$RECEIPT_MID_DEPLOY_RESUME" == "true" ]]; then
+        # The interrupted run already published this receipt's target .env,
+        # compose files and Compose command, so the live tree no longer
+        # describes the release the metadata still records. Snapshot what is
+        # actually there — restoring it must return the host to where this
+        # resume found it, not to a tree whose bytes never existed (#1931).
+        source_version="$(existing_env_value PROXY_VERSION)"
+        [[ "$source_version" == "$RELEASE_IMAGE_LOCK_VERSION" ]] || {
+            fail "Cannot snapshot source deploy state: interrupted deploy identity moved."
+            return 1
+        }
+    fi
     is_stable_semver "$source_version" || {
         fail "Cannot snapshot source deploy state: installed source version is invalid."
         return 1
