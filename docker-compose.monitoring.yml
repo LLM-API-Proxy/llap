@@ -14,6 +14,13 @@
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# Middleware source (issue #1951): these routers use `large-body@consul`, seeded
+# into Consul KV by the base compose's consul-init service. It used to be
+# `large-body@docker`, defined on the PROXY container's labels — and Traefik's
+# Docker provider drops every label of a container that is not Docker-healthy, so
+# both routers failed to load with `middleware "large-body@docker" does not
+# exist` for the whole of each proxy start-up window.
 
 services:
   alertmanager:
@@ -70,7 +77,7 @@ services:
       - "traefik.http.routers.prometheus.rule=PathPrefix(`/prometheus`)"
       - traefik.http.routers.prometheus.entrypoints=websecure
       - traefik.http.routers.prometheus.service=prometheus-backend
-      - traefik.http.routers.prometheus.middlewares=large-body@docker
+      - traefik.http.routers.prometheus.middlewares=large-body@consul
       - "traefik.http.services.prometheus-backend.loadbalancer.server.url=http://[::1]:9090"
 
   grafana:
@@ -101,7 +108,7 @@ services:
       - "traefik.http.routers.grafana.rule=PathPrefix(`/grafana`)"
       - traefik.http.routers.grafana.entrypoints=websecure
       - traefik.http.routers.grafana.service=grafana-backend
-      - traefik.http.routers.grafana.middlewares=large-body@docker
+      - traefik.http.routers.grafana.middlewares=large-body@consul
       - "traefik.http.services.grafana-backend.loadbalancer.server.url=http://[::1]:3000"
 
 volumes:

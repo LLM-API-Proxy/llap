@@ -53,6 +53,14 @@ services:
     # gets stored when base+no-mdns come up together.
     environment:
       TRAEFIK_UNAVAILABLE_BACKEND_URL: ${TRAEFIK_UNAVAILABLE_BACKEND_URL:-http://backend-unavailable:80}
+      # Same reasoning for the product data plane (issue #1951): the proxy-api
+      # router and its backend are seeded into Consul KV rather than read from
+      # the proxy container's Docker labels, and under this overlay Traefik
+      # reaches the proxy by Docker DNS instead of the host loopback. The port is
+      # the port the PROCESS binds (PROXY_LISTEN_PORT / PROXY_FORWARD_PROXY__PORT
+      # from the base compose), not the published host port above.
+      PROXY_BACKEND_URL: ${PROXY_BACKEND_URL:-http://proxy:${PROXY_LISTEN_PORT:-3000}}
+      PROXY_FORWARD_BACKEND_ADDRESS: ${PROXY_FORWARD_BACKEND_ADDRESS:-proxy:${PROXY_FORWARD_PROXY__PORT:-3001}}
 
   proxy:
     # Clear network_mode: host set in the base compose.

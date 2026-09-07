@@ -172,6 +172,24 @@ services:
       # Traefik and the responder are reached over the host network stack, so
       # Traefik reaches the responder at the published host port [::1]:8081.
       TRAEFIK_UNAVAILABLE_BACKEND_URL: ${TRAEFIK_UNAVAILABLE_BACKEND_URL:-http://[::1]:8081}
+      # ── Product data-plane topology (issue #1951) ──────────────────────────
+      # The proxy-api router, its backend service and its middlewares are seeded
+      # into Consul KV (see the entrypoint below) instead of being read from the
+      # proxy container's Docker labels. These two URLs are the only
+      # topology-dependent parts, so each overlay that changes the networking
+      # mode overrides them here rather than duplicating routing labels.
+      # Base compose: Traefik and the proxy both use network_mode: host, so the
+      # proxy is reachable on the host loopback at PROXY_LISTEN_PORT.
+      PROXY_BACKEND_URL: ${PROXY_BACKEND_URL:-http://localhost:${PROXY_LISTEN_PORT:-3000}}
+      PROXY_FORWARD_BACKEND_ADDRESS: ${PROXY_FORWARD_BACKEND_ADDRESS:-localhost:${PROXY_FORWARD_PROXY__PORT:-3001}}
+      # Middleware chain for the proxy-api router, in order. Overlays that add a
+      # middleware (e.g. the WAF) override this whole list; service-unavailable
+      # MUST stay first so a downed backend still yields the retryable envelope.
+      TRAEFIK_PROXY_API_MIDDLEWARES: ${TRAEFIK_PROXY_API_MIDDLEWARES:-service-unavailable@consul,hsts@consul}
+      # ACME resolver for the proxy-api router. Unchanged from the label this
+      # replaces: base/dev has no `cloudflare` resolver defined, Traefik logs
+      # that and serves its default certificate; the TLS overlay defines it.
+      TRAEFIK_PROXY_API_CERT_RESOLVER: ${TRAEFIK_PROXY_API_CERT_RESOLVER:-cloudflare}
     entrypoint:
       - /bin/sh
       - -c
@@ -263,6 +281,175 @@ services:
           consul kv put traefik/http/routers/backend-unavailable/service backend-unavailable@consul
           consul kv put traefik/http/routers/backend-unavailable/tls/options strong-tls
         }
+
+        # ── Product data plane: proxy-api router + service + middlewares (#1951)
+        # These used to be Docker labels on the proxy container. Traefik's Docker
+        # provider DROPS EVERY LABEL of a container whose Docker health status is
+        # not "healthy" — including `starting`. The proxy image ships a HEALTHCHECK
+        # (Dockerfile.server: start-period 30s, interval 15s, retries 3) that only
+        # goes healthy once the process has finished booting and migrating, so for
+        # the whole of that window the proxy-api router, the proxy-backend service,
+        # `hsts` and `large-body` did not exist at all. The only remaining match for
+        # `/v1/*` was the priority-1 backend-unavailable catch-all, which answered
+        # 529 for 3.5 minutes on the v0.0.157 upgrade even though the proxy itself
+        # was already serving 200s. It also made grafana/prometheus fail to load
+        # with `middleware "large-body@docker" does not exist`, because large-body
+        # was defined on the proxy container too.
+        #
+        # Seeding them here puts the ENTIRE product routing graph in ONE provider
+        # whose delivery is ordered by compose (traefik depends_on consul-init:
+        # service_completed_successfully), so a router can never be disabled by a
+        # middleware or TLS option that has not arrived yet, and no part of it is
+        # tied to the proxy container's lifecycle or health status.
+        #
+        # Written on EVERY run (no write-if-absent guard): this is the data plane,
+        # it is derived from the deployment topology and the shipped release, and
+        # KV drift here is an outage. Operator customisation belongs in the Traefik
+        # file drop-in (docker/traefik-dynamic/), not in these keys.
+        #
+        # Behaviour when the proxy is DOWN keeps #1334's intent and sharpens it: the
+        # router always matches, and its service is a FAILOVER service that hands
+        # the request to the backend-unavailable responder while the proxy's health
+        # check is failing — so the client gets the responder's own retryable status
+        # and dialect rather than a raw connection error.
+        #
+        # Fail loud BEFORE the first write: seeding an empty backend URL would leave
+        # a router pointing at nothing, which is an outage that survives the exit.
+        if [ -z "$${PROXY_BACKEND_URL}" ] || [ -z "$${PROXY_FORWARD_BACKEND_ADDRESS}" ]; then
+          echo "FATAL(consul-init): PROXY_BACKEND_URL / PROXY_FORWARD_BACKEND_ADDRESS are empty — the proxy-api router would be seeded with no backend and every request would fall through to the 529 responder (#1951). Aborting." >&2
+          exit 1
+        fi
+        consul kv put traefik/http/services/proxy-backend/loadBalancer/servers/0/url "$${PROXY_BACKEND_URL}"
+        # Traefik health-checks the proxy itself and fails over to the responder
+        # when it is down (see the failover service below). This probe is what
+        # bounds the outage window, so WHICH endpoint it hits decides whether the
+        # failover can send traffic to a proxy that is not ready to serve.
+        #
+        # /health is the STRONGEST readiness signal LLAP exposes over HTTP, and it
+        # is not a lenient liveness endpoint — that description was wrong. Per
+        # crates/proxy-server/src/management/health_check.rs it runs a real query
+        # against the data pool, classifies the result (classify_health_status)
+        # and answers 503, not 200, when the database is unreachable, when every
+        # circuit breaker is open, or when the 5-minute 5xx/timeout rate is above
+        # threshold. It reports pool and circuit-breaker state on every response.
+        #
+        # The alternatives are all strictly weaker for this purpose:
+        #   * /manage/v1/health/live and /manage/v1/health/ready (app.rs
+        #     health_live / health_ready) both return a hardcoded
+        #     {"status":"ok"} and check NOTHING — pointing the failover at
+        #     "ready" would make it less able to spot an unready proxy, not more.
+        #   * The container's own healthcheck is `proxy-server healthcheck`, a
+        #     CLI subcommand, not an HTTP endpoint Traefik can call. It is also
+        #     what took 3.5 minutes longer than the outage during #1951, which is
+        #     why the failover must not wait on it.
+        #
+        # Known trade-off, recorded deliberately: because /health returns 503 when
+        # the proxy is DEGRADED (one open circuit, elevated 5xx) and not only when
+        # it is down, the failover will hand a degraded-but-serving proxy's
+        # traffic to the responder's retryable envelope. That is the conservative
+        # direction — clients back off and retry rather than receive errors — but
+        # it does mean "degraded" and "down" are treated alike here.
+        consul kv put traefik/http/services/proxy-backend/loadBalancer/healthCheck/path /health
+        consul kv put traefik/http/services/proxy-backend/loadBalancer/healthCheck/interval 5s
+        consul kv put traefik/http/services/proxy-backend/loadBalancer/healthCheck/timeout 2s
+        # Disable response buffering so SSE streams flush through (issue #1474).
+        consul kv put traefik/http/services/proxy-backend/loadBalancer/responseForwarding/flushInterval 1ms
+        # HSTS — forces HTTPS by instructing browsers never to connect over HTTP.
+        # OPERATOR WARNING: stsIncludeSubdomains=true means ALL subdomains of the
+        # domain must serve HTTPS once a browser caches this header. stsPreload
+        # stays false: preload is a near-permanent commitment for the whole domain
+        # tree via browser preload lists.
+        consul kv put traefik/http/middlewares/hsts/headers/stsSeconds 31536000
+        consul kv put traefik/http/middlewares/hsts/headers/stsIncludeSubdomains true
+        consul kv put traefik/http/middlewares/hsts/headers/stsPreload false
+        consul kv put traefik/http/middlewares/hsts/headers/forceSTSHeader true
+        # large-body — request body cap for the NON-STREAMING monitoring routers
+        # (grafana/prometheus reference it as large-body@consul). It must NEVER be
+        # attached to proxy-api: Traefik's `buffering` middleware always buffers the
+        # whole RESPONSE before forwarding it and there is no toggle to disable that
+        # (maxResponseBodyBytes=0 only removes the size LIMIT), which breaks SSE
+        # streaming (issue #1474). The proxy enforces its own request cap
+        # (reject_request_bytes), so the data plane needs no Traefik request limit.
+        consul kv put traefik/http/middlewares/large-body/buffering/maxRequestBodyBytes 1073741824
+        consul kv put traefik/http/middlewares/large-body/buffering/maxResponseBodyBytes 0
+        consul kv put traefik/http/middlewares/large-body/buffering/memRequestBodyBytes 1048576
+        # Failover service: the router's service is a failover wrapper, not the
+        # backend directly. While proxy-backend's health check passes, requests go
+        # to the proxy untouched (verified: SSE still streams, TTFB 2.5ms against a
+        # 3s stream). When it fails, Traefik routes to the responder DIRECTLY, so
+        # the client gets the responder's OWN status and dialect — 529 +
+        # overloaded_error on the Anthropic paths, 503 + an OpenAI-shaped error on
+        # /v1/responses, /v1/chat/completions and /api/* (#1334, #62).
+        #
+        # This is why the fallback is a failover service and not just the errors
+        # middleware: Traefik's errors middleware replaces the response BODY but
+        # PRESERVES the upstream status, so routing a downed backend through it
+        # yields a 502 carrying a 529-flavoured body, and its single `query` fetch
+        # cannot select the per-path dialect. Measured, not assumed.
+        consul kv put traefik/http/services/proxy-api-failover/failover/service proxy-backend@consul
+        consul kv put traefik/http/services/proxy-api-failover/failover/fallback backend-unavailable@consul
+        # The errors middleware stays in the chain for the case the failover cannot
+        # see: a backend that is health-check-UP but answers one request 502/504
+        # (or that has just died and the next probe has not fired yet). It must
+        # NEVER be given a status the responder itself returns — catching the
+        # responder's own 503 would pair that 503 with the Anthropic-shaped body
+        # from `query: /`. 502 and 504 are the two the responder never produces.
+        # Written every run so an install seeded by an earlier release, which
+        # stored 502/503/504, is corrected in place.
+        consul kv put traefik/http/middlewares/service-unavailable/errors/status/0 502
+        consul kv put traefik/http/middlewares/service-unavailable/errors/status/1 504
+        consul kv delete traefik/http/middlewares/service-unavailable/errors/status/2 > /dev/null 2>&1 || true
+        # proxy-api router. NO explicit priority: Traefik ranks it by rule length
+        # (15) which beats the backend-unavailable catch-all's explicit priority 1
+        # while keeping the same relative order against every other router that the
+        # Docker-label version had.
+        consul kv put traefik/http/routers/proxy-api/rule 'PathPrefix(`/`)'
+        consul kv put traefik/http/routers/proxy-api/entryPoints/0 websecure
+        consul kv put traefik/http/routers/proxy-api/service proxy-api-failover@consul
+        consul kv put traefik/http/routers/proxy-api/tls/options strong-tls
+        consul kv put traefik/http/routers/proxy-api/tls/certResolver "$${TRAEFIK_PROXY_API_CERT_RESOLVER}"
+        # Middleware chain, written as an ordered index list. Trailing indices from
+        # a previously longer chain (e.g. after the WAF overlay is removed) are
+        # deleted AFTER the new ones are written, so the router is never briefly
+        # invalid for a Traefik that is already running and watching this prefix.
+        # The `:-` default is defence in depth: the chain must never be empty,
+        # because service-unavailable@consul is what turns a 502/504 from a live
+        # backend into a retryable envelope (#1334).
+        #
+        # The stale sweep ENUMERATES what is actually in KV rather than counting to
+        # a fixed ceiling. The previous version deleted indices 0..7 only, but
+        # TRAEFIK_PROXY_API_MIDDLEWARES is operator-supplied and has no enforced
+        # eight-item limit: an operator who shortened a longer chain kept indices
+        # >= 8 in KV, and Traefik went on applying those obsolete middlewares to the
+        # public router forever. Enumerating makes the written list authoritative
+        # for any previous length.
+        _mw_existing=$$(consul kv get -keys traefik/http/routers/proxy-api/middlewares/ 2>/dev/null || true)
+        _mw_list="$${TRAEFIK_PROXY_API_MIDDLEWARES:-service-unavailable@consul,hsts@consul}"
+        _mw_idx=0
+        while [ -n "$$_mw_list" ]; do
+          case "$$_mw_list" in
+            *,*) _mw_item="$${_mw_list%%,*}"; _mw_list="$${_mw_list#*,}" ;;
+            *)   _mw_item="$$_mw_list";       _mw_list="" ;;
+          esac
+          [ -n "$$_mw_item" ] || continue
+          consul kv put "traefik/http/routers/proxy-api/middlewares/$$_mw_idx" "$$_mw_item"
+          _mw_idx=$$((_mw_idx + 1))
+        done
+        for _mw_key in $$_mw_existing; do
+          _mw_stale="$${_mw_key##*/}"
+          # Skip anything that is not a plain index (a nested key, or the prefix
+          # itself) — only numbered chain entries are ours to remove.
+          case "$$_mw_stale" in ''|*[!0-9]*) continue ;; esac
+          if [ "$$_mw_stale" -ge "$$_mw_idx" ]; then
+            consul kv delete "traefik/http/routers/proxy-api/middlewares/$$_mw_stale" > /dev/null 2>&1 || true
+          fi
+        done
+        # Forward proxy (CONNECT mode) TCP passthrough. HSTS and TLS options are
+        # HTTP-layer concerns and deliberately do not apply to a TCP router.
+        consul kv put traefik/tcp/routers/forward-proxy/rule 'HostSNI(`*`)'
+        consul kv put traefik/tcp/routers/forward-proxy/entryPoints/0 forward-proxy
+        consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward@consul
+        consul kv put traefik/tcp/services/proxy-forward/loadBalancer/servers/0/address "$${PROXY_FORWARD_BACKEND_ADDRESS}"
 
   # ─── backend-unavailable responder (issue #1334) ─────────────────────────────
   # Always-up static sidecar that answers EVERY request with a retryable HTTP 503
@@ -426,7 +613,11 @@ services:
     healthcheck:
       # Read the exact KV Traefik's consul provider needs. A 403 (revoked token)
       # or a missing key makes `consul kv get` exit non-zero → unhealthy.
-      test: ["CMD-SHELL", "consul kv get traefik/tls/options/strong-tls/minVersion >/dev/null 2>&1 || exit 1"]
+      # Since #1951 the data-plane router itself lives in this KV too, so the
+      # probe covers it as well: losing traefik/http/routers/proxy-api is now an
+      # ingress outage (every request falls through to the 529 responder), not
+      # just a TLS-hardening regression.
+      test: ["CMD-SHELL", "consul kv get traefik/tls/options/strong-tls/minVersion >/dev/null 2>&1 && consul kv get traefik/http/routers/proxy-api/rule >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -484,76 +675,15 @@ services:
     depends_on:
       consul:
         condition: service_healthy
-    labels:
-      - traefik.enable=true
-      # HTTP router — handles all HTTPS requests via the websecure entrypoint
-      - "traefik.http.routers.proxy-api.rule=PathPrefix(`/`)"
-      - traefik.http.routers.proxy-api.entrypoints=websecure
-      - traefik.http.routers.proxy-api.service=proxy-backend
-      # service-unavailable@consul is the errors middleware seeded into Consul KV
-      # by consul-init (issue #1334). It catches a dead-but-present backend
-      # (502/503/504) and serves the retryable backend-unavailable 503 envelope so
-      # Claude CLI retries instead of treating the blip as a model-access error.
-      # NO large-body@docker here (issue #1474): Traefik's `buffering` middleware
-      # reads the ENTIRE response into memory before forwarding it — there is NO
-      # "buffering off" toggle, and `maxResponseBodyBytes=0` only disables the
-      # response SIZE LIMIT, not the buffering itself. Attaching it to this router
-      # therefore breaks SSE streaming: the client receives the whole stream as one
-      # burst at the end (measured: time_starttransfer == time_total). The proxy
-      # streams live on its own (verified direct-to-backend: TTFB << total), so the
-      # data plane must NOT be wrapped in a response-buffering middleware. Request
-      # body-size limits are enforced by the proxy itself (reject_request_bytes), so
-      # dropping Traefik's request cap here is safe. (large-body remains available
-      # for non-streaming routes like grafana/prometheus — see docker-compose.monitoring.yml.)
-      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,hsts@docker
-      - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
-      # TLS options reference the Consul KV provider (see issue #242 — Consul KV must be
-      # active for this to take effect; falls back to default TLS options otherwise).
-      # Uses @consul suffix (migrated from @file provider in issue #241).
-      # Without @consul, Traefik uses default TLS options (TLS 1.0 allowed, weak ciphers)
-      # even if Consul KV has the options seeded. Requires issue #242 to be merged.
-      - traefik.http.routers.proxy-api.tls.options=strong-tls@consul
-      # HSTS middleware — forces HTTPS by instructing browsers to never connect over HTTP.
-      # OPERATOR WARNING: stsIncludeSubdomains: true means ALL subdomains of the domain
-      # will be required to serve HTTPS once a browser caches this header.
-      # stsPreload: false is the safe default — enabling preload is a near-permanent
-      # commitment for the entire domain tree via browser preload lists.
-      # Operators who understand the implications may override via docker-compose.override.yml.
-      - traefik.http.middlewares.hsts.headers.stsSeconds=31536000
-      - traefik.http.middlewares.hsts.headers.stsIncludeSubdomains=true
-      - "traefik.http.middlewares.hsts.headers.stsPreload=false"
-      - traefik.http.middlewares.hsts.headers.forceSTSHeader=true
-      # Body size middleware — allows up to 1 GiB requests.
-      # WARNING (issue #1474): a Traefik `buffering` middleware ALWAYS buffers the
-      # full RESPONSE body before forwarding it — `maxResponseBodyBytes=0` only
-      # disables the response size LIMIT (no 500 on a large response), it does NOT
-      # turn response buffering off (there is no such toggle). NEVER attach this
-      # middleware to a streaming/SSE route (the proxy-api router above) or the
-      # client gets the whole stream in one terminal burst. It is defined here (on
-      # the proxy container, the canonical owner of shared middlewares) and used
-      # ONLY by the non-streaming grafana/prometheus routers in
-      # docker-compose.monitoring.yml. The proxy enforces its own request-body cap
-      # (reject_request_bytes), so the data plane needs no Traefik request limit.
-      # memRequestBodyBytes=1048576: request bodies ≤1 MiB stay in memory; larger spill to
-      # the container filesystem rather than exhausting the 512 MiB Traefik memory limit.
-      - "traefik.http.middlewares.large-body.buffering.maxRequestBodyBytes=1073741824"
-      - "traefik.http.middlewares.large-body.buffering.maxResponseBodyBytes=0"
-      - "traefik.http.middlewares.large-body.buffering.memRequestBodyBytes=1048576"
-      # HTTP service — both Traefik and the proxy use network_mode: host, so both
-      # are on the host network stack. Traefik reaches the proxy at localhost on
-      # PROXY_LISTEN_PORT (default 3000). No Docker bridge network resolution needed.
-      # traefik.docker.network is NOT set (proxy is not on a Docker bridge network).
-      - "traefik.http.services.proxy-backend.loadbalancer.server.url=http://localhost:${PROXY_LISTEN_PORT:-3000}"
-      # Disable buffering for SSE streaming support
-      - traefik.http.services.proxy-backend.loadbalancer.responseForwarding.flushInterval=1ms
-      # TCP router — passthrough for the forward proxy (CONNECT mode / TLS interception).
-      # HSTS and TLS options are HTTP-layer concerns and do NOT apply to the TCP router.
-      - "traefik.tcp.routers.forward-proxy.rule=HostSNI(`*`)"
-      - traefik.tcp.routers.forward-proxy.entrypoints=forward-proxy
-      - traefik.tcp.routers.forward-proxy.service=proxy-forward
-      # TCP service — Traefik in host mode reaches the proxy via localhost.
-      # Default port 3001; change PROXY_FORWARD_PROXY__PORT if it conflicts.
-      - "traefik.tcp.services.proxy-forward.loadbalancer.server.port=${PROXY_FORWARD_PROXY__PORT:-3001}"
+    # ── No Traefik labels on this container (issue #1951) ─────────────────────
+    # Every product router, service and middleware is seeded into Consul KV by
+    # consul-init above, NOT declared here. Traefik's Docker provider silently
+    # drops all labels of a container whose Docker health status is not
+    # "healthy", and this image ships a HEALTHCHECK, so labels here vanish for
+    # the whole of every start-up/upgrade window — which is exactly how a public
+    # hostname served the priority-1 backend-unavailable fallback (529) for 3.5
+    # minutes after the proxy was already answering requests. Do not reintroduce
+    # `traefik.*` labels on this service; add the keys to consul-init instead.
 
 networks:
   proxy_net:

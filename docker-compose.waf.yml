@@ -32,6 +32,23 @@ services:
       ALLOWED_REQUEST_CONTENT_TYPE: "application/json|application/x-www-form-urlencoded|multipart/form-data|text/event-stream|text/plain"
     volumes:
       - ./modsecurity/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:ro
+    labels:
+      # The WAF middleware is declared on the WAF's OWN container (issue #1951).
+      # It used to sit on the proxy container's labels, which coupled it to the
+      # proxy's Docker health status: Traefik drops every label of a container
+      # that is not "healthy", so the middleware vanished for the whole of each
+      # proxy start-up window and took the proxy-api router down with it.
+      #
+      # It is still Docker-provided rather than Consul-seeded because Traefik's
+      # KV provider is not a verified transport for plugin configuration. The
+      # remaining coupling is deliberate and correct: while this sidecar is not
+      # healthy the proxy-api router is disabled and the backend-unavailable
+      # responder answers with a retryable envelope — a WAF deployment must fail
+      # closed rather than serve uninspected traffic. That window is bounded by
+      # this container's own healthcheck, not by the proxy's boot + migrations.
+      - traefik.enable=true
+      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.modSecurityUrl=http://[::1]:8180"
+      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.maxBodySize=52428800"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost/healthz || exit 1"]
@@ -47,16 +64,14 @@ services:
           cpus: "0.1"
           memory: 64m
 
-  # Add WAF middleware to the proxy-api router.
-  # Traefik uses host networking and reaches the sidecar at [::1]:8180.
-  proxy:
-    labels:
-      # service-unavailable@consul (issue #1334) MUST stay first so a downed
-      # backend still yields the retryable 503 envelope under the WAF overlay.
-      # Compose replaces the whole middlewares label, so it is repeated here.
-      - traefik.http.routers.proxy-api.middlewares=service-unavailable@consul,modsecurity-waf@docker,hsts@docker
-      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.modSecurityUrl=http://[::1]:8180"
-      - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.maxBodySize=52428800"
+  # Insert the WAF middleware into the proxy-api chain (issue #1951).
+  # The chain is a consul-init environment variable now that the router lives in
+  # Consul KV; this override replaces the whole ordered list.
+  # service-unavailable@consul (issue #1334) MUST stay first so a downed backend
+  # still yields the retryable envelope under the WAF overlay.
+  consul-init:
+    environment:
+      TRAEFIK_PROXY_API_MIDDLEWARES: ${TRAEFIK_PROXY_API_MIDDLEWARES:-service-unavailable@consul,modsecurity-waf@docker,hsts@consul}
 
   traefik:
     command:

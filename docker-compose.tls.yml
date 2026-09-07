@@ -175,13 +175,12 @@ services:
       - PROXY_TLS__ENABLED=true
       - PROXY_TLS__DOMAIN=${PROXY_TLS__DOMAIN}
       - PROXY_TLS__ACME_EMAIL=${PROXY_TLS__ACME_EMAIL}
-    labels:
-      # TLS overlay: add certresolver so the ACME cloudflare resolver issues certificates
-      # for the proxy-api router. The base compose sets routing labels; this overlay adds
-      # the ACME certresolver label so certificates are obtained automatically.
-      # The entrypoints.websecure.http.tls.certresolver flag on Traefik pre-fetches a
-      # wildcard cert at startup; this label ensures the per-router resolver is also set.
-      - traefik.http.routers.proxy-api.tls.certresolver=cloudflare
+    # No Traefik labels here (issue #1951). The proxy-api router — including its
+    # ACME certResolver — is seeded into Consul KV by consul-init, because
+    # Traefik's Docker provider drops the labels of a container that is not
+    # Docker-healthy and the router must exist before the proxy finishes booting.
+    # TRAEFIK_PROXY_API_CERT_RESOLVER already defaults to `cloudflare`, which is
+    # the resolver this overlay defines, so no override is needed here.
 
 volumes:
   # Named volume for ACME certificate storage.

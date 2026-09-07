@@ -19,9 +19,31 @@ Drop `*.yml`, `*.yaml`, or `*.toml` files here to extend Traefik with your own
 - **Operator / site-specific config** → here. Custom hostnames, vanity
   redirects, extra middlewares, your own routers. This is YOUR config; it is
   never overwritten by an upgrade.
-- **Product routing** → NOT here. The proxy's own routers/middlewares are
-  configured via Docker labels on the proxy service and TLS options via Consul
-  KV. Do not duplicate those here.
+- **Product routing** → NOT here. The proxy's own routers, services,
+  middlewares and TLS options are seeded into **Consul KV** by the `consul-init`
+  one-shot service (issues #241, #242, #1951). Do not duplicate those here.
+
+> ### Do not add a `Host()` router for a hostname this proxy already serves
+>
+> The product router `proxy-api@consul` is a catch-all path-prefix rule with
+> **no host constraint**, so it already serves every hostname that reaches this box,
+> and it carries the `service-unavailable` middleware that turns a downed
+> backend into a retryable error envelope instead of a hard failure.
+>
+> A drop-in router with an explicit `Host()` rule has a **longer rule and
+> therefore a higher default priority**, so it takes those hostnames away from
+> the product router. If it covers only part of the surface — a `/health` route,
+> say — you get a split ingress: health checks answer `200` from your router
+> while `/v1/*` falls through to a different one. That is exactly what made a
+> multi-minute inference outage invisible during the v0.0.157 upgrade
+> (issue #1951).
+>
+> If you do need a host-scoped router, make it cover the **whole** path surface
+> or nothing, and attach `service-unavailable@consul` to it so a restart still
+> produces a retryable response. The installer's post-deploy gate probes
+> `/v1/models` and `/health` on every configured hostname and fails the deploy if
+> they disagree; declare any additional hostnames in `docker/.env` as
+> `LLAP_INGRESS_VERIFY_HOSTS=host-a,host-b` so they are covered.
 
 > Files in this directory are dynamic (runtime) config only. They **cannot**
 > change Traefik static config (entrypoints, providers, ACME resolvers) — those
