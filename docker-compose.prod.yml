@@ -217,7 +217,8 @@ services:
           consul kv put traefik/http/middlewares/service-unavailable/errors/status/1 503
           consul kv put traefik/http/middlewares/service-unavailable/errors/status/2 504
           consul kv put traefik/http/middlewares/service-unavailable/errors/service backend-unavailable@consul
-          consul kv put traefik/http/middlewares/service-unavailable/errors/query /
+          consul kv put traefik/http/middlewares/service-unavailable/errors/query '/{url}'
+          consul kv put traefik/http/middlewares/service-unavailable/errors/statusRewrites/502-504 503
         }
         # 3. Lowest-priority catch-all router for the no-matching-router 404 case.
         consul kv get traefik/http/routers/backend-unavailable/rule > /dev/null 2>&1 || {
@@ -332,6 +333,27 @@ services:
         consul kv put traefik/http/middlewares/service-unavailable/errors/status/0 502
         consul kv put traefik/http/middlewares/service-unavailable/errors/status/1 504
         consul kv delete traefik/http/middlewares/service-unavailable/errors/status/2 > /dev/null 2>&1 || true
+        # Issue #1966. Traefik fetches the error page with the middleware's OWN
+        # query, not the client's path, and discards the responder's status. A
+        # `query: /` therefore served the catch-all Anthropic envelope on EVERY
+        # 502/504 — an OpenAI client POSTing /v1/chat/completions read
+        # `502 Bad Gateway: overloaded_error: ...`, retried 15 times and exited.
+        #
+        # `{url}` passes the ORIGINAL request URL through as a percent-encoded
+        # path segment, which the responder's regex locations decode and match,
+        # so the fetched body is dialect-correct per path.
+        #
+        # `statusRewrites` then replaces the preserved 502/504 with 503. The key
+        # is the RANGE `502-504`, not two numeric keys: Traefik's Consul KV
+        # provider reads an all-digit child key as a slice index, so
+        # `statusRewrites/502` fails the whole provider with "statusRewrites
+        # cannot be a standalone element (type map[string]int)" and every router
+        # in KV disappears. Only 502 and 504 ever reach this middleware, so the
+        # range covers exactly the two statuses in the list above.
+        # Both written every run so an install seeded by an earlier release is
+        # corrected in place.
+        consul kv put traefik/http/middlewares/service-unavailable/errors/query '/{url}'
+        consul kv put traefik/http/middlewares/service-unavailable/errors/statusRewrites/502-504 503
         # No explicit priority: Traefik ranks proxy-api by rule length (15), which
         # beats the backend-unavailable catch-all's explicit priority 1 and keeps
         # the same relative order the Docker-label version had.
