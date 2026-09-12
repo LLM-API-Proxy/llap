@@ -468,6 +468,51 @@ emit_backup_events  = true
 # Sakana account to a proxy key's routing policy. The base URL
 # (https://api.sakana.ai/v1) is the fixed default and needs no configuration.
 #
+# ModelArk: BytePlus / Volcengine ModelArk CODING PLAN is a FLAT-RATE
+# SUBSCRIPTION that exposes the ANTHROPIC MESSAGES API (not an OpenAI-shaped
+# one) on a dedicated Coding Plan base path — same wire protocol Claude Code
+# already speaks, so NO cross-protocol translation is needed. The provider is
+# built by embedding an AnthropicProvider and reusing the shared header policy
+# and Anthropic pipeline verbatim (mirrors z.ai's shape, not Sakana's).
+#   * Only /v1/messages and /v1/messages/count_tokens are registered. The
+#     Anthropic-only OAuth / eval / grove / penguin / profile / event-logging
+#     paths do not exist at ModelArk and are never probed.
+# Auth is bearer-token, API-key only (Authorization: Bearer <ark api key>) —
+# there is NO OAuth or refresh path; a ModelArk account must never be probed
+# against auth.anthropic.com or appear in OAuth recovery/reauth code paths.
+# Ark keys carry no sk-ant- prefix, so that validation check is dropped (same
+# as z.ai). Model: `ark-code-latest` is the documented auto-select id and the
+# default model; entitlement is sourced from the account's own /v1/models
+# discovery, degrading to a minimal static catalogue containing just
+# ark-code-latest if discovery returns nothing (mirrors how VoyageAi handles a
+# provider with no public /v1/models).
+# Regional / plan variance: ModelArk is sold on two hosts and two plan paths.
+# The default below is the BytePlus (international) Coding Plan. Operators on
+# a different combination set the account's upstream_url override:
+#   * Coding Plan, BytePlus intl (default):
+#       https://ark.ap-southeast.bytepluses.com/api/coding
+#   * Coding Plan, Volcengine mainland:
+#       https://ark.cn-beijing.volces.com/api/coding
+#   * Agent Plan, BytePlus intl:
+#       https://ark.ap-southeast.bytepluses.com/api/plan
+# The outbound Host header is always derived from the EFFECTIVE base URL's
+# authority (default or override) — never hardcoded independently of the URL
+# actually being dialled. validate_upstream_url still rejects private/
+# link-local hosts.
+# Pricing: Coding Plan is a flat-rate SUBSCRIPTION, not metered per-token — a
+# ModelArk account is priced as a $0 marginal-cost subscription source for
+# ROUTING (same treatment as z.ai/Sakana), with reference-only pricing rows
+# seeded so cost observability has data instead of a cold cache.
+# Configuration: on the API or web/TUI dashboards, create a provider account,
+# select "ModelArk" as the provider type, choose "API key" auth method, and
+# paste the Ark API key from ModelArk Console -> API Key Management. Leave the
+# base URL at its default unless your subscription is on the Volcengine-
+# mainland or Agent-Plan combination above, in which case set upstream_url to
+# the matching row. Save the account and confirm background model discovery
+# populated provider_models, then add the ModelArk account to a proxy key's
+# routing policy. See docs/resources/modelark.md for the full reference — NOTE
+# that reference is contract-derived, not MITM-verified against a live key.
+#
 # OpenRouter: uses the standard api_key auth path. No provider-specific config
 # keys are required. The model catalogue is cached per-account in the
 # provider_models table and refreshable via the management API.
@@ -532,6 +577,7 @@ emit_backup_events  = true
 # openai_codex = "15m"
 # openrouter   = "15m"
 # zai          = "15m"
+# modelark     = "15m"
 # # Fast/local providers may be shorter.
 # ollama       = "10m"
 # local_llm    = "10m"
