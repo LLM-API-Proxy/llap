@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.165"
+INSTALLER_VERSION="0.0.166"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -7999,6 +7999,21 @@ deploy_write_container_dns_overlay() {
         done
         if [[ "$OPT_BACKUP" == "true" ]]; then
             echo "  backup:"
+            echo "    dns:"
+            for server in "${servers[@]}"; do
+                printf '      - "%s"\n' "$server"
+            done
+        fi
+        if [[ "$OPT_TLS" == "true" ]]; then
+            # Traefik runs with network_mode: host (#1340), so it never gets
+            # Docker's embedded per-container DNS. Without an explicit override
+            # here it falls back to the container's copied /etc/resolv.conf,
+            # which — under systemd-resolved — lists the global "uplink"
+            # nameservers rather than the working per-link resolvers those
+            # uplinks are only reachable through via the local stub. That left
+            # ACME renewal unable to resolve the Let's Encrypt API, silently,
+            # until certs on non-prefetched (legacy-redirect) domains expired.
+            echo "  traefik:"
             echo "    dns:"
             for server in "${servers[@]}"; do
                 printf '      - "%s"\n' "$server"
