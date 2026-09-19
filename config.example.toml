@@ -148,6 +148,14 @@ refresh_interval_secs = 30
 # both model listing and model-dominant routing. Both knobs default to 3600
 # seconds (1 hour).
 #
+# Provider-account onboarding (#2090).
+#   PROXY_ACCOUNTS__READINESS_GATE=true
+[accounts]
+# Readiness gate: an account is not routable until credential validation,
+# usage/allowance retrieval and full model discovery have all succeeded.
+# Unset means enabled. Set to false only to reproduce pre-gate behaviour.
+readiness_gate = true
+
 # Note on env var naming: nested struct fields require DOUBLE-UNDERSCORE separators.
 #   PROXY_MODEL_DISCOVERY__TTL_SECS=3600
 #   PROXY_MODEL_DISCOVERY__REFRESH_INTERVAL_SECS=3600
