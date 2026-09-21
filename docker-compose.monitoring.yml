@@ -1,10 +1,11 @@
 # docker/docker-compose.monitoring.yml — Prometheus + Grafana + Alertmanager monitoring overlay.
 #
-# Adds Prometheus, Grafana, and Alertmanager on the proxy_net bridge network.
-# Services are served via Traefik subpath routing:
+# Adds Prometheus, Grafana, Alertmanager and cAdvisor on the proxy_net bridge
+# network. Services are served via Traefik subpath routing:
 #   /grafana      → Grafana (port 3000)
 #   /prometheus   → Prometheus (port 9090)
 #   /alertmanager → Alertmanager (port 9093, internal only — not exposed via Traefik)
+#   cadvisor      → not routed: scraped over proxy_net at cadvisor:8080 (#1697)
 #
 # Alertmanager config:
 #   Copy docker/alertmanager/alertmanager.yml to docker/alertmanager/alertmanager.local.yml
@@ -23,6 +24,42 @@
 # exist` for the whole of each proxy start-up window.
 
 services:
+  # ── cAdvisor — per-container cgroup counters (#1697) ────────────────────────
+  #
+  # WHY THIS SERVICE EXISTS
+  # -----------------------
+  # Production OOM-killed 32 PostgreSQL backends between 2026-07-02 and
+  # 2026-07-14. The kernel killed individual backends, so the postmaster and the
+  # container stayed up: restart_count was 0 and no health check ever noticed.
+  # cAdvisor exposes the cgroup OOM-kill counter (`container_oom_events_total`,
+  # fed from cgroup v2 `memory.events` `oom_kill`) plus the working-set and
+  # limit gauges, which the llap-database-oom rules alert on. It is the metric
+  # source for that alert group; without it the rules are inert (which the
+  # LLAPDatabaseOOMMetricsAbsent rule pages on).
+  #
+  # EXPOSURE: internal to proxy_net only — no host port is published, so it is
+  # reachable by Prometheus at `cadvisor:8080` and by nothing else. Monitoring
+  # is opt-in (`--no-monitoring` disables this whole overlay).
+  #
+  # PRIVILEGE: the host mounts are read-only and this is the documented cAdvisor
+  # configuration for reading Docker's per-container cgroups. It does not mount
+  # application data or the proxy's credentials.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.54.1
+    networks:
+      - proxy_net
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    command:
+      - "--docker_only=true"
+      - "--housekeeping_interval=30s"
+    restart: unless-stopped
+
   alertmanager:
     image: prom/alertmanager:v0.28.1
     networks:
@@ -54,6 +91,13 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/rules:/etc/prometheus/rules:ro
+      # Read-only `prx-ro-` scrape credential for the authenticated /metrics
+      # endpoint, provisioned by install.sh (provision_monitoring_scrape_key).
+      # Prometheus re-reads it every scrape, so rotating the key needs no reload.
+      # The installer creates the file before `compose up` so the bind-mount
+      # preflight (#1390) never sees a missing source and Docker never
+      # auto-creates a directory here (#1881).
+      - ./prometheus/llap-metrics.token:/etc/prometheus/llap-metrics.token:ro
       - prometheus_data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"

@@ -4,6 +4,21 @@
 # (proxy, traefik) are reached via the Docker bridge gateway.
 # The monitoring overlay sets extra_hosts: host.docker.internal:host-gateway
 # which resolves to the Docker bridge gateway IP on Linux.
+#
+# Every target below must actually reach the wire. Issue #1881: all three were
+# structurally unscrapeable —
+#   * `prometheus` self-scrape hit /metrics while the container runs with
+#     `--web.route-prefix=/prometheus`, so Prometheus's own metrics live at
+#     /prometheus/metrics and the scrape 404'd.
+#   * `proxy-server` sent no credential, and /metrics REQUIRES one (it is
+#     deliberately not on the public-endpoint allow-list in
+#     crates/proxy-server/CLAUDE.md). The installer provisions a read-only
+#     `prx-ro-` key into the token file referenced by `credentials_file` below.
+#   * `traefik` scraped :8082 while the base compose that the installer deploys
+#     declared no `--metrics.*` flags. docker-compose.yml now enables the
+#     `metrics` entrypoint that this job targets.
+# docker/prometheus/test/scrape_targets_test.bats proves all three reach `up`
+# against a real Prometheus built from THIS file — not a string match.
 
 global:
   scrape_interval: 15s
@@ -15,6 +30,8 @@ rule_files:
   - 'rules/llap-rate-limit.yml'
   - 'rules/llap-sse-health.yml'
   - 'rules/llap-backup-health.yml'
+  # Database cgroup OOM-kill alerting (#1697). Fed by the `cadvisor` job below.
+  - 'rules/llap-database-oom.yml'
 
 # Alertmanager connection — only active when the monitoring overlay includes
 # the alertmanager service (docker-compose.monitoring.yml).
@@ -25,20 +42,31 @@ alerting:
       timeout: 10s
 
 scrape_configs:
+  # Self-scrape. MUST track the `--web.route-prefix=/prometheus` in
+  # docker-compose.monitoring.yml: with that prefix the container serves its own
+  # metrics at /prometheus/metrics and /metrics is a 404 (#1881).
   - job_name: 'prometheus'
+    metrics_path: /prometheus/metrics
     static_configs:
       - targets: ['localhost:9090']
 
-  # Proxy metrics — host-networked, reached via Docker gateway
+  # Proxy metrics — host-networked, reached via Docker gateway.
+  # /metrics is authenticated (JWT or a `prx-ro-` read-only key); Prometheus
+  # sends the installer-provisioned read-only key as a bearer token. Never add
+  # /metrics to the public allowlist to work around a missing credential.
   - job_name: 'proxy-server'
     scrape_interval: 10s
     metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/llap-metrics.token
     static_configs:
       - targets: ['host.docker.internal:7080']
         labels:
           service: 'proxy-server'
 
-  # Traefik metrics — host-networked, reached via Docker gateway
+  # Traefik metrics — host-networked, reached via Docker gateway. docker-compose.yml
+  # defines `--entrypoints.metrics.address=[::]:8082` + `--metrics.prometheus`.
   - job_name: 'traefik'
     scrape_interval: 15s
     metrics_path: /metrics
@@ -46,3 +74,16 @@ scrape_configs:
       - targets: ['host.docker.internal:8082']
         labels:
           service: 'traefik'
+
+  # cAdvisor — per-container cgroup counters for the database container (#1697).
+  # `container_oom_events_total` is the cgroup memory.events oom_kill count;
+  # a killed PostgreSQL BACKEND leaves the postmaster and the container up, so
+  # this is the only signal that sees it. Reached over proxy_net (service
+  # `cadvisor`), never host-published. The llap-database-oom rules key off it.
+  - job_name: 'cadvisor'
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['cadvisor:8080']
+        labels:
+          service: 'cadvisor'

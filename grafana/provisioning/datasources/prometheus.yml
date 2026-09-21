@@ -1,5 +1,10 @@
 # docker/grafana/provisioning/datasources/prometheus.yml
 # Auto-provisions the Prometheus data source in Grafana on first startup.
+#
+# The URL MUST include the /prometheus path prefix. docker-compose.monitoring.yml
+# starts Prometheus with `--web.route-prefix=/prometheus`, so its HTTP API lives
+# at /prometheus/api/v1/... — a datasource pointed at http://prometheus:9090
+# would query /api/v1/... and get 404 for every panel (#1881).
 
 apiVersion: 1
 
@@ -7,6 +12,6 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    url: http://prometheus:9090/prometheus
     isDefault: true
     editable: false

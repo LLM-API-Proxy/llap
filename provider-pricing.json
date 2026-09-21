@@ -173,6 +173,16 @@
       "notes": "claude-opus-3 (legacy Opus 3)"
     },
     {
+      "provider_type": "anthropic",
+      "model": "claude-mythos-5",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "10.000000",
+      "output_per_million_usd": "50.000000",
+      "cache_read_per_million_usd": "1.000000",
+      "cache_create_per_million_usd": "12.500000",
+      "notes": "claude-mythos-5 (Anthropic published model page); flagship tier, same published rate as claude-fable-5; 5-minute cache write price used for cache_create. Seeded by migration 0140 for issue #1616"
+    },
+    {
       "provider_type": "openai",
       "model": "gpt-5.4-pro",
       "effective_from": "2026-04-03T00:00:00Z",
@@ -597,6 +607,96 @@
       "cache_read_per_million_usd": "1.000000",
       "cache_create_per_million_usd": "0.000000",
       "notes": "OpenAI Codex gpt-5.3-codex spark variant; same tier as gpt-5.3-codex, no cache creation charge"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.2-codex",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.750000",
+      "output_per_million_usd": "14.000000",
+      "cache_read_per_million_usd": "0.175000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.2-codex (official model-page rate); no cache creation charge; async batch output billed at 50% (7.00/MTok). Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.2",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.750000",
+      "output_per_million_usd": "14.000000",
+      "cache_read_per_million_usd": "0.175000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.2 (same published rate as the openai-provider row; duplicated provider-scoped because pricing lookup filters by provider). Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.1-codex-max",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.250000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.125000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.1-codex-max (official model-page rate); no cache creation charge. Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.1-codex",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.250000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.125000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.1-codex (official model-page rate); no cache creation charge. Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.1",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.250000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.125000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.1 (same published rate as the openai-provider row; duplicated provider-scoped). Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5-codex",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.250000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.125000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5-codex (official model-page rate); no cache creation charge. Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "1.250000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.125000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5 (same published rate as the openai-provider row; duplicated provider-scoped). Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5.1-codex-mini",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "0.250000",
+      "output_per_million_usd": "2.000000",
+      "cache_read_per_million_usd": "0.025000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5.1-codex-mini (official model-page rate); no cache creation charge; async batch output billed at 50% (1.00/MTok). Seeded by migration 0140 for issue #1616"
+    },
+    {
+      "provider_type": "openai_codex",
+      "model": "gpt-5-codex-mini",
+      "effective_from": "2026-07-01T00:00:00Z",
+      "input_per_million_usd": "0.250000",
+      "output_per_million_usd": "2.000000",
+      "cache_read_per_million_usd": "0.025000",
+      "cache_create_per_million_usd": "0.000000",
+      "notes": "OpenAI Codex gpt-5-codex-mini (deprecated id) — replacement-reference equivalent of its mandatory successor gpt-5.1-codex-mini at the same published rate, not an exact historical PAYG rate for the deprecated id. Seeded by migration 0140 for issue #1616"
     }
   ]
 }

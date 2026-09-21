@@ -94,16 +94,23 @@ services:
       # command wholesale, so the ping flags MUST be repeated here — otherwise the
       # base traefik healthcheck (inherited) would probe a ping entrypoint that
       # does not exist and mark a healthy WAF Traefik unhealthy. Uses 127.0.0.1:8083
-      # (NOT the metrics :8082 below) so the two loopback entrypoints never collide.
+      # so the liveness probe stays loopback-only and never collides with the
+      # metrics entrypoint on 8082 (which is bridge-reachable, see below).
       - "--ping=true"
       - "--ping.entrypoint=ping"
       - "--entrypoints.ping.address=127.0.0.1:8083"
       - "--log.level=INFO"
       - "--accesslog=true"
-      # Traefik metrics endpoint for Prometheus scraping
+      # Traefik metrics endpoint for Prometheus scraping (#1881).
+      # `entryPoint` is the Traefik v3 flag spelling (the lowercase variant is
+      # not recognised), and the address must be reachable from the proxy_net
+      # bridge — Prometheus scrapes host.docker.internal:8082, never the
+      # container's own loopback, so a [::1] bind is unscrapeable by design.
+      # Public exposure is prevented by the installer's INPUT chain, which
+      # admits 8082 from Docker bridges only.
       - "--metrics.prometheus=true"
-      - "--metrics.prometheus.entrypoint=metrics"
-      - "--entrypoints.metrics.address=[::1]:8082"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=[::]:8082"
       # ModSecurity WAF plugin
       - "--experimental.plugins.modsecurity.moduleName=github.com/acouvreur/traefik-modsecurity-plugin"
       - "--experimental.plugins.modsecurity.version=v1.6.0"

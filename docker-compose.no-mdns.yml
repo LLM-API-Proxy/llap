@@ -43,6 +43,12 @@ services:
       - "[::]:443:443"
       - "[::]:8443:8443"
       - "[::]:80:80"
+      # Metrics entrypoint (#1881). Without host networking the Prometheus
+      # container reaches Traefik through host.docker.internal, i.e. a PUBLISHED
+      # host port — an unpublished container port is unreachable from the
+      # proxy_net bridge. Loopback-only: only Prometheus needs it, and this path
+      # has no nftables firewall to scope a bridge-only accept.
+      - "[::1]:8082:8082"
 
   consul-init:
     # Under no-mdns, Traefik runs on the proxy_net bridge (not host networking),

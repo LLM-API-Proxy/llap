@@ -573,6 +573,15 @@ services:
       - "--entrypoints.ping.address=127.0.0.1:8083"
       - "--log.level=INFO"
       - "--accesslog=true"
+      # Prometheus metrics entrypoint (#1881). docker/prometheus/prometheus.yml
+      # scrapes the `traefik` job at host.docker.internal:8082; without these
+      # flags nothing ever listened on 8082 and the target could never come up.
+      # network_mode: host means this binds the host's bridge gateway too, so the
+      # installer admits Docker-bridge traffic to 8082 in the nftables INPUT chain
+      # (firewall_bridge_metrics_ports). IPv6-first, matching the entrypoints above.
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=[::]:8082"
     volumes:
       # Docker socket for label-based service discovery
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -683,6 +692,20 @@ services:
       PROXY_LISTEN_PORT: ${PROXY_LISTEN_PORT:-3000}
       # Default 3001 — change if the port conflicts with another service on the host.
       PROXY_FORWARD_PROXY__PORT: ${PROXY_FORWARD_PROXY__PORT:-3001}
+      # #1722: terminate TLS on the CONNECT client hop so the proxy key in
+      # `Proxy-Authorization` never crosses the network in cleartext. The
+      # listener's entry certificate is issued by the shared CA (so the client's
+      # existing CA install covers it), and the advertised forward-proxy URL
+      # becomes https://. Set PROXY_FORWARD_PROXY__CLIENT_TLS=false only for a
+      # deliberately plaintext deployment on a trusted network; the advertised
+      # scheme follows it. See docs/forward-proxy-tls.md.
+      PROXY_FORWARD_PROXY__CLIENT_TLS: ${PROXY_FORWARD_PROXY__CLIENT_TLS:-true}
+      # Hostname presented in the listener's own certificate. Empty falls back to
+      # PROXY_TLS__DOMAIN, then the host of PROXY_PUBLIC_URL, then localhost.
+      PROXY_FORWARD_PROXY__TLS_HOSTNAME: ${PROXY_FORWARD_PROXY__TLS_HOSTNAME:-}
+      # Public port clients reach: Traefik publishes 8443 and passes it through
+      # as raw TCP, while the process binds PROXY_FORWARD_PROXY__PORT above.
+      PROXY_FORWARD_PROXY__PUBLIC_PORT: ${PROXY_FORWARD_PROXY__PUBLIC_PORT:-8443}
       # With host networking, TimescaleDB is reachable at localhost:5432
       # (published via "ports: [::1]:5432:5432" on the timescaledb service).
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/${POSTGRES_DB:-llm_proxy}

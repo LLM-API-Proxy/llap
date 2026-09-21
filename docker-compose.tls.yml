@@ -105,6 +105,17 @@ services:
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      # Prometheus metrics entrypoint (#1881). Compose replaces command arrays
+      # wholesale, so the base compose's metrics flags are LOST here unless
+      # repeated — and the TLS overlay is the production default. Without these
+      # the `traefik` scrape target pointed at a port nothing listened on, for
+      # every TLS deployment. Bound on all interfaces because Prometheus scrapes
+      # through the Docker bridge gateway (host.docker.internal), not container
+      # loopback; the installer's nftables INPUT chain admits 8082 from Docker
+      # bridges only (firewall_bridge_metrics_ports).
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=[::]:8082"
       # ACME certificate resolver — DNS-01 challenge via Cloudflare
       # Traefik v3 CLI flag names (all lowercase). Note: these differ from the YAML keys.
       # delaybeforechecks uses Go duration string format ("30s"), not a plain integer.

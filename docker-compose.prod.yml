@@ -483,6 +483,19 @@ services:
       PROXY_LISTEN_ADDR: "::"
       PROXY_LISTEN_PORT: ${PROXY_LISTEN_PORT:-8080}
       PROXY_FORWARD_PROXY__PORT: ${PROXY_FORWARD_PROXY__PORT:-3001}
+      # #1722: terminate TLS on the CONNECT client hop so the proxy key in
+      # `Proxy-Authorization` never crosses the network in cleartext. The entry
+      # certificate is issued by the shared CA (so the client's existing CA
+      # install covers it) and the advertised forward-proxy URL becomes https://.
+      # Set PROXY_FORWARD_PROXY__CLIENT_TLS=false only for a deliberately
+      # plaintext deployment on a trusted network. See docs/forward-proxy-tls.md.
+      PROXY_FORWARD_PROXY__CLIENT_TLS: ${PROXY_FORWARD_PROXY__CLIENT_TLS:-true}
+      # Hostname presented in the listener's own certificate. Empty falls back to
+      # PROXY_TLS__DOMAIN, then the host of PROXY_PUBLIC_URL, then localhost.
+      PROXY_FORWARD_PROXY__TLS_HOSTNAME: ${PROXY_FORWARD_PROXY__TLS_HOSTNAME:-}
+      # Public port clients reach: Traefik publishes 8443 and passes it through
+      # as raw TCP, while the process binds PROXY_FORWARD_PROXY__PORT above.
+      PROXY_FORWARD_PROXY__PUBLIC_PORT: ${PROXY_FORWARD_PROXY__PUBLIC_PORT:-8443}
       # Forward proxy CA storage directory — persisted via the proxy_ca_data named volume.
       # The ca_storage_dir config field (added in #243) reads this env var on startup.
       PROXY_CA_STORAGE_DIR: "/ca"
@@ -635,7 +648,7 @@ services:
       # Metrics for Prometheus scraping
       - "--metrics.prometheus=true"
       - "--metrics.prometheus.entryPoint=metrics"
-      - "--entrypoints.metrics.address=:8082"
+      - "--entrypoints.metrics.address=[::]:8082"
     ports:
       - "443:443"
       - "8443:8443"
@@ -682,6 +695,13 @@ services:
       - "--storage.tsdb.retention.time=30d"
       - "--web.console.libraries=/etc/prometheus/console_libraries"
       - "--web.console.templates=/etc/prometheus/consoles"
+      # Route prefix (#1881). docker/prometheus/prometheus.yml self-scrapes
+      # /prometheus/metrics and docker/grafana/provisioning points its datasource
+      # at http://prometheus:9090/prometheus, because the monitoring overlay
+      # (docker-compose.monitoring.yml) serves Prometheus under /prometheus. This
+      # file shares those two configs, so it must use the same prefix.
+      - "--web.external-url=/prometheus"
+      - "--web.route-prefix=/prometheus"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
