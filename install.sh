@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.174"
+INSTALLER_VERSION="0.0.175"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -9020,6 +9020,30 @@ database_run_staged_source_compose() {
         "$root" "$source_version" "$include_receipt" true "$@"
 }
 
+# cAdvisor (monitoring overlay, #1697) reads Docker's per-container cgroups
+# through five documented read-only host mounts. They are the only binds in the
+# shipped stack that live outside `${INSTALL_DIR}/docker`, so the recovery
+# validator names each exact (source, target) pair and requires `read_only`;
+# any other service, source, target or a writable variant is rejected like any
+# unknown bind. Without this, every receipt-bound upgrade *from* a release that
+# ships the monitoring overlay fails closed at "Captured source Compose model
+# does not match the running stack" (observed on the v0.0.172 → v0.0.174
+# production upgrade, 2026-09-24).
+installer_bind_is_cadvisor_host_mount() {
+    local service="$1" source="$2" target="$3" read_only="$4"
+    [[ "$service" == "cadvisor" && "$read_only" == "true" ]] || return 1
+    case "${source}|${target}" in
+        "/|/rootfs" \
+        | "/var/run|/var/run" \
+        | "/sys|/sys" \
+        | "/var/lib/docker/|/var/lib/docker" \
+        | "/dev/disk/|/dev/disk")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 database_validate_staged_compose_bind_sources() {
     local root="${1%/}" config_json="$2"
     local service source target read_only relative staged_path
@@ -9041,6 +9065,10 @@ database_validate_staged_compose_bind_sources() {
         if [[ "$source" == "/var/run/docker.sock" ]]; then
             [[ "$target" == "/var/run/docker.sock" \
                 && "$read_only" == "true" ]] || return 1
+            continue
+        fi
+        if installer_bind_is_cadvisor_host_mount \
+            "$service" "$source" "$target" "$read_only"; then
             continue
         fi
         if [[ -n "$DATABASE_ROLLBACK_TIMESCALEDB_BIND_SOURCE" \
