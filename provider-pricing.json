@@ -1,7 +1,17 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-10T00:00:00Z",
+  "generated_at": "2026-09-23T00:00:00Z",
   "entries": [
+    {
+      "provider_type": "anthropic",
+      "model": "claude-opus-5-5",
+      "effective_from": "2026-09-22T00:00:00Z",
+      "input_per_million_usd": "4.000000",
+      "output_per_million_usd": "20.000000",
+      "cache_read_per_million_usd": "0.200000",
+      "cache_create_per_million_usd": "5.000000",
+      "notes": "claude-opus-5-5 (Claude Opus 5.5, claude-cli 2.1.280 default, released 2026-09-22); Anthropic published model page: $4 / $20 per MTok, cache read $0.20, 5-minute cache write $5 used for cache_create (the published 1-hour write is $8; 2.1.280 sends cache_control.ttl 1h on main-loop turns, so 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Seeded by migration 0146 for issue #2133"
+    },
     {
       "provider_type": "anthropic",
       "model": "claude-opus-5",
@@ -16,11 +26,21 @@
       "provider_type": "anthropic",
       "model": "claude-sonnet-5",
       "effective_from": "2026-07-01T00:00:00Z",
-      "input_per_million_usd": "3.000000",
-      "output_per_million_usd": "15.000000",
-      "cache_read_per_million_usd": "0.300000",
-      "cache_create_per_million_usd": "3.750000",
-      "notes": "claude-sonnet-5 (Claude Sonnet 5); standard rate, not the promotional intro rate through 2026-08-31; 5-minute cache write price used for cache_create"
+      "input_per_million_usd": "2.000000",
+      "output_per_million_usd": "10.000000",
+      "cache_read_per_million_usd": "0.200000",
+      "cache_create_per_million_usd": "2.500000",
+      "notes": "claude-sonnet-5 (Claude Sonnet 5); Anthropic published model page (platform.claude.com/docs/en/models/sonnet-5/overview, fetched 2026-09-23): $2 / $10 per MTok standing rate, cache read $0.20, 5-minute cache write $2.50 used for cache_create (the published 1-hour write is $4; 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Supersedes the $3 / $15 rate 0107 seeded as the post-promo standard; repriced by migration 0147 for issue #2141"
+    },
+    {
+      "provider_type": "anthropic",
+      "model": "claude-fable-5-1",
+      "effective_from": "2026-09-01T00:00:00Z",
+      "input_per_million_usd": "10.000000",
+      "output_per_million_usd": "50.000000",
+      "cache_read_per_million_usd": "0.250000",
+      "cache_create_per_million_usd": "12.500000",
+      "notes": "claude-fable-5-1 (Claude Fable 5.1, claude-cli 2.1.260 primary, released 2026-09-01); Anthropic published model page (platform.claude.com/docs/en/models/fable-5-1/overview, fetched 2026-09-23): $10 / $50 per MTok, cache read $0.25 (a quarter of Fable 5's $1.00), 5-minute cache write $12.50 used for cache_create (the published 1-hour write is $20; 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Dedicated row so the slug no longer prefix-matches claude-fable-5; seeded by migration 0147 for issue #2141"
     },
     {
       "provider_type": "anthropic",
@@ -131,6 +151,16 @@
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
       "notes": "claude-sonnet-3-7 family"
+    },
+    {
+      "provider_type": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "effective_from": "2025-10-15T00:00:00Z",
+      "input_per_million_usd": "1.000000",
+      "output_per_million_usd": "5.000000",
+      "cache_read_per_million_usd": "0.100000",
+      "cache_create_per_million_usd": "1.250000",
+      "notes": "claude-haiku-4-5-20251001 (Claude Haiku 4.5 pinned snapshot, the claude-cli auxiliary-turn model; released 2025-10-15); Anthropic published model page (platform.claude.com/docs/en/models/haiku-4-5/overview, fetched 2026-09-23): $1 / $5 per MTok, cache read $0.10, 5-minute cache write $1.25 used for cache_create. Dedicated row so the snapshot no longer prefix-matches the claude-haiku-4-5 alias row; seeded by migration 0147 for issue #2141"
     },
     {
       "provider_type": "anthropic",
