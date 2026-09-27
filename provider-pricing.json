@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-09-23T00:00:00Z",
+  "generated_at": "2026-09-26T00:00:00Z",
   "entries": [
     {
       "provider_type": "anthropic",
@@ -10,7 +10,15 @@
       "output_per_million_usd": "20.000000",
       "cache_read_per_million_usd": "0.200000",
       "cache_create_per_million_usd": "5.000000",
-      "notes": "claude-opus-5-5 (Claude Opus 5.5, claude-cli 2.1.280 default, released 2026-09-22); Anthropic published model page: $4 / $20 per MTok, cache read $0.20, 5-minute cache write $5 used for cache_create (the published 1-hour write is $8; 2.1.280 sends cache_control.ttl 1h on main-loop turns, so 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Seeded by migration 0146 for issue #2133"
+      "cache_write_1h_per_million_usd": "8.000000",
+      "fast_input_per_million_usd": "8.000000",
+      "fast_output_per_million_usd": "40.000000",
+      "fast_cache_read_per_million_usd": "0.400000",
+      "fast_cache_create_per_million_usd": "10.000000",
+      "fast_cache_write_1h_per_million_usd": "16.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-5-5 (Claude Opus 5.5, claude-cli 2.1.280 default, released 2026-09-22); Anthropic published model page: $4 / $20 per MTok, cache read $0.20, 5-minute cache write $5, 1-hour cache write $8 used for cache_write_1h_per_million_usd (differential 1h/5m cache-write pricing landed in #2108/#2138/#2153). Seeded by migration 0146 for issue #2133; 1h rate added by migration 0149. #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -20,7 +28,15 @@
       "output_per_million_usd": "25.000000",
       "cache_read_per_million_usd": "0.500000",
       "cache_create_per_million_usd": "6.250000",
-      "notes": "claude-opus-5 (Claude Opus 5, claude-cli 2.1.220 default); 5-minute cache write price used for cache_create"
+      "cache_write_1h_per_million_usd": "10.000000",
+      "fast_input_per_million_usd": "10.000000",
+      "fast_output_per_million_usd": "50.000000",
+      "fast_cache_read_per_million_usd": "1.000000",
+      "fast_cache_create_per_million_usd": "12.500000",
+      "fast_cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-5 (Claude Opus 5, claude-cli 2.1.220 default); 5-minute cache write price used for cache_create #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -30,7 +46,10 @@
       "output_per_million_usd": "10.000000",
       "cache_read_per_million_usd": "0.200000",
       "cache_create_per_million_usd": "2.500000",
-      "notes": "claude-sonnet-5 (Claude Sonnet 5); Anthropic published model page (platform.claude.com/docs/en/models/sonnet-5/overview, fetched 2026-09-23): $2 / $10 per MTok standing rate, cache read $0.20, 5-minute cache write $2.50 used for cache_create (the published 1-hour write is $4; 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Supersedes the $3 / $15 rate 0107 seeded as the post-promo standard; repriced by migration 0147 for issue #2141"
+      "cache_write_1h_per_million_usd": "4.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-sonnet-5 (Claude Sonnet 5); Anthropic published model page (platform.claude.com/docs/en/models/sonnet-5/overview, fetched 2026-09-23): $2 / $10 per MTok standing rate, cache read $0.20, 5-minute cache write $2.50, 1-hour cache write $4.00 used for cache_write_1h_per_million_usd (differential 1h/5m cache-write pricing landed in #2108/#2138/#2153). Supersedes the $3 / $15 rate 0107 seeded as the post-promo standard; repriced by migration 0147 for issue #2141; 1h rate added by migration 0149. #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -40,7 +59,10 @@
       "output_per_million_usd": "50.000000",
       "cache_read_per_million_usd": "0.250000",
       "cache_create_per_million_usd": "12.500000",
-      "notes": "claude-fable-5-1 (Claude Fable 5.1, claude-cli 2.1.260 primary, released 2026-09-01); Anthropic published model page (platform.claude.com/docs/en/models/fable-5-1/overview, fetched 2026-09-23): $10 / $50 per MTok, cache read $0.25 (a quarter of Fable 5's $1.00), 5-minute cache write $12.50 used for cache_create (the published 1-hour write is $20; 1h writes under-bill until the TTL-keyed dimension in #2138 lands). Dedicated row so the slug no longer prefix-matches claude-fable-5; seeded by migration 0147 for issue #2141"
+      "cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-fable-5-1 (Claude Fable 5.1, claude-cli 2.1.260 primary, released 2026-09-01); Anthropic published model page (platform.claude.com/docs/en/models/fable-5-1/overview, fetched 2026-09-23): $10 / $50 per MTok, cache read $0.25 (a quarter of Fable 5's $1.00), 5-minute cache write $12.50, 1-hour cache write $20.00 used for cache_write_1h_per_million_usd (differential 1h/5m cache-write pricing landed in #2108/#2138/#2153). Dedicated row so the slug no longer prefix-matches claude-fable-5; seeded by migration 0147 for issue #2141; 1h rate added by migration 0149. #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -50,7 +72,10 @@
       "output_per_million_usd": "50.000000",
       "cache_read_per_million_usd": "1.000000",
       "cache_create_per_million_usd": "12.500000",
-      "notes": "claude-fable-5 (Claude Fable 5, 2.1.173); 5-minute cache write price used for cache_create"
+      "cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-fable-5 (Claude Fable 5, 2.1.173); 5-minute cache write price used for cache_create #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -60,7 +85,15 @@
       "output_per_million_usd": "25.000000",
       "cache_read_per_million_usd": "0.500000",
       "cache_create_per_million_usd": "6.250000",
-      "notes": "claude-opus-4-8 family; 5-minute cache write price used for cache_create"
+      "cache_write_1h_per_million_usd": "10.000000",
+      "fast_input_per_million_usd": "10.000000",
+      "fast_output_per_million_usd": "50.000000",
+      "fast_cache_read_per_million_usd": "1.000000",
+      "fast_cache_create_per_million_usd": "12.500000",
+      "fast_cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4-8 family; 5-minute cache write price used for cache_create #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -70,7 +103,10 @@
       "output_per_million_usd": "25.000000",
       "cache_read_per_million_usd": "0.500000",
       "cache_create_per_million_usd": "6.250000",
-      "notes": "claude-opus-4-7 family; 5-minute cache write price used for cache_create"
+      "cache_write_1h_per_million_usd": "10.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4-7 family; 5-minute cache write price used for cache_create #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -80,7 +116,10 @@
       "output_per_million_usd": "25.000000",
       "cache_read_per_million_usd": "0.500000",
       "cache_create_per_million_usd": "6.250000",
-      "notes": "claude-opus-4-6 family; 5-minute cache write price used for cache_create"
+      "cache_write_1h_per_million_usd": "10.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4-6 family; 5-minute cache write price used for cache_create #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -90,7 +129,9 @@
       "output_per_million_usd": "25.000000",
       "cache_read_per_million_usd": "0.500000",
       "cache_create_per_million_usd": "6.250000",
-      "notes": "claude-opus-4-5 family"
+      "cache_write_1h_per_million_usd": "10.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4-5 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -100,7 +141,9 @@
       "output_per_million_usd": "75.000000",
       "cache_read_per_million_usd": "1.500000",
       "cache_create_per_million_usd": "18.750000",
-      "notes": "claude-opus-4-1 family"
+      "cache_write_1h_per_million_usd": "30.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4-1 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -110,7 +153,9 @@
       "output_per_million_usd": "75.000000",
       "cache_read_per_million_usd": "1.500000",
       "cache_create_per_million_usd": "18.750000",
-      "notes": "claude-opus-4 base prefix"
+      "cache_write_1h_per_million_usd": "30.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-4 base prefix #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -120,7 +165,10 @@
       "output_per_million_usd": "15.000000",
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
-      "notes": "claude-sonnet-4-6 family"
+      "cache_write_1h_per_million_usd": "6.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-sonnet-4-6 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -130,7 +178,9 @@
       "output_per_million_usd": "15.000000",
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
-      "notes": "claude-sonnet-4-5 family"
+      "cache_write_1h_per_million_usd": "6.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-sonnet-4-5 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -140,7 +190,9 @@
       "output_per_million_usd": "15.000000",
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
-      "notes": "claude-sonnet-4 base prefix"
+      "cache_write_1h_per_million_usd": "6.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-sonnet-4 base prefix #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -150,7 +202,8 @@
       "output_per_million_usd": "15.000000",
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
-      "notes": "claude-sonnet-3-7 family"
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-sonnet-3-7 family #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
     },
     {
       "provider_type": "anthropic",
@@ -160,7 +213,9 @@
       "output_per_million_usd": "5.000000",
       "cache_read_per_million_usd": "0.100000",
       "cache_create_per_million_usd": "1.250000",
-      "notes": "claude-haiku-4-5-20251001 (Claude Haiku 4.5 pinned snapshot, the claude-cli auxiliary-turn model; released 2025-10-15); Anthropic published model page (platform.claude.com/docs/en/models/haiku-4-5/overview, fetched 2026-09-23): $1 / $5 per MTok, cache read $0.10, 5-minute cache write $1.25 used for cache_create. Dedicated row so the snapshot no longer prefix-matches the claude-haiku-4-5 alias row; seeded by migration 0147 for issue #2141"
+      "cache_write_1h_per_million_usd": "2.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-haiku-4-5-20251001 (Claude Haiku 4.5 pinned snapshot, the claude-cli auxiliary-turn model; released 2025-10-15); Anthropic published model page (platform.claude.com/docs/en/models/haiku-4-5/overview, fetched 2026-09-23): $1 / $5 per MTok, cache read $0.10, 5-minute cache write $1.25, 1-hour cache write $2.00 used for cache_write_1h_per_million_usd (differential 1h/5m cache-write pricing landed in #2108/#2138/#2153). Dedicated row so the snapshot no longer prefix-matches the claude-haiku-4-5 alias row; seeded by migration 0147 for issue #2141; 1h rate added by migration 0149. #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -170,7 +225,9 @@
       "output_per_million_usd": "5.000000",
       "cache_read_per_million_usd": "0.100000",
       "cache_create_per_million_usd": "1.250000",
-      "notes": "claude-haiku-4-5 family"
+      "cache_write_1h_per_million_usd": "2.000000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-haiku-4-5 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -180,7 +237,9 @@
       "output_per_million_usd": "4.000000",
       "cache_read_per_million_usd": "0.080000",
       "cache_create_per_million_usd": "1.000000",
-      "notes": "claude-haiku-3-5 family"
+      "cache_write_1h_per_million_usd": "1.600000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-haiku-3-5 family #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
     },
     {
       "provider_type": "anthropic",
@@ -190,7 +249,8 @@
       "output_per_million_usd": "1.250000",
       "cache_read_per_million_usd": "0.030000",
       "cache_create_per_million_usd": "0.300000",
-      "notes": "claude-haiku-3 base prefix"
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-haiku-3 base prefix #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
     },
     {
       "provider_type": "anthropic",
@@ -200,7 +260,8 @@
       "output_per_million_usd": "75.000000",
       "cache_read_per_million_usd": "1.500000",
       "cache_create_per_million_usd": "18.750000",
-      "notes": "claude-opus-3 (legacy Opus 3)"
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-opus-3 (legacy Opus 3) #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
     },
     {
       "provider_type": "anthropic",
@@ -210,7 +271,23 @@
       "output_per_million_usd": "50.000000",
       "cache_read_per_million_usd": "1.000000",
       "cache_create_per_million_usd": "12.500000",
-      "notes": "claude-mythos-5 (Anthropic published model page); flagship tier, same published rate as claude-fable-5; 5-minute cache write price used for cache_create. Seeded by migration 0140 for issue #1616"
+      "cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-mythos-5 (Anthropic published model page); flagship tier, same published rate as claude-fable-5; 5-minute cache write price used for cache_create. Seeded by migration 0140 for issue #1616 #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
+    },
+    {
+      "provider_type": "anthropic",
+      "model": "claude-mythos-5-1",
+      "effective_from": "2026-09-26T00:00:00Z",
+      "input_per_million_usd": "10.000000",
+      "output_per_million_usd": "50.000000",
+      "cache_read_per_million_usd": "0.250000",
+      "cache_create_per_million_usd": "12.500000",
+      "cache_write_1h_per_million_usd": "20.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-mythos-5-1 (Claude Mythos 5.1, limited availability); Anthropic pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-26): $10 / $50 per MTok, cache read $0.25 (0.025x), 5-minute cache write $12.50, 1-hour cache write $20. effective_from is the source OBSERVATION date, not a vendor launch date. Seeded by migration 0150 for issue #2160."
     },
     {
       "provider_type": "openai",
