@@ -175,6 +175,13 @@ services:
       # Inert unless the Traefik command defines --certificatesresolvers.cloudflare.*
       # (docker-compose.tls.yml), exactly like the label it replaces.
       TRAEFIK_PROXY_API_CERT_RESOLVER: ${TRAEFIK_PROXY_API_CERT_RESOLVER:-cloudflare}
+      # PROXY protocol toward the forward-proxy listener (#2325). The SAME
+      # variable drives proxy-server's PROXY_FORWARD_PROXY__PROXY_PROTOCOL, so
+      # Traefik sending the header and LLAP requiring it always switch together.
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}
+      # proxy-server's dedicated PROXY-protocol ingress listener; the main
+      # forward-proxy port stays header-free.
+      PROXY_FORWARD_INGRESS_BACKEND_ADDRESS: ${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS:-proxy-server:${PROXY_FORWARD_PROXY__INGRESS_PORT:-3002}}
     entrypoint:
       - /bin/sh
       - -c
@@ -399,10 +406,43 @@ services:
         done
         # Forward proxy (CONNECT mode) TCP passthrough. HSTS and TLS options are
         # HTTP-layer concerns and deliberately do not apply to a TCP router.
+        #
+        # PROXY protocol v2 to the forward-proxy listener (#2325). Traefik reaches
+        # proxy-server over the proxy-net bridge, so without it every CONNECT
+        # arrives from Traefik's container address: one per-IP bucket for every
+        # tenant and no client address in logs/audit. Traefik v3.5.2+ configures
+        # this on a TCP serversTransport (loadBalancer.proxyProtocol is
+        # deprecated). The PROXY hop is a SEPARATE service (proxy-forward-pp, to
+        # the dedicated ingress port) selected by the router; proxy-forward stays
+        # plain TCP, so an older consul-init (downgrade / recovery) that rewrites
+        # the router to proxy-forward@consul self-reverts to plain TCP. Written
+        # EVERY run; each target exists before the router points at it.
+        case "$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}" in
+          true|false) ;;
+          *)
+            echo "FATAL(consul-init): PROXY_FORWARD_PROXY__PROXY_PROTOCOL must be true or false (got '$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL}') — the proxy would refuse the same value (#2325). Aborting." >&2
+            exit 1
+            ;;
+        esac
         consul kv put traefik/tcp/routers/forward-proxy/rule 'HostSNI(`*`)'
         consul kv put traefik/tcp/routers/forward-proxy/entryPoints/0 forward-proxy
-        consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward@consul
         consul kv put traefik/tcp/services/proxy-forward/loadBalancer/servers/0/address "$${PROXY_FORWARD_BACKEND_ADDRESS}"
+        consul kv delete traefik/tcp/services/proxy-forward/loadBalancer/serversTransport > /dev/null 2>&1 || true
+        consul kv delete -recurse traefik/tcp/services/proxy-forward/loadBalancer/proxyProtocol/ > /dev/null 2>&1 || true
+        if [ "$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}" = "true" ]; then
+          if [ -z "$${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS}" ]; then
+            echo "FATAL(consul-init): PROXY_FORWARD_INGRESS_BACKEND_ADDRESS is empty while PROXY protocol is on — the forward-proxy router would point at nothing (#2325). Aborting." >&2
+            exit 1
+          fi
+          consul kv put traefik/tcp/serversTransports/proxy-forward-pp/proxyProtocol/version 2
+          consul kv put traefik/tcp/services/proxy-forward-pp/loadBalancer/servers/0/address "$${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS}"
+          consul kv put traefik/tcp/services/proxy-forward-pp/loadBalancer/serversTransport proxy-forward-pp@consul
+          consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward-pp@consul
+        else
+          consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward@consul
+          consul kv delete -recurse traefik/tcp/services/proxy-forward-pp/ > /dev/null 2>&1 || true
+          consul kv delete -recurse traefik/tcp/serversTransports/proxy-forward-pp/ > /dev/null 2>&1 || true
+        fi
 
         # ── Backup ACL policies ────────────────────────────────────────────────
         # Skip policy/token provisioning when no management token is set.
@@ -496,9 +536,32 @@ services:
       # Public port clients reach: Traefik publishes 8443 and passes it through
       # as raw TCP, while the process binds PROXY_FORWARD_PROXY__PORT above.
       PROXY_FORWARD_PROXY__PUBLIC_PORT: ${PROXY_FORWARD_PROXY__PUBLIC_PORT:-8443}
+      # #2325: Traefik prepends a PROXY v2 header to every forward-proxy
+      # connection (seeded by consul-init from the SAME variable) and dials the
+      # dedicated INGRESS port, which requires it and refuses every peer but
+      # Traefik. Traefik reaches proxy-server over the bridge from an address
+      # Docker assigns at start-up, so it is trusted by name. A connection from
+      # Traefik without the header is closed rather than served under Traefik's
+      # address; the main port stays header-free for direct clients.
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}
+      PROXY_FORWARD_PROXY__INGRESS_PORT: ${PROXY_FORWARD_PROXY__INGRESS_PORT:-3002}
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED:-dns:traefik}
+      # #2325: X-Forwarded-For from Traefik (which strips any client-supplied
+      # value and appends the real peer) is what gives IP-keyed limits and audit
+      # records the client address on the HTTP plane.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-dns:traefik}
       # Forward proxy CA storage directory — persisted via the proxy_ca_data named volume.
       # The ca_storage_dir config field (added in #243) reads this env var on startup.
       PROXY_CA_STORAGE_DIR: "/ca"
+      # #2336: since v0.0.182 the CA is persisted in PostgreSQL (key under the
+      # KEK); /ca above is only the legacy import source, read once to import a
+      # pre-v0.0.182 CA unchanged. Delete the plaintext pair there after the
+      # import (docs/forward-proxy-tls.md, Retiring the legacy /ca copy).
+      # Pin its fingerprint so a lost database row keeps the forward proxy down instead of minting a
+      # CA no client trusts; PROXY_CA_ALLOW_REGENERATE=true is the deliberate
+      # rotation opt-in. See docs/forward-proxy-tls.md (The CA pin).
+      PROXY_CA_EXPECTED_FINGERPRINT_SHA256: ${PROXY_CA_EXPECTED_FINGERPRINT_SHA256:-}
+      PROXY_CA_ALLOW_REGENERATE: ${PROXY_CA_ALLOW_REGENERATE:-false}
       # Consul token for the proxy-server to read/write the proxy/backup/* KV prefix.
       # Provisioned by consul-init (proxy-server-backup-rw policy, #279).
       # Obtain the SecretID from consul-init output on first deploy, then set in docker/.env.
@@ -767,6 +830,8 @@ volumes:
   consul_data:
   prometheus_data:
   grafana_data:
-  # Persistent storage for the forward proxy CA certificate and key.
-  # Backup: docker run --rm -v proxy_ca_data:/ca -v $PWD:/backup busybox tar czf /backup/ca_backup.tar.gz /ca
+  # Legacy forward-proxy CA import source only (#2336). The CA lives in
+  # PostgreSQL with its key under the KEK and is backed up with the database;
+  # never archive this volume, it would export the plaintext CA key (#1326).
+  # Retire its contents after the one-time import: docs/forward-proxy-tls.md.
   proxy_ca_data:

@@ -32,6 +32,8 @@ rule_files:
   - 'rules/llap-backup-health.yml'
   # Database cgroup OOM-kill alerting (#1697). Fed by the `cadvisor` job below.
   - 'rules/llap-database-oom.yml'
+  # Forward-proxy CA expiry / downed forward proxy (#2336).
+  - 'rules/llap-forward-proxy-ca.yml'
 
 # Alertmanager connection — only active when the monitoring overlay includes
 # the alertmanager service (docker-compose.monitoring.yml).

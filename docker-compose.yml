@@ -190,6 +190,18 @@ services:
       # replaces: base/dev has no `cloudflare` resolver defined, Traefik logs
       # that and serves its default certificate; the TLS overlay defines it.
       TRAEFIK_PROXY_API_CERT_RESOLVER: ${TRAEFIK_PROXY_API_CERT_RESOLVER:-cloudflare}
+      # PROXY protocol toward the forward-proxy listener (#2325). The SAME
+      # variable drives the proxy's PROXY_FORWARD_PROXY__PROXY_PROTOCOL below, so
+      # Traefik sending the header and LLAP requiring it always switch together.
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}
+      # The proxy's dedicated ingress listener (PROXY_FORWARD_PROXY__INGRESS_PORT),
+      # which requires the PROXY header; the main forward-proxy port stays
+      # header-free for direct clients.
+      PROXY_FORWARD_INGRESS_BACKEND_ADDRESS: ${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS:-localhost:${PROXY_FORWARD_PROXY__INGRESS_PORT:-3002}}
+      # Shared secret Traefik presents on every proxied HTTP request so the
+      # proxy believes its X-Forwarded-For and nobody else's (#2325). Empty
+      # (non-installer dev stacks): no middleware is seeded.
+      TRUSTED_PROXY_SECRET: ${TRUSTED_PROXY_SECRET:-}
     entrypoint:
       - /bin/sh
       - -c
@@ -447,6 +459,17 @@ services:
         # for any previous length.
         _mw_existing=$$(consul kv get -keys traefik/http/routers/proxy-api/middlewares/ 2>/dev/null || true)
         _mw_list="$${TRAEFIK_PROXY_API_MIDDLEWARES:-service-unavailable@consul,hsts@consul}"
+        # Ingress authentication (#2325): with TRUSTED_PROXY_SECRET set, Traefik
+        # stamps every proxied request with the shared secret, and the proxy
+        # believes X-Forwarded-For only on requests that carry it — so a
+        # same-host process talking to the proxy directly over loopback cannot
+        # choose its own client IP. Defined BEFORE the router references it, and
+        # appended after the operator's chain so a WAF/TRAEFIK_PROXY_API_MIDDLEWARES
+        # override can never drop it. The secret is piped on stdin, never argv.
+        if [ -n "$${TRUSTED_PROXY_SECRET}" ]; then
+          printf '%s' "$${TRUSTED_PROXY_SECRET}" | consul kv put traefik/http/middlewares/llap-ingress-auth/headers/customRequestHeaders/X-Llap-Ingress-Auth - > /dev/null
+          _mw_list="$${_mw_list},llap-ingress-auth@consul"
+        fi
         _mw_idx=0
         while [ -n "$$_mw_list" ]; do
           case "$$_mw_list" in
@@ -466,12 +489,58 @@ services:
             consul kv delete "traefik/http/routers/proxy-api/middlewares/$$_mw_stale" > /dev/null 2>&1 || true
           fi
         done
+        # Secret removed: the router no longer references the middleware (swept
+        # above), so its definition — and the old secret — can go.
+        if [ -z "$${TRUSTED_PROXY_SECRET}" ]; then
+          consul kv delete -recurse traefik/http/middlewares/llap-ingress-auth/ > /dev/null 2>&1 || true
+        fi
         # Forward proxy (CONNECT mode) TCP passthrough. HSTS and TLS options are
         # HTTP-layer concerns and deliberately do not apply to a TCP router.
+        #
+        # PROXY protocol v2 to the forward-proxy listener (#2325). Traefik and the
+        # proxy share the host network, so without it every CONNECT reaches LLAP
+        # from [::1]: the per-IP tunnel and CONNECT-rate limits become one bucket
+        # shared by every tenant, and logs/audit lose the client address.
+        # Traefik v3.5.2+ configures this on a TCP serversTransport
+        # (loadBalancer.proxyProtocol is deprecated); the installer pulls the
+        # current traefik:v3 on every upgrade.
+        #
+        # The PROXY hop is a SEPARATE service (proxy-forward-pp, pointing at the
+        # proxy's dedicated ingress port) selected by the router; proxy-forward
+        # itself stays plain TCP to the main port and never carries a transport.
+        # A pre-#2325 consul-init — a --rollback-backup downgrade, or the
+        # installer's exact-source recovery after a failed upgrade — rewrites the
+        # router's service to proxy-forward@consul unconditionally, so it
+        # self-reverts to plain TCP that an older proxy understands instead of
+        # leaving Traefik prepending a header nobody parses. Written EVERY run
+        # (data plane, topology-derived); each target exists before the router
+        # points at it.
+        case "$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}" in
+          true|false) ;;
+          *)
+            echo "FATAL(consul-init): PROXY_FORWARD_PROXY__PROXY_PROTOCOL must be true or false (got '$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL}') — the proxy would refuse the same value (#2325). Aborting." >&2
+            exit 1
+            ;;
+        esac
         consul kv put traefik/tcp/routers/forward-proxy/rule 'HostSNI(`*`)'
         consul kv put traefik/tcp/routers/forward-proxy/entryPoints/0 forward-proxy
-        consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward@consul
         consul kv put traefik/tcp/services/proxy-forward/loadBalancer/servers/0/address "$${PROXY_FORWARD_BACKEND_ADDRESS}"
+        consul kv delete traefik/tcp/services/proxy-forward/loadBalancer/serversTransport > /dev/null 2>&1 || true
+        consul kv delete -recurse traefik/tcp/services/proxy-forward/loadBalancer/proxyProtocol/ > /dev/null 2>&1 || true
+        if [ "$${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}" = "true" ]; then
+          if [ -z "$${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS}" ]; then
+            echo "FATAL(consul-init): PROXY_FORWARD_INGRESS_BACKEND_ADDRESS is empty while PROXY protocol is on — the forward-proxy router would point at nothing (#2325). Aborting." >&2
+            exit 1
+          fi
+          consul kv put traefik/tcp/serversTransports/proxy-forward-pp/proxyProtocol/version 2
+          consul kv put traefik/tcp/services/proxy-forward-pp/loadBalancer/servers/0/address "$${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS}"
+          consul kv put traefik/tcp/services/proxy-forward-pp/loadBalancer/serversTransport proxy-forward-pp@consul
+          consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward-pp@consul
+        else
+          consul kv put traefik/tcp/routers/forward-proxy/service proxy-forward@consul
+          consul kv delete -recurse traefik/tcp/services/proxy-forward-pp/ > /dev/null 2>&1 || true
+          consul kv delete -recurse traefik/tcp/serversTransports/proxy-forward-pp/ > /dev/null 2>&1 || true
+        fi
 
   # ─── backend-unavailable responder (issue #1334) ─────────────────────────────
   # Always-up static sidecar that answers EVERY request with a retryable HTTP 503
@@ -706,6 +775,27 @@ services:
       # Public port clients reach: Traefik publishes 8443 and passes it through
       # as raw TCP, while the process binds PROXY_FORWARD_PROXY__PORT above.
       PROXY_FORWARD_PROXY__PUBLIC_PORT: ${PROXY_FORWARD_PROXY__PUBLIC_PORT:-8443}
+      # #2325: Traefik (host network, same host) prepends a PROXY v2 header to
+      # every forward-proxy connection (seeded by consul-init from the SAME
+      # variable) and dials the dedicated INGRESS port below, which requires the
+      # header from loopback — the only address Traefik can reach it from — and
+      # refuses every other peer. The main PROXY_FORWARD_PROXY__PORT never reads
+      # a header, so direct clients (same-host ones on localhost included) keep
+      # working under their own address.
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL:-true}
+      PROXY_FORWARD_PROXY__INGRESS_PORT: ${PROXY_FORWARD_PROXY__INGRESS_PORT:-3002}
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED:-::1,127.0.0.0/8}
+      # #2325: the reverse proxy / management plane reach LLAP through the same
+      # host-networked Traefik, so their socket peer is loopback too. Loopback is
+      # trusted for X-Forwarded-For (Traefik strips any client-supplied one and
+      # appends the real peer) so IP-keyed limits and audit records see the
+      # client instead of [::1] — but loopback is shared by every process on the
+      # host, so with TRUSTED_PROXY_SECRET set (the installer always sets it)
+      # X-Forwarded-For is believed only on requests carrying Traefik's
+      # llap-ingress-auth secret header; anything else is pinned to its socket
+      # peer. Without the secret the proxy logs a start-up warning.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-::1,127.0.0.0/8}
+      TRUSTED_PROXY_SECRET: ${TRUSTED_PROXY_SECRET:-}
       # With host networking, TimescaleDB is reachable at localhost:5432
       # (published via "ports: [::1]:5432:5432" on the timescaledb service).
       DATABASE_URL: postgres://${POSTGRES_USER:-proxy}:${POSTGRES_PASSWORD:-proxy_dev_password}@localhost:5432/${POSTGRES_DB:-llm_proxy}

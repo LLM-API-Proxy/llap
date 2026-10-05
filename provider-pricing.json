@@ -215,8 +215,9 @@
       "output_per_million_usd": "15.000000",
       "cache_read_per_million_usd": "0.300000",
       "cache_create_per_million_usd": "3.750000",
+      "cache_write_1h_per_million_usd": "6.000000",
       "web_search_per_request_usd": "0.010000",
-      "notes": "claude-sonnet-3-7 family #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
+      "notes": "claude-sonnet-3-7 family #2160/migration 0150: hosted web search $10 / 1,000; 1h rate = the published 2x 1-hour cache-write multiplier on the row's own base input (migration 0182, #2340)."
     },
     {
       "provider_type": "anthropic",
@@ -262,8 +263,9 @@
       "output_per_million_usd": "1.250000",
       "cache_read_per_million_usd": "0.030000",
       "cache_create_per_million_usd": "0.300000",
+      "cache_write_1h_per_million_usd": "0.500000",
       "web_search_per_request_usd": "0.010000",
-      "notes": "claude-haiku-3 base prefix #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
+      "notes": "claude-haiku-3 base prefix #2160/migration 0150: hosted web search $10 / 1,000; 1h rate = the published 2x 1-hour cache-write multiplier on the row's own base input (migration 0182, #2340)."
     },
     {
       "provider_type": "anthropic",
@@ -273,8 +275,9 @@
       "output_per_million_usd": "75.000000",
       "cache_read_per_million_usd": "1.500000",
       "cache_create_per_million_usd": "18.750000",
+      "cache_write_1h_per_million_usd": "30.000000",
       "web_search_per_request_usd": "0.010000",
-      "notes": "claude-opus-3 (legacy Opus 3) #2160/migration 0150: hosted web search $10 / 1,000; no 1h rate (absent from the current vendor table, none invented)."
+      "notes": "claude-opus-3 (legacy Opus 3) #2160/migration 0150: hosted web search $10 / 1,000; 1h rate = the published 2x 1-hour cache-write multiplier on the row's own base input (migration 0182, #2340)."
     },
     {
       "provider_type": "anthropic",

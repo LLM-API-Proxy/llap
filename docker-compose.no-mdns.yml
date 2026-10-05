@@ -67,6 +67,8 @@ services:
       # from the base compose), not the published host port above.
       PROXY_BACKEND_URL: ${PROXY_BACKEND_URL:-http://proxy:${PROXY_LISTEN_PORT:-3000}}
       PROXY_FORWARD_BACKEND_ADDRESS: ${PROXY_FORWARD_BACKEND_ADDRESS:-proxy:${PROXY_FORWARD_PROXY__PORT:-3001}}
+      # The proxy's PROXY-protocol ingress listener (#2325), over the bridge.
+      PROXY_FORWARD_INGRESS_BACKEND_ADDRESS: ${PROXY_FORWARD_INGRESS_BACKEND_ADDRESS:-proxy:${PROXY_FORWARD_PROXY__INGRESS_PORT:-3002}}
 
   proxy:
     # Clear network_mode: host set in the base compose.
@@ -85,6 +87,13 @@ services:
       # Disable mDNS — multicast does not cross Docker bridge networks and the
       # proxy would fail silently or log errors if mDNS were left enabled here.
       PROXY_MDNS__ENABLED: "false"
+      # #2325: Traefik reaches the proxy over the proxy_net bridge here, from an
+      # address Docker assigns at start-up, so trust it by name rather than the
+      # base compose's loopback. Both the PROXY-protocol header on the
+      # forward-proxy listener and X-Forwarded-For on the HTTP plane are honoured
+      # only from that container.
+      PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED: ${PROXY_FORWARD_PROXY__PROXY_PROTOCOL_TRUSTED:-dns:traefik}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-dns:traefik}
       # Restore the bridge-network DATABASE_URL. The base compose sets
       # DATABASE_URL=...@localhost:5432/... which is correct for host networking
       # (TimescaleDB publishes its port on the host). In bridge networking mode,
