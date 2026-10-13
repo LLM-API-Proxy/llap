@@ -19,7 +19,10 @@ services:
   timescaledb:
     # PINNED (#1325): concrete tag + digest, not the floating `latest-pg18`, so
     # the data-volume migration path stays reproducible. Bump deliberately.
-    image: timescale/timescaledb:2.27.2-pg18@sha256:4051ec6e2c6c5b31fe789cf2cd87991ee1490b312b77fe02efaf51bec84b89b7
+    # Flipped to the LLAP database image (upstream + pgvector >= 0.8.4) together
+    # with docker-compose.yml by scripts/check-database-image-pin.py --write-digest
+    # once its digest is published (docs/operations/database-image.md).
+    image: ghcr.io/llm-api-proxy/timescaledb:2.27.2-pg18-pgvector0.8.6@sha256:317b1c97078e267019651b5e339bb22b8437d21c47654e3d0e825d0dec767bf6
     restart: unless-stopped
     # ── Connection budget (issue #1288) ───────────────────────────────────────
     # Raise max_connections to 100 so the proxy's connection budget (control
@@ -805,6 +808,8 @@ services:
 
   # ─── Proxy TUI (optional — enable with --profile tui) ────────────────────────
   proxy-tui:
+    # Interactive, profile-gated TUI session: must not be auto-restarted.
+    restart: "no"
     image: ${PROXY_CLI_IMAGE:-ghcr.io/llm-api-proxy/cli:${PROXY_VERSION:-latest}}
     profiles: ["tui"]
     environment:

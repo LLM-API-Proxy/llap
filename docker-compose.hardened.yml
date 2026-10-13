@@ -155,7 +155,10 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 1g
+          # 2026-10-13 prod outage: a fixed 1g cap OOM-killed the proxy
+          # (anon-rss ~1 GB, Exit 137) under 21 MiB request bodies. Default 4g;
+          # raise via docker/.env (PROXY_MEMORY_LIMIT=6g). Guarded: must stay >= 2g.
+          memory: ${PROXY_MEMORY_LIMIT:-4g}
         reservations:
           cpus: "0.25"
           memory: 128m

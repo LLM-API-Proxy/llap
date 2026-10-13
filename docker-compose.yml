@@ -1,11 +1,32 @@
 services:
   timescaledb:
+    # Crash recovery (2026-10-13 prod OOM outage: no restart policy left the
+    # proxy down until started by hand). Guarded by docker_compose_test.
+    restart: unless-stopped
     # PINNED (#1325): a concrete TimescaleDB+pg18 tag with its digest, not the
     # floating `latest-pg18`. A floating tag means two installs days apart can
     # land on different Postgres builds, and an `upgrade` that preserves the data
     # volume can pull an image incompatible with the on-disk data directory.
     # Bump deliberately (and verify data-volume compatibility) when updating.
-    image: timescale/timescaledb:2.27.2-pg18@sha256:4051ec6e2c6c5b31fe789cf2cd87991ee1490b312b77fe02efaf51bec84b89b7
+    #
+    # LLAP DATABASE IMAGE (memory, docs/architecture/memory.md 1.1): memory wants
+    # pgvector >= 0.8.4 and this upstream image ships 0.8.1. The replacement,
+    # ghcr.io/llm-api-proxy/timescaledb (same upstream image + pgvector, built from
+    # docker/timescaledb/Dockerfile, multi-arch), has a digest that exists only
+    # after Docker Publish has built it, so the default below stays on the upstream
+    # digest until `scripts/check-database-image-pin.py --write-digest sha256:...`
+    # flips it, the prod compose, the website snippet and CI to the LLAP image in
+    # one commit; the release gate refuses to tag before that.
+    #
+    # A signed-receipt install does not use the default: like the server, CLI and
+    # backup images, the database image of a release is the digest its own tag run
+    # built, locked and attested, and the installer writes it to .env as
+    # PROXY_DATABASE_IMAGE from the receipt (docs/operations/database-image.md).
+    # A release that predates the image writes nothing and this default applies.
+    # Same PG major and data directory, so an existing volume starts on either;
+    # the installer takes the restic recovery point first, then runs
+    # ALTER EXTENSION vector UPDATE.
+    image: ${PROXY_DATABASE_IMAGE:-ghcr.io/llm-api-proxy/timescaledb:2.27.2-pg18-pgvector0.8.6@sha256:317b1c97078e267019651b5e339bb22b8437d21c47654e3d0e825d0dec767bf6}
     # ── Connection budget (issue #1288) ───────────────────────────────────────
     # Raise max_connections to 100 so the proxy's connection budget (control
     # pool + data pool) plus headroom for migrations, psql, and background
@@ -104,6 +125,9 @@ services:
       retries: 5
 
   consul:
+    # Crash recovery (2026-10-13 prod OOM outage: no restart policy left the
+    # proxy down until started by hand). Guarded by docker_compose_test.
+    restart: unless-stopped
     image: hashicorp/consul:1.22
     # Single-node server with persistent storage.
     # Previous versions used -dev mode (in-memory), which caused complete Traefik
@@ -573,6 +597,9 @@ services:
       start_period: 5s
 
   traefik:
+    # Crash recovery (2026-10-13 prod OOM outage: no restart policy left the
+    # proxy down until started by hand). Guarded by docker_compose_test.
+    restart: unless-stopped
     image: traefik:v3
     # network_mode: host gives Traefik direct access to the host network stack.
     # This is required so that client source IPs are real (not Docker bridge IPs).
@@ -590,15 +617,20 @@ services:
     # both Traefik and the proxy are on the host network stack so Traefik routes
     # to localhost:<port> directly — no Docker bridge network resolution needed.
     network_mode: host
-    # env_file passes .env variables INTO the Traefik container environment.
-    # Docker Compose --env-file / the .env file only feeds YAML variable
-    # substitution (${VAR}) — it does NOT pass variables into containers.
-    # Without env_file, CONSUL_HTTP_TOKEN is never set inside the Traefik
-    # process, so all Consul KV reads fail with 403 and strong-tls@consul
-    # TLS options are never loaded.
-    env_file:
-      - path: .env
-        required: false
+    # Explicit allow-list (#2366). Traefik must NEVER receive the whole .env:
+    # that would put PROXY_KEK_VALUE (the envelope-encryption master key),
+    # PROXY_PROXY_KEY_PEPPER and every AWS/restic/Cloudflare/Consul secret in its
+    # process environment (docker inspect, /proc/<pid>/environ, a Traefik
+    # compromise). Docker Compose --env-file / .env only feeds ${VAR}
+    # substitution; it does not pass variables into containers, so the one
+    # variable Traefik needs is named here. CONSUL_HTTP_TOKEN is read by the
+    # Consul KV provider (without it every KV read fails 403 and
+    # strong-tls@consul is never loaded). The ACME DNS-provider variables
+    # (CF_DNS_API_TOKEN, CF_API_EMAIL, CF_API_KEY) are added ONLY by
+    # docker-compose.tls.yml. Add a variable here only if Traefik itself reads
+    # it; scripts/validate-compose.sh enforces the deny-list.
+    environment:
+      CONSUL_HTTP_TOKEN: ${CONSUL_HTTP_TOKEN:-}
     command:
       # Consul KV provider: TLS options are seeded into Consul by consul-init (#240).
       # Traefik uses network_mode: host and reaches Consul at [::1]:8500 via the
@@ -724,6 +756,9 @@ services:
       start_period: 20s
 
   proxy:
+    # Crash recovery (2026-10-13 prod OOM outage: no restart policy left the
+    # proxy down until started by hand). Guarded by docker_compose_test.
+    restart: unless-stopped
     image: ${PROXY_SERVER_IMAGE:-ghcr.io/llm-api-proxy/server:${PROXY_VERSION:-edge}}
     # ── mDNS networking ──────────────────────────────────────────────────────────
     # mDNS (RFC 6762/6763) uses link-local multicast (IPv4: 224.0.0.251:5353,

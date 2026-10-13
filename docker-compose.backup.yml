@@ -108,6 +108,26 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-llm_proxy}
       POSTGRES_USER: ${POSTGRES_USER:-proxy}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for PostgreSQL backup}
+      # Bundled object store (v0.0.185, #2370). The installer writes
+      # LLAP_OBJECT_STORAGE_BUNDLED=true while Garage is deployed; backup.sh
+      # then takes a Garage metadata snapshot (scoped backup token: health +
+      # CreateMetadataSnapshot only) and backs up the metadata and data
+      # volumes, mounted read-only below. With external storage the flag is
+      # false and the garage target is skipped.
+      LLAP_OBJECT_STORAGE_BUNDLED: ${LLAP_OBJECT_STORAGE_BUNDLED:-false}
+      # `garage` resolves on proxy_net, which this service and the Garage
+      # service (docker-compose.garage.yml) both join.
+      GARAGE_ADMIN_URL: http://garage:3903
+      GARAGE_BACKUP_ADMIN_TOKEN: ${GARAGE_BACKUP_ADMIN_TOKEN:-}
+    # The Garage volumes are always declared and mounted so this overlay does
+    # not depend on whether the Garage overlay is active. Without Garage, Docker
+    # creates them empty and backup.sh never reads them: the garage target
+    # runs only when LLAP_OBJECT_STORAGE_BUNDLED=true. Keeping the named
+    # volumes also preserves a store whose overlay was dropped (they are never
+    # deleted).
+    volumes:
+      - garage_meta:/garage/meta:ro
+      - garage_data:/garage/data:ro
     # Run as root (user: "0:0") so entrypoint.sh can write the crontab into the
     # root-owned /etc/supercronic tmpfs (mode=0700) at startup. The backup is
     # PostgreSQL-only (#1326), so no host bind-mounts are needed; security is
@@ -135,3 +155,8 @@ services:
         reservations:
           cpus: "0.1"
           memory: 64m
+
+# Shared with docker-compose.garage.yml (same project, same named volumes).
+volumes:
+  garage_meta:
+  garage_data:

@@ -295,9 +295,10 @@ require_auth = true
 # the intended operating mode. Inspection is required to enforce per-key model
 # restrictions, rate limits, usage accounting, and request logging.
 #
-# Set to false only when MITM is explicitly undesired (e.g. non-LLM passthrough
-# or environments that prohibit TLS interception). Requires a CA certificate
-# (ca_storage_dir or ca_cert_pem / ca_key_pem) when true.
+# There is NO raw-tunnel mode (#2377): with this set to false, or with no CA,
+# every CONNECT is refused with 502 (X-Llap-Error: tls-intercept-unavailable)
+# because an opaque relay would pass client and provider data untranslated.
+# Requires a CA certificate (ca_storage_dir or ca_cert_pem / ca_key_pem).
 #
 # Env: PROXY_FORWARD_PROXY__TLS_INTERCEPT (double underscore)
 tls_intercept = true
