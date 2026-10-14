@@ -66,6 +66,19 @@
     },
     {
       "provider_type": "anthropic",
+      "model": "claude-haiku-5-5",
+      "effective_from": "2026-10-07T00:00:00Z",
+      "input_per_million_usd": "0.100000",
+      "output_per_million_usd": "0.500000",
+      "cache_read_per_million_usd": "0.010000",
+      "cache_create_per_million_usd": "0.125000",
+      "cache_write_1h_per_million_usd": "0.200000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-haiku-5-5 (Claude Haiku 5.5, claude-cli 2.1.296 helper and picker model, released 2026-10-07); Anthropic pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-10-13) and model page (platform.claude.com/docs/en/models/haiku-5-5/overview): $0.10 / $0.50 per MTok for prompts up to 100,000 tokens, cache read $0.01, 5-minute cache write $0.125, 1-hour cache write $0.20; no fast card; US multiplier 1.1 (Claude 4.6+); hosted web search $10 / 1,000. The over-100,000-token tier ($0.50 / $2.50, cache read $0.05, 5-minute write $0.625) is seeded by migration 0239 (tier columns are not part of this manifest and are preserved by sync); its over-100,000-token 1-hour cache write ($1.00) is seeded by migration 0240 (tier2_cache_write_1h_per_million_usd). Seeded by migration 0239 for issue #2388."
+    },
+    {
+      "provider_type": "anthropic",
       "model": "claude-fable-5-1",
       "effective_from": "2026-09-01T00:00:00Z",
       "input_per_million_usd": "10.000000",
