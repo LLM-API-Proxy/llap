@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.187"
+INSTALLER_VERSION="0.0.188"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -9752,12 +9752,15 @@ database_validate_staged_compose_against_running_stack() {
                 )
             '
     )" || return 1
-    # The static legacy Traefik service consumes the complete .env without the
-    # proxy service's renamed-key override (notably CONSUL_HTTP_TOKEN versus
-    # PROXY_CONSUL_TOKEN). Require every raw key/value to survive rendering
-    # unchanged, then bind both services' complete effective environments to
-    # immutable Engine state. This authenticates every interpolation input
-    # without Compose's version-dependent private config hash.
+    # Require every raw key/value to survive rendering unchanged, then bind
+    # both services' complete effective environments to immutable Engine
+    # state. This authenticates every interpolation input without Compose's
+    # version-dependent private config hash. A legacy Traefik consumed the
+    # complete .env; since #2366 it gets an explicit allow-list, so requiring
+    # every key in Traefik alone rejected every v0.0.185+ source (#2401). A
+    # key now survives in Traefik, or in the proxy, which consumes the
+    # complete .env except its renamed-key override: CONSUL_HTTP_TOKEN (the
+    # proxy's carries PROXY_CONSUL_TOKEN) must survive in Traefik itself.
     {
         printf '%s\n' "$config_json"
         printf '%s\n' "$env_json"
@@ -9767,8 +9770,11 @@ database_validate_staged_compose_against_running_stack() {
         ($raw_env | to_entries |
           all(.[];
             . as $entry |
-            $compose.services.traefik.environment[$entry.key] ==
-              $entry.value))
+            ($compose.services.traefik.environment[$entry.key] ==
+              $entry.value) or
+            ($entry.key != "CONSUL_HTTP_TOKEN" and
+              $compose.services.proxy.environment[$entry.key] ==
+                $entry.value)))
     ' >/dev/null 2>&1 || return 1
     if ! database_validate_rendered_service_against_running_stack \
             "$config_json" "$expected_config_files" proxy true \
