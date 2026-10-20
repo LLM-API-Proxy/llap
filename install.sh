@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.192"
+INSTALLER_VERSION="0.0.193"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -1153,6 +1153,16 @@ DATABASE_FORWARD_UPGRADE_ACTIVE="false"
 # the newest scheduled one (which can be hours old).
 DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
 DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+# The quiesced catch-up snapshot (#2435) that completes the full snapshot above:
+# relational state as of the quiesce. A rollback restores the full snapshot and
+# then re-applies this one. Empty when none was taken.
+DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID=""
+DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME=""
+# What database_validate_restic_rollback_artifact verified, for the restore.
+VALIDATED_RESTIC_FULL_ID=""
+VALIDATED_RESTIC_FULL_PATH=""
+VALIDATED_RESTIC_CATCHUP_ID=""
+VALIDATED_RESTIC_CATCHUP_PATH=""
 # Upper bound on the fresh pre-upgrade snapshot (#2332): pg_dump streamed into
 # restic inside the backup container. The proxy is stopped for this long at
 # most; on expiry the upgrade aborts and the source proxy is resumed.
@@ -1160,6 +1170,22 @@ DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS="${DATABASE_RECOVERY_SNAPSHOT_TIMEOUT
 # How far before the quiesce instant a snapshot's own timestamp may lie and
 # still count as fresh (clock granularity between host and container).
 DATABASE_RECOVERY_SNAPSHOT_CLOCK_TOLERANCE_SECONDS=120
+# Zero-downtime upgrade contract (#2435). The full recovery snapshot is taken
+# while the proxy is still serving; only the image swap, migrations and a small
+# catch-up snapshot of relational state run with the proxy stopped.
+#   * DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS bounds the quiesced catch-up.
+#   * DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS is the proxy-down budget the
+#     installer reports against; DATABASE_UPGRADE_DOWNTIME_STRICT=true (a
+#     rehearsal) turns an over-budget upgrade into a non-zero exit.
+#   * DATABASE_CATCHUP_EXCLUDE_TABLE_DATA is the pg_dump --exclude-table-data
+#     pattern that drops hypertable chunk data (append-only logs) from the
+#     catch-up seconds-sized while the large tables are hypertables.
+DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS="${DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS:-120}"
+DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS="${DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS:-60}"
+DATABASE_UPGRADE_DOWNTIME_STRICT="${DATABASE_UPGRADE_DOWNTIME_STRICT:-false}"
+DATABASE_CATCHUP_EXCLUDE_TABLE_DATA="${DATABASE_CATCHUP_EXCLUDE_TABLE_DATA:-_timescaledb_internal.*}"
+# Epoch seconds at which the proxy was stopped; empty while it is serving.
+DATABASE_PROXY_DOWN_SINCE_EPOCH=""
 # jq `tsec`: a restic snapshot's `.time` as epoch seconds.
 #
 # Compare INSTANTS, not strings. restic serialises snapshot time in the local
@@ -8880,9 +8906,11 @@ database_write_recovery_journal() {
         --arg source_migration "$DATABASE_ROLLBACK_SOURCE_MIGRATION" \
         --arg recovery_snapshot_id "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID" \
         --arg recovery_snapshot_time "$DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME" \
+        --arg catchup_snapshot_id "$DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID" \
+        --arg catchup_snapshot_time "$DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME" \
         --arg replacement_is_adopted \
             "$DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT" \
-        '{format_version: 4, phase: $phase, source_version: $source_version,
+        '{format_version: 5, phase: $phase, source_version: $source_version,
           install_dir: $install_dir, metadata_path: $metadata_path,
           snapshot_path: $snapshot_path,
           timescaledb_bind_source: $timescaledb_bind_source,
@@ -8893,6 +8921,8 @@ database_write_recovery_journal() {
           source_migration: $source_migration,
           recovery_snapshot_id: $recovery_snapshot_id,
           recovery_snapshot_time: $recovery_snapshot_time,
+          catchup_snapshot_id: $catchup_snapshot_id,
+          catchup_snapshot_time: $catchup_snapshot_time,
           replacement_is_adopted_artifact: ($replacement_is_adopted == "true")}' \
         | $SUDO /usr/bin/tee "$journal_staging" >/dev/null \
         || ! $SUDO chmod 0600 "$journal_staging" \
@@ -8905,7 +8935,7 @@ database_write_recovery_journal() {
     fi
     DATABASE_ROLLBACK_JOURNAL_STAGING_FILE=""
     DATABASE_ROLLBACK_RECOVERY_PHASE="$phase"
-    DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION="4"
+    DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION="5"
 }
 
 database_legacy_recovery_install_dir() {
@@ -8949,6 +8979,7 @@ database_load_recovery_journal() {
     local active_database safety_database replacement_database
     local source_migration replacement_is_adopted
     local recovery_snapshot_id recovery_snapshot_time
+    local catchup_snapshot_id catchup_snapshot_time
     rollback_root="${METADATA_DIR}/database-rollback"
     journal=$(database_recovery_journal_path)
     if ! $SUDO test -f "$journal" || $SUDO test -L "$journal"; then
@@ -8958,7 +8989,8 @@ database_load_recovery_journal() {
         $SUDO cat "$journal" | jq -er '
           if (
             (.format_version == 1 or .format_version == 2 or
-             .format_version == 3 or .format_version == 4) and
+             .format_version == 3 or .format_version == 4 or
+             .format_version == 5) and
             (.phase == "deploy-files-mutating" or
              .phase == "deploy-mutating" or
              .phase == "deploy-stack-stopped" or .phase == "staging" or
@@ -8979,6 +9011,12 @@ database_load_recovery_journal() {
                     test("^([0-9a-f]{8,64})?$")) and
                 (.recovery_snapshot_time | type == "string") and
                 (.replacement_is_adopted_artifact | type == "boolean")
+             else true end) and
+            (if (.format_version >= 5) then
+                (.catchup_snapshot_id | type == "string" and
+                    test("^([0-9a-f]{8,64})?$")) and
+                (.catchup_snapshot_time | type == "string" and
+                    test("^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})?)?$"))
              else true end) and
             (if (.format_version >= 3) then
                 (.timescaledb_bind_source | type == "string") and
@@ -9041,7 +9079,11 @@ database_load_recovery_journal() {
             (if (.format_version >= 4) and .recovery_snapshot_time != ""
              then .recovery_snapshot_time else "-" end),
             (if (.format_version >= 4) and .replacement_is_adopted_artifact
-             then "true" else "false" end)
+             then "true" else "false" end),
+            (if (.format_version >= 5) and .catchup_snapshot_id != ""
+             then .catchup_snapshot_id else "-" end),
+            (if (.format_version >= 5) and .catchup_snapshot_time != ""
+             then .catchup_snapshot_time else "-" end)
           ] | @tsv
           else error("invalid recovery journal")
           end'
@@ -9060,12 +9102,15 @@ database_load_recovery_journal() {
         timescaledb_bind_source timescaledb_bind_identity \
         active_database safety_database replacement_database \
         source_migration recovery_snapshot_id recovery_snapshot_time \
-        replacement_is_adopted <<< "$journal_fields"
+        replacement_is_adopted catchup_snapshot_id catchup_snapshot_time \
+        <<< "$journal_fields"
     [[ "$safety_database" != "-" ]] || safety_database=""
     [[ "$replacement_database" != "-" ]] || replacement_database=""
     [[ "$source_migration" != "-" ]] || source_migration=""
     [[ "$recovery_snapshot_id" != "-" ]] || recovery_snapshot_id=""
     [[ "$recovery_snapshot_time" != "-" ]] || recovery_snapshot_time=""
+    [[ "$catchup_snapshot_id" != "-" ]] || catchup_snapshot_id=""
+    [[ "$catchup_snapshot_time" != "-" ]] || catchup_snapshot_time=""
     if [[ "$(dirname -- "$snapshot_path")" != "$rollback_root" ]] \
         || [[ "$(basename -- "$snapshot_path")" != .source-deploy-* ]]; then
         fail "Pending database recovery journal references an unsafe source snapshot."
@@ -9130,6 +9175,9 @@ database_load_recovery_journal() {
     fi
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID="$recovery_snapshot_id"
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME="$recovery_snapshot_time"
+    # Absent before format 5: an older journal recorded no catch-up.
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID="$catchup_snapshot_id"
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME="$catchup_snapshot_time"
     if [[ "$replacement_is_adopted" == "true" ]]; then
         DATABASE_ROLLBACK_REPLACEMENT_IS_ADOPTED_ARTIFACT="true"
     else
@@ -11278,7 +11326,8 @@ database_quiesce_proxy() {
         return 1
     fi
     DATABASE_ROLLBACK_PROXY_STOPPED="true"
-    info "Proxy quiesced for a consistent database recovery point"
+    DATABASE_PROXY_DOWN_SINCE_EPOCH=$(date -u +%s)
+    info "Proxy quiesced for the image swap and migrations"
 }
 
 database_resume_proxy() {
@@ -11292,6 +11341,7 @@ database_resume_proxy() {
         return 1
     fi
     DATABASE_ROLLBACK_PROXY_STOPPED="false"
+    DATABASE_PROXY_DOWN_SINCE_EPOCH=""
     info "Prior proxy resumed"
 }
 
@@ -11813,6 +11863,209 @@ SQL
     VALIDATED_DATABASE_BACKUP_KIND="database"
 }
 
+# Validate a kind == "restic" rollback artifact (#2435): the manifest of an
+# in-place upgrade, whose recovery point is a full restic snapshot plus an
+# optional quiesced catch-up. Like the frozen-database validation it runs
+# BEFORE the proxy is stopped, so a bad record or an unreadable repository costs
+# no downtime.
+#
+# The manifest schema is strict: format 3, kind restic, matching versions and
+# backup id, a hex full-snapshot id (an upgrade that recorded none cannot be
+# rolled back by the installer and is refused), and catch-up fields that are
+# either both absent/empty (a record written before v0.0.193) or a hex id and a
+# timestamp. Both snapshots are then proven against the repository with the
+# same listing, tag and dump-header checks the upgrade used to create them.
+database_validate_restic_rollback_artifact() {
+    local backup_id="$1" snapshot_manifest="$2"
+    local requested_version="$3" installed_version="$4"
+    local manifest_values="" full_id="" catchup_id=""
+    local lock_wait="${DATABASE_RECOVERY_SNAPSHOT_LOCK_WAIT:-10m}"
+    [[ "$lock_wait" =~ ^[1-9][0-9]*[smh]$ ]] || lock_wait="10m"
+    # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
+    if ! manifest_values="$(
+        set -o pipefail
+        $SUDO cat "$snapshot_manifest" \
+            | jq -er \
+                --arg backup_id "$backup_id" \
+                --arg requested "$requested_version" \
+                --arg installed "$installed_version" \
+                'if (.format_version == 3 and .kind == "restic" and
+                     .backup_id == $backup_id and
+                     .source_version == $requested and
+                     .target_version == $installed and
+                     (.database | type == "string" and
+                         test("^[A-Za-z_][A-Za-z0-9_]{0,62}$")) and
+                     (.migration_version | type == "string" and
+                         test("^[0-9]+$")) and
+                     (.recovery_snapshot_id | type == "string" and
+                         test("^[0-9a-f]{8,64}$")) and
+                     ((.catchup_snapshot_id // "") | type == "string" and
+                         test("^([0-9a-f]{8,64})?$")) and
+                     ((.catchup_snapshot_time // "") | type == "string" and
+                         test("^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})?)?$")))
+                 then [.migration_version, .database, .recovery_snapshot_id,
+                       (if (.catchup_snapshot_id // "") == "" then "-"
+                        else .catchup_snapshot_id end)] | @tsv
+                 else error("rollback manifest mismatch")
+                 end' 2>> "$LOG_FILE"
+    )"; then
+        fail "Rollback artifact manifest does not match the requested recovery transition (or records no recovery point)."
+        return 1
+    fi
+    IFS=$'\t' read -r VALIDATED_DATABASE_BACKUP_MIGRATION \
+        DATABASE_ROLLBACK_ACTIVE_DATABASE full_id catchup_id <<< "$manifest_values"
+    [[ "$catchup_id" != "-" ]] || catchup_id=""
+    if [[ ! "$VALIDATED_DATABASE_BACKUP_MIGRATION" =~ ^[0-9]+$ ]] \
+        || ! database_recovery_identifier_is_safe "$DATABASE_ROLLBACK_ACTIVE_DATABASE"; then
+        fail "Rollback artifact manifest authority is malformed."
+        return 1
+    fi
+    local deadline
+    deadline=$(( $(date +%s) + ${DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS:-14400} ))
+    VALIDATED_RESTIC_FULL_ID="" VALIDATED_RESTIC_FULL_PATH=""
+    VALIDATED_RESTIC_CATCHUP_ID="" VALIDATED_RESTIC_CATCHUP_PATH=""
+    if ! database_verify_restic_snapshot "$full_id" 0 pre-upgrade postgres \
+        '^/postgres-[A-Za-z0-9_.-]+\.sql$' "$deadline" \
+        "${DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS:-14400}" \
+        DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS pre-upgrade "$lock_wait"; then
+        return 1
+    fi
+    VALIDATED_RESTIC_FULL_ID="$VERIFIED_RESTIC_ID"
+    VALIDATED_RESTIC_FULL_PATH="$VERIFIED_RESTIC_PATH"
+    if [[ -n "$catchup_id" ]]; then
+        if ! database_verify_restic_snapshot "$catchup_id" 0 \
+            pre-upgrade-delta pre-upgrade-delta \
+            '^/postgres-[A-Za-z0-9_.-]+-catchup\.sql$' "$deadline" \
+            "${DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS:-14400}" \
+            DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS catch-up "$lock_wait"; then
+            return 1
+        fi
+        VALIDATED_RESTIC_CATCHUP_ID="$VERIFIED_RESTIC_ID"
+        VALIDATED_RESTIC_CATCHUP_PATH="$VERIFIED_RESTIC_PATH"
+    else
+        warn "Rollback artifact ${backup_id} records no catch-up snapshot: writes between the full snapshot and the quiesce will not be restored."
+    fi
+    VALIDATED_DATABASE_BACKUP_KIND="restic"
+}
+
+# Stream one restic snapshot's plain-SQL dump from the backup container into
+# `database` in the TimescaleDB container. The two `compose exec` channels are
+# joined on the host (nothing is written to disk), and BOTH exit statuses are
+# required to be 0. The target is an isolated, disposable staging database, so
+# the load is not wrapped in one transaction (a TimescaleDB restore is not meant
+# to be) and stops at the first error.
+database_restore_restic_snapshot_into() {
+    local snapshot_id="$1" snapshot_path="$2" database="$3"
+    local lock_wait="${DATABASE_RECOVERY_SNAPSHOT_LOCK_WAIT:-10m}"
+    local -a status=()
+    [[ "$lock_wait" =~ ^[1-9][0-9]*[smh]$ ]] || lock_wait="10m"
+    database_recovery_identifier_is_safe "$database" || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the containers.
+    {
+        installer_run_live_compose exec -T backup \
+            sh -ceu 'exec restic dump --retry-lock "$3" "$1" "$2"' \
+            sh "$snapshot_id" "$snapshot_path" "$lock_wait" </dev/null 2>> "$LOG_FILE" \
+        | installer_run_live_compose exec -T timescaledb \
+            sh -ceu 'exec psql --no-psqlrc --quiet --username="$POSTGRES_USER" --dbname="$1" --set=ON_ERROR_STOP=1' \
+            sh "$database" >> "$LOG_FILE" 2>&1
+        status=("${PIPESTATUS[@]}")
+    } || true
+    [[ "${status[0]:-1}" == 0 && "${status[1]:-1}" == 0 ]]
+}
+
+# Re-apply the catch-up's relational state over a restored full snapshot.
+#
+# `scratch` holds the restored catch-up (schema, catalog, ordinary tables, NO
+# hypertable data); `target` holds the restored full snapshot. In ONE
+# transaction on the target: every ordinary table is emptied and refilled from
+# the catch-up, and its sequences are set to the catch-up's values.
+#
+# Foreign keys: the load runs with `session_replication_role = replica`, which
+# disables FK (and user) triggers, and every table is emptied by ONE TRUNCATE
+# statement naming all of them, which PostgreSQL accepts because no referencing
+# table is left out. pg_restore --data-only in dependency order was rejected:
+# the snapshots are plain-format SQL streams (pg_restore cannot read them),
+# restic holds no custom-format archive, and a catalog with circular
+# foreign keys (TimescaleDB's own) needs --disable-triggers anyway, which is
+# the same mechanism and also needs a superuser. The catch-up is a single
+# quiesced point in time, so its rows are FK-consistent with each other; the
+# transaction commits all of them or none.
+database_apply_catchup_to_database() {
+    local scratch="$1" target="$2" tables=""
+    local -a status=()
+    database_recovery_identifier_is_safe "$scratch" || return 1
+    database_recovery_identifier_is_safe "$target" || return 1
+    # Ordinary tables only: not hypertables (their data was never in the
+    # catch-up), not TimescaleDB-owned schemas, not extension members.
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    tables=$(installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec psql --no-psqlrc --username="$POSTGRES_USER" --dbname="$1" --no-align --tuples-only --set=ON_ERROR_STOP=1 --command="$2"' \
+        sh "$target" "SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', ' ORDER BY n.nspname, c.relname)
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              AND n.nspname NOT LIKE '\\_timescaledb%' AND n.nspname NOT LIKE 'timescaledb%'
+              AND NOT EXISTS (SELECT 1 FROM timescaledb_information.hypertables h
+                               WHERE h.hypertable_schema = n.nspname AND h.hypertable_name = c.relname)
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')" \
+        </dev/null 2>> "$LOG_FILE") || return 1
+    tables=$(printf '%s' "$tables" | tr -d '\r\n')
+    [[ -n "$tables" ]] || return 1
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    {
+        installer_run_live_compose exec -T timescaledb \
+            sh -ceu 'printf "SET session_replication_role = replica;\nTRUNCATE %s;\n" "$2"; exec pg_dump --username="$POSTGRES_USER" --data-only --exclude-schema="_timescaledb_*" --exclude-schema="timescaledb_*" --dbname="$1"' \
+            sh "$scratch" "$tables" </dev/null 2>> "$LOG_FILE" \
+        | installer_run_live_compose exec -T timescaledb \
+            sh -ceu 'exec psql --no-psqlrc --quiet --username="$POSTGRES_USER" --dbname="$1" --set=ON_ERROR_STOP=1 --single-transaction' \
+            sh "$target" >> "$LOG_FILE" 2>&1
+        status=("${PIPESTATUS[@]}")
+    } || true
+    [[ "${status[0]:-1}" == 0 && "${status[1]:-1}" == 0 ]]
+}
+
+# Build the rollback replacement from a validated restic recovery point:
+# full snapshot into `target`, then the catch-up (when recorded) through a
+# scratch database that is always dropped. `target` must already exist with the
+# TimescaleDB extension enabled and in pre-restore mode; the caller leaves
+# restore mode (post-restore) afterwards, exactly as for the dump path.
+database_restore_restic_recovery() {
+    local target="$1" scratch="${1}_cu"
+    database_recovery_identifier_is_safe "$target" \
+        && database_recovery_identifier_is_safe "$scratch" || return 1
+    [[ -n "${VALIDATED_RESTIC_FULL_ID:-}" ]] || return 1
+    step "  Restoring restic snapshot ${VALIDATED_RESTIC_FULL_ID} into the isolated staging database..."
+    if ! database_restore_restic_snapshot_into \
+        "$VALIDATED_RESTIC_FULL_ID" "$VALIDATED_RESTIC_FULL_PATH" "$target"; then
+        fail "The full restic snapshot could not be restored into the staging database."
+        return 1
+    fi
+    [[ -n "${VALIDATED_RESTIC_CATCHUP_ID:-}" ]] || return 0
+
+    step "  Re-applying catch-up snapshot ${VALIDATED_RESTIC_CATCHUP_ID} (relational state at the quiesce)..."
+    local ok="true"
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    if ! installer_run_live_compose exec -T timescaledb \
+            sh -ceu 'dropdb --if-exists --force --username="$POSTGRES_USER" "$1"; createdb --username="$POSTGRES_USER" --owner="$POSTGRES_USER" "$1"' \
+            sh "$scratch" >> "$LOG_FILE" 2>&1 \
+        || ! database_run_timescaledb_restore_lifecycle "$scratch" "create-extension" \
+        || ! database_run_timescaledb_restore_lifecycle "$scratch" "pre-restore" \
+        || ! database_restore_restic_snapshot_into \
+            "$VALIDATED_RESTIC_CATCHUP_ID" "$VALIDATED_RESTIC_CATCHUP_PATH" "$scratch" \
+        || ! database_run_timescaledb_restore_lifecycle "$scratch" "post-restore" \
+        || ! database_apply_catchup_to_database "$scratch" "$target"; then
+        ok="false"
+    fi
+    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+    installer_run_live_compose exec -T timescaledb \
+        sh -ceu 'exec dropdb --if-exists --force --username="$POSTGRES_USER" "$1"' \
+        sh "$scratch" >> "$LOG_FILE" 2>&1 || true
+    if [[ "$ok" != "true" ]]; then
+        fail "The catch-up snapshot could not be re-applied over the restored full snapshot."
+        return 1
+    fi
+}
+
 database_validate_rollback_backup() {
     local backup_id="$1"
     local requested_version="$2"
@@ -11866,25 +12119,9 @@ database_validate_rollback_backup() {
         fail "Rollback backup manifest does not declare a supported artifact kind: ${backup_id}"
         return 1
     }
-    # An in-place upgrade left no on-host artifact. Say so precisely, name the
-    # snapshot, and refuse — rather than accepting the flag and then failing
-    # somewhere less recoverable. Restoring a restic snapshot into production
-    # is a separately approved procedure, not an installer flag.
-    if [[ "$artifact_kind" == "restic" ]]; then
-        local recorded_snapshot=""
-        recorded_snapshot="$(
-            $SUDO cat "$manifest" 2>> "$LOG_FILE" \
-                | jq -r '.recovery_snapshot_id // ""' 2>> "$LOG_FILE"
-        )" || recorded_snapshot=""
-        fail "Rollback backup ${backup_id} records an in-place upgrade; there is no on-host artifact to restore."
-        if [[ -n "$recorded_snapshot" ]]; then
-            fail "  Its recovery point is restic snapshot ${recorded_snapshot}."
-        else
-            fail "  No recovery point was recorded for that upgrade."
-        fi
-        fail "  Restoring it is an operator procedure — see docs/runbooks/database-rollback.md."
-        return 1
-    fi
+    # A `restic` record has no on-host bytes: like a frozen-database artifact it
+    # is manifest-only here, and its snapshots are proven against the
+    # repository below (before anything is stopped).
     if [[ "$artifact_kind" == "dump" ]] \
         && { ! $SUDO test -s "$dump" || $SUDO test -L "$dump"; }; then
         fail "Rollback backup not found or incomplete: ${backup_id}"
@@ -11992,6 +12229,23 @@ database_validate_rollback_backup() {
             return 1
         fi
         info "Rollback artifact validated: ${backup_id} (frozen database ${VALIDATED_DATABASE_BACKUP_ARTIFACT_DATABASE})"
+        return 0
+    fi
+    if [[ -z "$validation_error" && "$artifact_kind" == "restic" ]]; then
+        if ! database_validate_restic_rollback_artifact \
+            "$backup_id" "$snapshot_manifest" \
+            "$requested_version" "$installed_version"; then
+            VALIDATED_DATABASE_BACKUP_MIGRATION=""
+            DATABASE_ROLLBACK_ACTIVE_DATABASE=""
+            VALIDATED_DATABASE_BACKUP_KIND=""
+            database_discard_validation_staging || true
+            return 1
+        fi
+        if ! database_discard_validation_staging; then
+            fail "Rollback artifact manifest snapshot could not be removed."
+            return 1
+        fi
+        info "Rollback artifact validated: ${backup_id} (restic snapshot ${VALIDATED_RESTIC_FULL_ID}${VALIDATED_RESTIC_CATCHUP_ID:+ + catch-up ${VALIDATED_RESTIC_CATCHUP_ID}})"
         return 0
     fi
     # shellcheck disable=SC2016  # jq variables are intentionally single-quoted.
@@ -12762,7 +13016,9 @@ database_stage_validated_backup_for_swap() {
     local timestamp restored_migration
     local -a restore_status=()
 
-    if ! database_validated_dump_is_safe; then
+    local from_restic="false"
+    [[ "${VALIDATED_DATABASE_BACKUP_KIND:-}" != "restic" ]] || from_restic="true"
+    if [[ "$from_restic" != "true" ]] && ! database_validated_dump_is_safe; then
         fail "${operation_label} validated root-only dump snapshot is absent or changed."
         database_close_validated_backup_dump || true
         database_abort_rollback || true
@@ -12810,36 +13066,46 @@ database_stage_validated_backup_for_swap() {
         return 1
     fi
 
-    if ! database_validated_dump_is_safe; then
-        database_close_validated_backup_dump || true
-        fail "${operation_label} validated dump changed before isolated restore."
-        database_abort_rollback || true
-        return 1
-    fi
-    # shellcheck disable=SC2016  # Expanded by sh inside the database container.
-    {
-        $SUDO cat "$VALIDATED_DATABASE_BACKUP_DUMP_PATH" 2>> "$LOG_FILE" \
-            | database_read_archive_then_drain \
-                installer_run_live_compose exec -T timescaledb \
-                sh -ceu 'exec pg_restore --exit-on-error --single-transaction --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$1"' \
-                sh "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
-                >> "$LOG_FILE" 2>&1
-        restore_status=("${PIPESTATUS[@]}")
-    } || true
-    # A pg_restore that stops reading — because it finished, or because
-    # --exit-on-error aborted it — SIGPIPEs the feeder. Its own status below
-    # is what decides success, so the feeder's 141 is never load-bearing.
-    if ! database_archive_feed_status_is_ok "${restore_status[0]:-1}" \
-        || [[ "${restore_status[1]:-1}" != 0 ]]; then
-        database_close_validated_backup_dump || true
-        fail "${operation_label} restore failed in the isolated staging database (feeder=${restore_status[0]:-unset} reader=${restore_status[1]:-unset}); the active database was not changed."
-        database_abort_rollback || true
-        return 1
-    fi
-    if ! database_close_validated_backup_dump; then
-        fail "${operation_label} validated dump snapshot could not be removed."
-        database_abort_rollback || true
-        return 1
+    if [[ "$from_restic" == "true" ]]; then
+        # Full snapshot, then the catch-up, from the repository: no dump file
+        # exists on this host.
+        if ! database_restore_restic_recovery "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE"; then
+            fail "${operation_label} restic restore failed in the isolated staging database; the active database was not changed."
+            database_abort_rollback || true
+            return 1
+        fi
+    else
+        if ! database_validated_dump_is_safe; then
+            database_close_validated_backup_dump || true
+            fail "${operation_label} validated dump changed before isolated restore."
+            database_abort_rollback || true
+            return 1
+        fi
+        # shellcheck disable=SC2016  # Expanded by sh inside the database container.
+        {
+            $SUDO cat "$VALIDATED_DATABASE_BACKUP_DUMP_PATH" 2>> "$LOG_FILE" \
+                | database_read_archive_then_drain \
+                    installer_run_live_compose exec -T timescaledb \
+                    sh -ceu 'exec pg_restore --exit-on-error --single-transaction --no-owner --no-acl --username="$POSTGRES_USER" --dbname="$1"' \
+                    sh "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" \
+                    >> "$LOG_FILE" 2>&1
+            restore_status=("${PIPESTATUS[@]}")
+        } || true
+        # A pg_restore that stops reading — because it finished, or because
+        # --exit-on-error aborted it — SIGPIPEs the feeder. Its own status below
+        # is what decides success, so the feeder's 141 is never load-bearing.
+        if ! database_archive_feed_status_is_ok "${restore_status[0]:-1}" \
+            || [[ "${restore_status[1]:-1}" != 0 ]]; then
+            database_close_validated_backup_dump || true
+            fail "${operation_label} restore failed in the isolated staging database (feeder=${restore_status[0]:-unset} reader=${restore_status[1]:-unset}); the active database was not changed."
+            database_abort_rollback || true
+            return 1
+        fi
+        if ! database_close_validated_backup_dump; then
+            fail "${operation_label} validated dump snapshot could not be removed."
+            database_abort_rollback || true
+            return 1
+        fi
     fi
     if ! database_run_timescaledb_restore_lifecycle \
         "$DATABASE_ROLLBACK_REPLACEMENT_DATABASE" "post-restore"; then
@@ -13008,6 +13274,23 @@ database_restore_version_backup() {
         return 1
     fi
     DATABASE_ROLLBACK_SOURCE_VERSION="$installed_version"
+    if [[ "${VALIDATED_DATABASE_BACKUP_KIND:-}" == "restic" ]]; then
+        # An in-place upgrade's recovery point: restore the full snapshot into
+        # an isolated database, re-apply the catch-up, verify, then swap. The
+        # migrated database is renamed aside as the safety database, so there is
+        # no pre-rollback dump (same reasoning as the frozen-artifact path).
+        if ! database_require_rollback_headroom; then
+            database_abort_rollback || true
+            return 1
+        fi
+        if ! database_quiesce_proxy; then
+            database_abort_rollback || true
+            return 1
+        fi
+        database_stage_validated_backup_for_swap \
+            "Rollback" "llap_restore" "llap_pre_rollback"
+        return $?
+    fi
     if [[ "${VALIDATED_DATABASE_BACKUP_KIND:-}" == "database" ]]; then
         if ! database_require_rollback_headroom; then
             database_abort_rollback || true
@@ -13097,6 +13380,8 @@ database_prepare_forward_upgrade() {
     # Whatever the scheduled listing named is history, not the recovery point.
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID=""
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME=""
     if [[ "${DATABASE_ROLLBACK_RECOVERY_EXPECTED:-false}" == "true" \
         && "${DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ:-false}" != "true" ]]; then
         if [[ "${OPT_ACCEPT_NO_RECOVERY_POINT:-false}" != "true" ]]; then
@@ -13111,19 +13396,46 @@ database_prepare_forward_upgrade() {
     fi
 
     DATABASE_ROLLBACK_SOURCE_VERSION="$source_version"
+    database_announce_expected_downtime
+    database_announce_ledger_retention_change "$target_version" "$database"
     # Announce the irreversibility before taking it, not after.
     step "  Applying ${target_version} migrations in place to ${database}..."
     warn "This upgrade migrates the live database in place and cannot be reversed by the installer."
     if [[ "${DATABASE_ROLLBACK_RECOVERY_EXPECTED:-false}" == "true" \
         && "${DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ:-false}" == "true" ]]; then
-        warn "  Recovery point: a fresh restic snapshot, taken and verified while the proxy is stopped."
+        warn "  Recovery point: a fresh restic snapshot, taken and verified while the proxy is still serving, plus a small catch-up snapshot at the quiesce."
     else
         warn "  Recovery point: NONE — backups are disabled or the repository is unreadable."
     fi
-    warn "  Restoring it is an operator procedure — see docs/runbooks/database-rollback.md."
+    warn "  Rolling back restores it with --rollback-backup (full snapshot, then the catch-up) — see docs/runbooks/database-rollback.md."
 
-    local quiesced_at_epoch
-    quiesced_at_epoch=$(date -u +%s)
+    # The full recovery point is taken BEFORE the quiesce (#2435). pg_dump reads
+    # one MVCC snapshot, so it is consistent while the proxy keeps serving, and
+    # its (potentially minutes-long) duration is no longer downtime. Fails
+    # closed with zero downtime: nothing has been stopped yet.
+    local snapshot_started_at
+    snapshot_started_at=$(date -u +%s)
+    if [[ "${DATABASE_ROLLBACK_RECOVERY_EXPECTED:-false}" == "true" \
+        && "${DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ:-false}" == "true" ]]; then
+        if ! database_take_fresh_recovery_snapshot \
+            "$snapshot_started_at" "$source_version" "$target_version"; then
+            DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
+            DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+            if [[ "${OPT_ACCEPT_NO_RECOVERY_POINT:-false}" != "true" ]]; then
+                fail "Could not take and verify a fresh pre-upgrade restic snapshot."
+                fail "  The upgrade is aborted before the proxy was stopped and before any"
+                fail "  migration ran; the source release is restored. Fix the backup agent /"
+                fail "  repository and re-run, or pass --accept-no-recovery-point to upgrade"
+                fail "  with no way back."
+                database_abort_rollback || true
+                return 1
+            fi
+            warn "Proceeding with NO recovery point: --accept-no-recovery-point was given."
+        fi
+    fi
+
+    # Quiesce only now: the remaining downtime is the catch-up snapshot, the
+    # image swap and the migrations.
     if ! database_quiesce_proxy; then
         database_abort_rollback || true
         return 1
@@ -13135,26 +13447,20 @@ database_prepare_forward_upgrade() {
     fi
     DATABASE_ROLLBACK_SOURCE_MIGRATION="$source_migration"
 
-    # The fresh recovery point (#2332). Taken while nothing writes to the
-    # database and before the target binary can migrate it, so what it holds
-    # is exactly the pre-upgrade state. Fails closed: an upgrade that wanted a
-    # recovery point and could not get a verified one stops here, restores the
-    # source deploy tree and resumes the source proxy.
-    if [[ "${DATABASE_ROLLBACK_RECOVERY_EXPECTED:-false}" == "true" \
-        && "${DATABASE_ROLLBACK_RECOVERY_REPOSITORY_READ:-false}" == "true" ]]; then
-        if ! database_take_fresh_recovery_snapshot \
-            "$quiesced_at_epoch" "$source_version" "$target_version"; then
-            DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
-            DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
+    # Catch-up (#2435): writes committed between the full snapshot's start and
+    # the quiesce are not in it. A small snapshot of relational state (hypertable
+    # chunk data excluded) is taken now, with nothing writing, so rollback loses
+    # at most append-only log rows from that window (see database_take_catchup_snapshot).
+    if [[ -n "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID:-}" ]]; then
+        if ! database_take_catchup_snapshot "$source_version" "$target_version"; then
             if [[ "${OPT_ACCEPT_NO_RECOVERY_POINT:-false}" != "true" ]]; then
-                fail "Could not take and verify a fresh pre-upgrade restic snapshot."
-                fail "  The upgrade is aborted before any migration ran; the source"
-                fail "  release is restored. Fix the backup agent / repository and"
-                fail "  re-run, or pass --accept-no-recovery-point to upgrade with no way back."
+                fail "Could not take the quiesced catch-up snapshot; the upgrade is aborted before any migration ran."
+                fail "  The source release is restored. Re-run, or pass --accept-no-recovery-point"
+                fail "  to upgrade with the earlier full snapshot only (writes after it are lost on rollback)."
                 database_abort_rollback || true
                 return 1
             fi
-            warn "Proceeding with NO recovery point: --accept-no-recovery-point was given."
+            warn "Proceeding without a catch-up snapshot: --accept-no-recovery-point was given."
         fi
     fi
 
@@ -13296,11 +13602,115 @@ database_resolve_upgrade_recovery_point() {
     info "Newest scheduled backup: restic snapshot ${snapshot_id} taken ${snapshot_time}"
 }
 
-# Take, verify and adopt a FRESH restic snapshot as the in-place upgrade's
-# recovery point (#2332). Called only while the proxy is quiesced and before
-# the target binary can migrate anything.
+# Verify a restic snapshot the repository is supposed to hold (#2332, #2435).
+# Shared by the full pre-upgrade snapshot, the quiesced catch-up and the
+# rollback path, so all of them get the same proof:
+#   1. the repository lists exactly this snapshot, carrying `required_tag`;
+#   2. its timestamp is not before `floor_epoch` (0 disables: rollback has no
+#      freshness requirement);
+#   3. its stored bytes read back as a PostgreSQL plain-format dump header.
 #
-#   $1  epoch seconds at which the proxy was quiesced
+#   $1 snapshot id   $2 floor epoch   $3 listing tag   $4 required tag
+#   $5 path regex    $6 deadline epoch   $7 budget seconds (for messages)
+#   $8 budget variable name (for messages)   $9 label   $10 lock wait
+#
+# Sets VERIFIED_RESTIC_ID / _TIME / _PATH on success.
+database_verify_restic_snapshot() {
+    local snapshot_id="$1" floor="$2" listing_tag="$3" required_tag="$4"
+    local path_regex="$5" deadline="$6" timeout_seconds="$7" budget_name="$8"
+    local label="$9" lock_wait="${10}"
+    local step_budget listing selection state short_id snapshot_time snapshot_path header
+    VERIFIED_RESTIC_ID="" VERIFIED_RESTIC_TIME="" VERIFIED_RESTIC_PATH=""
+    [[ "$listing_tag" =~ ^[a-z][a-z-]*$ ]] || return 1
+
+    step_budget=$(( deadline - $(date +%s) ))
+    if (( step_budget <= 0 )); then
+        fail "The ${label} restic snapshot used the whole ${timeout_seconds}s ${budget_name} budget before it could be verified."
+        return 1
+    fi
+    (( step_budget <= 720 )) || step_budget=720
+    # The tag is one of two installer constants, spliced into the script text so
+    # the operator-visible command line names it literally.
+    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
+    if ! listing=$(installer_run_live_compose exec -T backup \
+        sh -ceu 'exec timeout "$3" restic snapshots --json --tag '"$listing_tag"' --retry-lock "$2" "$1"' \
+        sh "$snapshot_id" "$lock_wait" "$step_budget" </dev/null 2>> "$LOG_FILE"); then
+        fail "The ${label} restic snapshot ${snapshot_id:0:8} could not be read back from the repository."
+        return 1
+    fi
+    if ! selection=$(printf '%s' "$listing" \
+        | jq -er --arg id "$snapshot_id" --arg tag "$required_tag" \
+            --argjson floor "$floor" \
+            "${RESTIC_SNAPSHOT_TIME_JQ_DEF}"'
+            if type != "array" then ["unreadable", "", "", ""]
+            else
+              [ .[] | select((.id // "") == $id or ((.id // "") | startswith($id))) ] as $hits
+              | if ($hits | length) != 1 then ["missing", "", "", ""]
+                else $hits[0]
+                  | (try tsec catch null) as $t
+                  | if ((.tags // []) | index($tag)) == null then ["untagged", "", "", ""]
+                    elif $t == null then ["untimed", "", "", ""]
+                    elif $t < $floor then ["stale", "", "", ""]
+                    else ["ok", (.short_id // .id[0:8]), .time, ((.paths // [])[0] // "")]
+                    end
+                end
+            end
+            | @tsv' 2>> "$LOG_FILE"); then
+        fail "The ${label} restic snapshot ${snapshot_id:0:8} listing is unreadable."
+        return 1
+    fi
+    IFS=$'\t' read -r state short_id snapshot_time snapshot_path <<< "$selection"
+    case "$state" in
+        ok) ;;
+        stale)
+            fail "Restic snapshot ${snapshot_id:0:8} predates the start of the snapshot step; it is not a fresh recovery point."
+            return 1
+            ;;
+        *)
+            fail "The repository does not hold a usable ${label} snapshot ${snapshot_id:0:8} (${state})."
+            return 1
+            ;;
+    esac
+    if [[ ! "$short_id" =~ ^[0-9a-f]{8,64}$ ]] \
+        || [[ ! "$snapshot_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ ]] \
+        || [[ ! "$snapshot_path" =~ $path_regex ]]; then
+        fail "The ${label} restic snapshot ${snapshot_id:0:8} has an unusable identity."
+        return 1
+    fi
+
+    # Read the stored bytes back: the dump must open as a PostgreSQL dump. Only
+    # the first 4 KiB are read; `head` closing the pipe is expected.
+    step_budget=$(( deadline - $(date +%s) ))
+    if (( step_budget <= 0 )); then
+        fail "The ${label} restic snapshot used the whole ${timeout_seconds}s ${budget_name} budget before it could be read back."
+        return 1
+    fi
+    (( step_budget <= 900 )) || step_budget=900
+    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
+    header=$(installer_run_live_compose exec -T backup \
+        sh -ceu 'timeout "$4" restic dump --retry-lock "$3" "$1" "$2" | head -c 4096' \
+        sh "$snapshot_id" "$snapshot_path" "$lock_wait" "$step_budget" </dev/null 2>> "$LOG_FILE" || true)
+    if [[ "$header" != *"PostgreSQL database dump"* ]]; then
+        fail "The ${label} restic snapshot ${snapshot_id:0:8} does not read back as a PostgreSQL dump."
+        return 1
+    fi
+    VERIFIED_RESTIC_ID="$short_id"
+    VERIFIED_RESTIC_TIME="$snapshot_time"
+    VERIFIED_RESTIC_PATH="$snapshot_path"
+}
+
+# Take, verify and adopt a FRESH restic snapshot as the in-place upgrade's
+# recovery point (#2332). Called BEFORE the proxy is quiesced (#2435): pg_dump
+# reads a single MVCC snapshot, so the dump is consistent while the proxy keeps
+# serving, and a multi-GB dump costs no downtime. It still runs before the
+# target binary can migrate anything.
+#
+# RPO: the snapshot holds the database as of the moment pg_dump started. Writes
+# committed after that and before the quiesce are covered by the small
+# catch-up snapshot (database_take_catchup_snapshot); only append-only
+# hypertable rows from that window are not recoverable by rollback.
+#
+#   $1  epoch seconds at which this snapshot step began
 #   $2  source version   $3  target version   (tag only)
 #
 # Runs through the backup container that already holds RESTIC_REPOSITORY,
@@ -13322,7 +13732,7 @@ database_take_fresh_recovery_snapshot() {
     local timeout_seconds="${DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS:-14400}"
     local tolerance="${DATABASE_RECOVERY_SNAPSHOT_CLOCK_TOLERANCE_SECONDS:-120}"
     local upgrade_tag backup_output summary snapshot_id bytes
-    local listing selection state short_id snapshot_time snapshot_path header
+    local short_id snapshot_time
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID=""
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME=""
 
@@ -13340,13 +13750,13 @@ database_take_fresh_recovery_snapshot() {
     local lock_wait="${DATABASE_RECOVERY_SNAPSHOT_LOCK_WAIT:-10m}"
     [[ "$lock_wait" =~ ^[1-9][0-9]*[smh]$ ]] || lock_wait="10m"
 
-    # DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS bounds the WHOLE quiesced
+    # DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS bounds the WHOLE
     # recovery-point step (backup, read-back listing and dump check), not just
     # the backup: each later call gets only what is left of it.
     local snapshot_deadline step_budget
     snapshot_deadline=$(( $(date +%s) + timeout_seconds ))
 
-    step "  Taking a fresh pre-upgrade restic snapshot while the proxy is stopped..."
+    step "  Taking a fresh pre-upgrade restic snapshot while the proxy keeps serving (no downtime)..."
     # The script runs under bash with pipefail inside the container, so a
     # pg_dump failure fails the pipeline instead of committing a truncated
     # dump as a "successful" snapshot.
@@ -13396,79 +13806,20 @@ PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
         return 1
     fi
 
-    # 2. The repository must list exactly this snapshot, fresh and tagged.
-    step_budget=$(( snapshot_deadline - $(date +%s) ))
-    if (( step_budget <= 0 )); then
-        fail "The pre-upgrade restic snapshot used the whole ${timeout_seconds}s DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS budget before it could be verified."
-        return 1
-    fi
-    (( step_budget <= 720 )) || step_budget=720
-    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
-    if ! listing=$(installer_run_live_compose exec -T backup \
-        sh -ceu 'exec timeout "$3" restic snapshots --json --tag pre-upgrade --retry-lock "$2" "$1"' \
-        sh "$snapshot_id" "$lock_wait" "$step_budget" </dev/null 2>> "$LOG_FILE"); then
-        fail "The pre-upgrade restic snapshot ${snapshot_id:0:8} could not be read back from the repository."
-        return 1
-    fi
-    if ! selection=$(printf '%s' "$listing" \
-        | jq -er --arg id "$snapshot_id" --argjson floor "$(( quiesced_at - tolerance ))" \
-            "${RESTIC_SNAPSHOT_TIME_JQ_DEF}"'
-            if type != "array" then ["unreadable", "", "", ""]
-            else
-              [ .[] | select((.id // "") == $id or ((.id // "") | startswith($id))) ] as $hits
-              | if ($hits | length) != 1 then ["missing", "", "", ""]
-                else $hits[0]
-                  | (try tsec catch null) as $t
-                  | if ((.tags // []) | index("postgres")) == null then ["untagged", "", "", ""]
-                    elif $t == null then ["untimed", "", "", ""]
-                    elif $t < $floor then ["stale", "", "", ""]
-                    else ["ok", (.short_id // .id[0:8]), .time, ((.paths // [])[0] // "")]
-                    end
-                end
-            end
-            | @tsv' 2>> "$LOG_FILE"); then
-        fail "The pre-upgrade restic snapshot ${snapshot_id:0:8} listing is unreadable."
-        return 1
-    fi
-    IFS=$'\t' read -r state short_id snapshot_time snapshot_path <<< "$selection"
-    case "$state" in
-        ok) ;;
-        stale)
-            fail "Restic snapshot ${snapshot_id:0:8} predates the quiesced proxy; it is not a fresh recovery point."
-            return 1
-            ;;
-        *)
-            fail "The repository does not hold a usable pre-upgrade snapshot ${snapshot_id:0:8} (${state})."
-            return 1
-            ;;
-    esac
-    if [[ ! "$short_id" =~ ^[0-9a-f]{8,64}$ ]] \
-        || [[ ! "$snapshot_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ ]] \
-        || [[ ! "$snapshot_path" =~ ^/postgres-[A-Za-z0-9_.-]+\.sql$ ]]; then
-        fail "The pre-upgrade restic snapshot ${snapshot_id:0:8} has an unusable identity."
-        return 1
-    fi
-
-    # 3. Read the stored bytes back: the dump must open as a PostgreSQL dump.
-    # Only the first 4 KiB are read; `head` closing the pipe is expected.
-    step_budget=$(( snapshot_deadline - $(date +%s) ))
-    if (( step_budget <= 0 )); then
-        fail "The pre-upgrade restic snapshot used the whole ${timeout_seconds}s DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS budget before it could be read back."
-        return 1
-    fi
-    (( step_budget <= 900 )) || step_budget=900
-    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
-    header=$(installer_run_live_compose exec -T backup \
-        sh -ceu 'timeout "$4" restic dump --retry-lock "$3" "$1" "$2" | head -c 4096' \
-        sh "$snapshot_id" "$snapshot_path" "$lock_wait" "$step_budget" </dev/null 2>> "$LOG_FILE" || true)
-    if [[ "$header" != *"PostgreSQL database dump"* ]]; then
-        fail "The pre-upgrade restic snapshot ${snapshot_id:0:8} does not read back as a PostgreSQL dump."
-        return 1
-    fi
+    # 2 + 3. The repository must list exactly this snapshot, fresh and tagged
+    # `postgres`, and its stored bytes must open as a PostgreSQL dump.
+    database_verify_restic_snapshot "$snapshot_id" "$(( quiesced_at - tolerance ))" \
+        pre-upgrade postgres '^/postgres-[A-Za-z0-9_.-]+\.sql$' \
+        "$snapshot_deadline" "$timeout_seconds" DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS \
+        pre-upgrade "$lock_wait" || return 1
+    short_id="$VERIFIED_RESTIC_ID"
+    snapshot_time="$VERIFIED_RESTIC_TIME"
 
     # 4. The bundled object store (#2370), when the source deployment runs it:
     # a Garage metadata snapshot, then its metadata and data volumes, in the
-    # same quiesced window and repository, tagged pre-upgrade + garage.
+    # same repository, tagged pre-upgrade + garage. Garage's CreateMetadataSnapshot
+    # is the supported live-consistent path and data blocks are immutable, so this
+    # too runs before the quiesce.
     step_budget=$(( snapshot_deadline - $(date +%s) ))
     if (( step_budget <= 0 )); then
         fail "The pre-upgrade restic snapshot used the whole ${timeout_seconds}s DATABASE_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS budget before the object store could be backed up."
@@ -13480,6 +13831,146 @@ PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID="$short_id"
     DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME="$snapshot_time"
     info "Fresh recovery point verified: restic snapshot ${short_id} taken ${snapshot_time} (${bytes} bytes)"
+}
+
+# Quiesced catch-up snapshot (#2435). Called with the proxy stopped, after the
+# full pre-upgrade snapshot was taken while it served.
+#
+# pg_dump of the relational state only: `--exclude-table-data` drops the data of
+# hypertable chunks (request_log, wire_id_ledger, request_payloads_v2, ... — the
+# append-only logs that make the database tens of GB), keeping schema, the
+# TimescaleDB catalog and every ordinary table. With nothing writing, it is a
+# point-in-time image of the authoritative state (accounts, keys, orgs,
+# sessions) AT the quiesce. A rollback restores the full snapshot and then
+# re-applies this one (database_restore_restic_recovery) and so loses none of
+# those tables' writes. Tagged pre-upgrade-delta + the upgrade tag (NOT
+# `postgres`, so the scheduled-backup probe never mistakes it for a full dump).
+#
+# It gets the same proof as the full snapshot: restic summary with a non-zero
+# byte count, a listing that names exactly this snapshot with the right tag and
+# a timestamp no earlier than the quiesce, and a dump-header read-back. The
+# whole step, read-back included, is bounded by
+# DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS: it is downtime.
+#
+# Sets DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID / _TIME on success.
+database_take_catchup_snapshot() {
+    local source_version="${1:-unknown}" target_version="${2:-unknown}"
+    local timeout_seconds="${DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS:-120}"
+    local exclude="${DATABASE_CATCHUP_EXCLUDE_TABLE_DATA:-_timescaledb_internal.*}"
+    local lock_wait="${DATABASE_RECOVERY_SNAPSHOT_LOCK_WAIT:-10m}"
+    local tolerance="${DATABASE_RECOVERY_SNAPSHOT_CLOCK_TOLERANCE_SECONDS:-120}"
+    local upgrade_tag output summary snapshot_id bytes started deadline
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID=""
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME=""
+    [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || timeout_seconds=120
+    [[ "$lock_wait" =~ ^[1-9][0-9]*[smh]$ ]] || lock_wait="10m"
+    [[ "$tolerance" =~ ^[0-9]+$ ]] || tolerance=120
+    [[ "$exclude" =~ ^[A-Za-z0-9_.*]+$ ]] || exclude="_timescaledb_internal.*"
+    upgrade_tag="upgrade-${source_version}-to-${target_version}"
+    [[ "$upgrade_tag" =~ ^upgrade-[0-9A-Za-z.+-]+-to-[0-9A-Za-z.+-]+$ ]] \
+        || upgrade_tag="upgrade-unknown"
+    started=$(date -u +%s)
+    deadline=$(( $(date +%s) + timeout_seconds ))
+
+    step "  Taking the quiesced catch-up snapshot (relational state only)..."
+    # shellcheck disable=SC2016  # Expanded by bash inside the backup container.
+    local catchup_script='
+set -o pipefail
+db="${POSTGRES_DB:-llm_proxy}"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+    -h "${POSTGRES_HOST:-timescaledb}" \
+    -U "${POSTGRES_USER:-proxy}" \
+    --exclude-table-data="$3" \
+    "$db" \
+  | restic backup --stdin \
+      --retry-lock "$2" \
+      --stdin-filename "postgres-${db}-${stamp}-catchup.sql" \
+      --tag pre-upgrade-delta \
+      --tag "$(date -u +%Y-%m-%d)" \
+      --tag "$1" \
+      --json
+'
+    # shellcheck disable=SC2016  # Expanded by sh inside the backup container.
+    if ! output=$(installer_run_live_compose exec -T backup \
+        sh -ceu 'exec timeout "$1" bash -ceu "$2" bash "$3" "$4" "$5"' \
+        sh "$timeout_seconds" "$catchup_script" "$upgrade_tag" "$lock_wait" "$exclude" \
+        </dev/null 2>> "$LOG_FILE"); then
+        fail "The quiesced catch-up snapshot failed or exceeded ${timeout_seconds}s (see ${LOG_FILE})."
+        return 1
+    fi
+    if ! summary=$(printf '%s\n' "$output" \
+        | jq -Rr 'fromjson? | select(type == "object" and .message_type == "summary")
+                  | [(.snapshot_id // ""), ((.total_bytes_processed // 0) | tostring)]
+                  | @tsv' 2>> "$LOG_FILE" | tail -n 1) \
+        || [[ -z "$summary" ]]; then
+        fail "The catch-up snapshot reported no summary; it cannot be trusted."
+        return 1
+    fi
+    IFS=$'\t' read -r snapshot_id bytes <<< "$summary"
+    if [[ ! "$snapshot_id" =~ ^[0-9a-f]{8,64}$ ]] \
+        || [[ ! "$bytes" =~ ^[0-9]+$ ]] || (( bytes == 0 )); then
+        fail "The catch-up snapshot is empty or has an unusable id."
+        return 1
+    fi
+    database_verify_restic_snapshot "$snapshot_id" "$(( started - tolerance ))" \
+        pre-upgrade-delta pre-upgrade-delta '^/postgres-[A-Za-z0-9_.-]+-catchup\.sql$' \
+        "$deadline" "$timeout_seconds" DATABASE_CATCHUP_SNAPSHOT_TIMEOUT_SECONDS \
+        catch-up "$lock_wait" || return 1
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID="$VERIFIED_RESTIC_ID"
+    DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME="$VERIFIED_RESTIC_TIME"
+    info "Catch-up snapshot verified: restic snapshot ${VERIFIED_RESTIC_ID} (${bytes} bytes, tag ${upgrade_tag}, pre-upgrade-delta)"
+}
+
+# Print the downtime the operator should expect, before anything is stopped.
+database_announce_expected_downtime() {
+    info "Expected proxy downtime: seconds (container swap + migrations); budget ${DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS}s."
+    info "  The recovery snapshot is taken first, while the proxy keeps serving."
+}
+
+# Migration 0246 (v0.0.193, #2435) cut wire_id_ledger retention from 90 to 30
+# days. The retention job then drops every older chunk for good, which no
+# rollback can bring back, so say so in the installer's own output next to the
+# expected-downtime line, where an operator sees it without the release notes.
+# Printed when the target is v0.0.193 or later and the database has not yet
+# applied 0246 (or its migration level cannot be read: unknown is announced).
+#   $1 target version   $2 database
+DATABASE_LEDGER_RETENTION_MIGRATION=246
+database_announce_ledger_retention_change() {
+    local target_version="$1" database="$2" migration=""
+    if [[ "$target_version" != "0.0.193" ]] \
+        && ! stable_semver_gt "$target_version" "0.0.193"; then
+        return 0
+    fi
+    if migration=$(database_query_migration_version "$database" 2>/dev/null) \
+        && [[ "$migration" =~ ^[0-9]+$ ]] \
+        && (( migration >= DATABASE_LEDGER_RETENTION_MIGRATION )); then
+        return 0
+    fi
+    warn "Upgrade note: migration ${DATABASE_LEDGER_RETENTION_MIGRATION} cuts wire_id_ledger retention from 90 to 30 days."
+    warn "  After this upgrade the retention job PERMANENTLY DROPS ledger rows older than 30 days (up to ~2 months, several GB)."
+    warn "  Rolling back cannot bring them back. They only feed the management translation search and thread views;"
+    warn "  export anything you need BEFORE upgrading. See docs/operations/upgrade-notes.md."
+}
+
+# Report the measured proxy-down time once the target proves healthy and warn
+# loudly when it exceeds the budget. In a rehearsal
+# (DATABASE_UPGRADE_DOWNTIME_STRICT=true) an over-budget upgrade returns 1.
+database_report_proxy_downtime() {
+    local since="${DATABASE_PROXY_DOWN_SINCE_EPOCH:-}"
+    local budget="${DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS:-60}"
+    local down
+    [[ "$since" =~ ^[0-9]+$ ]] || return 0
+    [[ "$budget" =~ ^[0-9]+$ ]] || budget=60
+    down=$(( $(date -u +%s) - since ))
+    DATABASE_PROXY_DOWN_SINCE_EPOCH=""
+    if (( down > budget )); then
+        warn "PROXY DOWNTIME ${down}s EXCEEDED the ${budget}s budget (quiesce to healthy)."
+        warn "  Upgrades must not take LLAP offline for minutes; file an issue with ${LOG_FILE}."
+        [[ "${DATABASE_UPGRADE_DOWNTIME_STRICT:-false}" != "true" ]] || return 1
+        return 0
+    fi
+    info "Proxy downtime ${down}s (budget ${budget}s)"
 }
 
 # garage_source_deployed — whether the SOURCE deployment runs the bundled
@@ -13878,13 +14369,13 @@ database_publish_upgrade_recovery_record() {
 # Record the restic snapshot that is the recovery point for an in-place
 # upgrade. O(1): a few hundred bytes, no database bytes read or written.
 #
-# The manifest is deliberately NOT consumable by --rollback-backup. Restoring a
-# restic snapshot into production is a separately approved procedure with its
-# own dual control (docs/operations/backups.md), and pretending the installer
-# can do it in one flag would be the most dangerous kind of convenience. What
-# this buys is that the recovery point is unambiguous and written down at the
-# moment it was true, instead of being reconstructed from cron schedules after
-# an incident.
+# The manifest names the full snapshot AND the quiesced catch-up (#2435), both
+# strictly validated by database_validate_restic_rollback_artifact, which is
+# what lets --rollback-backup restore the full snapshot into an isolated
+# database, re-apply the catch-up and swap it in (the old database is kept as
+# the safety database, so the swap itself is reversible by rename). The
+# catch-up fields are absent on records written before v0.0.193; such a record
+# restores the full snapshot only, and says so.
 database_publish_restic_recovery_manifest() {
     local source_version="${DATABASE_ROLLBACK_SOURCE_VERSION:-}"
     local target_version="" database timestamp backup_id
@@ -13935,12 +14426,16 @@ database_publish_restic_recovery_manifest() {
         --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg snapshot_id "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_ID:-}" \
         --arg snapshot_time "${DATABASE_ROLLBACK_RECOVERY_SNAPSHOT_TIME:-}" \
+        --arg catchup_id "${DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_ID:-}" \
+        --arg catchup_time "${DATABASE_ROLLBACK_CATCHUP_SNAPSHOT_TIME:-}" \
         '{format_version: 3, kind: "restic", backup_id: $backup_id,
           source_version: $source_version, target_version: $target_version,
           database: $database, migration_version: $migration_version,
           created_at: $created_at,
           recovery_snapshot_id: $snapshot_id,
           recovery_snapshot_time: $snapshot_time,
+          catchup_snapshot_id: $catchup_id,
+          catchup_snapshot_time: $catchup_time,
           migrated_in_place: true}' \
         | $SUDO /usr/bin/tee "$manifest_file" >/dev/null \
         || ! $SUDO chmod 0600 "$manifest_file" \
@@ -14372,6 +14867,10 @@ deploy_complete_database_transition() {
             return 1
         fi
         info "Target database, Consul, proxy, and ingress are healthy"
+        database_report_proxy_downtime || {
+            fail "Proxy downtime exceeded the rehearsal budget."
+            return 1
+        }
         if [[ "$DATABASE_FORWARD_UPGRADE_ACTIVE" == "true" ]]; then
             if ! database_complete_forward_upgrade_transition; then
                 fail "Target stack is healthy, but durable forward-upgrade cleanup could not be completed."
