@@ -38,7 +38,12 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.195"
+INSTALLER_VERSION="0.0.196"
+# sha256 of docker/timescaledb/Dockerfile at this release, stamped by
+# build-installer.sh. The release's database image carries it as its
+# com.llap.database-image.content-id label (docs/operations/database-image.md).
+# The unsubstituted template holds the placeholder, which matches nothing.
+DATABASE_IMAGE_CONTENT_ID="a9841f8ab04dd0b61c893e28a8fabefae5a65475397d4a428a4443f44ec5dc8e"
 # Reviewed production trust anchor. A downloaded public key is accepted only
 # when its primary fingerprint matches this exact value.
 RELEASE_SIGNING_FINGERPRINT="4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F"
@@ -1196,6 +1201,14 @@ DATABASE_PROXY_DOWN_SINCE_EPOCH=""
 #                                 and config: it is NOT restarted in the window
 DEPLOY_INFRA_PRE_RECONCILED="false"
 DEPLOY_TIMESCALEDB_UNCHANGED="false"
+# True when TimescaleDB is unchanged only because the release's image reference
+# moved while the image ID and configuration did not
+# (deploy_timescaledb_unchanged_but_for_image_ref). Compose's config-hash still
+# differs for it, so the final full-stack `up` must not be handed TimescaleDB.
+DEPLOY_TIMESCALEDB_REF_ONLY="false"
+# The image reference that unchanged database was created from; the final
+# full-stack `up` pins PROXY_DATABASE_IMAGE to it so Compose sees no difference.
+DEPLOY_TIMESCALEDB_RUNNING_REF=""
 # True only while the pre-quiesce pass runs its Consul ACL reconcile.
 DEPLOY_RECONCILING_BEFORE_QUIESCE="false"
 # Compose services the pre-quiesce pass never touches (single source of truth,
@@ -4235,6 +4248,41 @@ receipt_image_lock_set_for_version() {
     return 1
 }
 
+# A database image published once its image ID was made stable across releases
+# (docs/operations/database-image.md, "Image identity across releases") carries no
+# per-release revision or version label: those would change its config, hence its
+# image ID, on every release and force a swap of an unchanged database. Its
+# release binding is the SLSA provenance and the receipt-signed digest; its
+# config carries the content identity of its Dockerfile instead. Succeeds only
+# for exactly that shape, so an image with a half-present release label set is
+# still judged by the revision/version comparison alone.
+#
+# With an expected content identity (the target image: this installer carries its
+# own release's) the label must equal it. Without one (a recovery image: the
+# source release's identity, which this installer cannot know, and whose digest
+# the signed receipt already pins) the label must be a well-formed sha256.
+database_image_has_release_independent_identity() {
+    local image_ref="$1" expected="${2:-}" content_id revision version
+    content_id="$(
+        installer_docker image inspect --format \
+            '{{ index .Config.Labels "com.llap.database-image.content-id" }}' \
+            "$image_ref" 2>/dev/null
+    )" || return 1
+    revision="$(
+        installer_docker image inspect --format \
+            '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$image_ref" 2>/dev/null
+    )" || return 1
+    version="$(
+        installer_docker image inspect --format \
+            '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+            "$image_ref" 2>/dev/null
+    )" || return 1
+    [[ "$content_id" =~ ^[0-9a-f]{64}$ && -z "$revision" && -z "$version" ]] \
+        || return 1
+    [[ -z "$expected" || "$content_id" == "$expected" ]]
+}
+
 verify_receipt_recovery_image() {
     local image_name="$1"
     local image_ref="$2"
@@ -4274,13 +4322,20 @@ verify_receipt_recovery_image() {
             fail "Pulled recovery ${image_name} image does not retain its authorized digest."
             return 1
         }
-    [[ "$architecture" == "$ARCH" && "$operating_system" == "linux" \
-        && "$source_sha" == "$RELEASE_RECOVERY_IMAGE_LOCK_SOURCE_SHA" \
-        && "$version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]] \
-        || {
-            fail "Recovery ${image_name} image provenance does not match the signed receipt."
-            return 1
-        }
+    local provenance_ok=false
+    if [[ "$architecture" == "$ARCH" && "$operating_system" == "linux" ]]; then
+        if [[ "$source_sha" == "$RELEASE_RECOVERY_IMAGE_LOCK_SOURCE_SHA" \
+            && "$version" == "$RELEASE_RECOVERY_IMAGE_LOCK_VERSION" ]]; then
+            provenance_ok=true
+        elif [[ "$image_name" == "database" ]] \
+            && database_image_has_release_independent_identity "$image_ref"; then
+            provenance_ok=true
+        fi
+    fi
+    if [[ "$provenance_ok" != true ]]; then
+        fail "Recovery ${image_name} image provenance does not match the signed receipt."
+        return 1
+    fi
 }
 
 # Bind the running container to one of the receipt's own image digests. More
@@ -8683,6 +8738,11 @@ deploy_verify_locked_images() {
         else
             [[ "$source_sha" == "$RELEASE_IMAGE_LOCK_SOURCE_SHA" \
                 && "$version" == "$RELEASE_IMAGE_LOCK_VERSION" ]] \
+                || {
+                    [[ "$image_name" == "database" ]] \
+                        && database_image_has_release_independent_identity \
+                            "$image_ref" "$DATABASE_IMAGE_CONTENT_ID"
+                } \
                 || die "Pulled ${image_name} image provenance does not match the signed receipt."
         fi
     done
@@ -15117,6 +15177,57 @@ deploy_service_needs_recreate() {
     return 1
 }
 
+# Print the path of a temporary Compose env file that pins PROXY_DATABASE_IMAGE
+# to <reference>. compose-command.sh passes "$@" after its own --env-file, so a
+# later `--env-file <file>` overrides the variable for one invocation only; the
+# installed .env keeps the release-authorized reference.
+deploy_write_database_image_override() {
+    local reference="$1" env_file
+    [[ "$reference" =~ ^[A-Za-z0-9._/:@-]+$ ]] || return 1
+    env_file=$(mktemp "${TMPDIR:-/tmp}/llap-dbimage.XXXXXX") || return 1
+    printf 'PROXY_DATABASE_IMAGE=%s\n' "$reference" > "$env_file" \
+        || { rm -f "$env_file"; return 1; }
+    chmod 0644 "$env_file" 2>/dev/null || true
+    printf '%s\n' "$env_file"
+}
+
+# deploy_timescaledb_unchanged_but_for_image_ref <hashes> <images>
+# True (0) when the running timescaledb container is the same database as the
+# target: the very same image ID (the config digest, so identical layers and
+# labels) and a Compose configuration identical to the running container's once
+# the image reference is set to the one it was created from. The reference alone
+# differs between releases: it is the OCI index digest, which changes with every
+# release's attestations while the image behind it does not. Compose's own
+# config-hash includes the reference, so without this a byte-identical database
+# was swapped, with the proxy stopped, on every upgrade (v0.0.194, v0.0.195).
+# Any query that fails answers "no": a swap is the safe direction.
+deploy_timescaledb_unchanged_but_for_image_ref() {
+    local images="$2"
+    local cid have_ref have_hash have_image want_image image_ref want_hash env_file
+    DEPLOY_TIMESCALEDB_RUNNING_REF=""
+    cid=$(installer_run_live_compose ps -q timescaledb 2>> "$LOG_FILE") || return 1
+    [[ -n "$cid" ]] || return 1
+    image_ref=$(awk '$1 == "timescaledb" { print $2 }' <<< "$images")
+    [[ -n "$image_ref" ]] || return 1
+    have_image=$(installer_docker inspect --format '{{ .Image }}' "$cid" \
+        2>> "$LOG_FILE") || return 1
+    want_image=$(installer_docker image inspect --format '{{ .Id }}' "$image_ref" \
+        2>> "$LOG_FILE") || return 1
+    [[ -n "$want_image" && "$want_image" == "$have_image" ]] || return 1
+    have_ref=$(installer_docker inspect --format '{{ .Config.Image }}' "$cid" \
+        2>> "$LOG_FILE") || return 1
+    have_hash=$(installer_docker inspect \
+        --format '{{ index .Config.Labels "com.docker.compose.config-hash" }}' \
+        "$cid" 2>> "$LOG_FILE") || return 1
+    [[ -n "$have_hash" ]] || return 1
+    env_file=$(deploy_write_database_image_override "$have_ref") || return 1
+    want_hash=$(installer_run_live_compose --env-file "$env_file" \
+        config --hash timescaledb 2>> "$LOG_FILE" | awk '$1 == "timescaledb" { print $2 }')
+    rm -f "$env_file"
+    [[ -n "$want_hash" && "$want_hash" == "$have_hash" ]] || return 1
+    DEPLOY_TIMESCALEDB_RUNNING_REF="$have_ref"
+}
+
 # deploy_reconcile_infrastructure_before_quiesce (#2438)
 #
 # The v0.0.193 upgrade restarted timescaledb, consul, traefik, prometheus,
@@ -15139,6 +15250,8 @@ deploy_service_needs_recreate() {
 deploy_reconcile_infrastructure_before_quiesce() {
     DEPLOY_INFRA_PRE_RECONCILED="false"
     DEPLOY_TIMESCALEDB_UNCHANGED="false"
+    DEPLOY_TIMESCALEDB_REF_ONLY="false"
+    DEPLOY_TIMESCALEDB_RUNNING_REF=""
     step "  Reconciling infrastructure services (the proxy keeps serving)..."
     # docker-compose.backup.yml declares proxy_ca_data as external:true; compose
     # validates every declared volume before starting anything.
@@ -15159,13 +15272,21 @@ deploy_reconcile_infrastructure_before_quiesce() {
     if ! deploy_service_needs_recreate timescaledb "$hashes" "$images"; then
         DEPLOY_TIMESCALEDB_UNCHANGED="true"
         info "timescaledb unchanged; it is not restarted during the upgrade"
+    elif deploy_timescaledb_unchanged_but_for_image_ref "$hashes" "$images"; then
+        DEPLOY_TIMESCALEDB_UNCHANGED="true"
+        DEPLOY_TIMESCALEDB_REF_ONLY="true"
+        info "timescaledb unchanged (same image ID and configuration; only the release's image reference moved); it is not restarted during the upgrade"
     else
         info "timescaledb changed; it is swapped while the proxy is stopped"
     fi
     # A protected bind-mount refresh of the database must still recreate it.
     local service
     for service in ${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]+"${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]}"}; do
-        [[ "$service" != timescaledb ]] || DEPLOY_TIMESCALEDB_UNCHANGED="false"
+        [[ "$service" != timescaledb ]] || {
+            DEPLOY_TIMESCALEDB_UNCHANGED="false"
+            DEPLOY_TIMESCALEDB_REF_ONLY="false"
+            DEPLOY_TIMESCALEDB_RUNNING_REF=""
+        }
     done
 
     # A changed Consul is recreated here, with the source proxy serving. The
@@ -15388,7 +15509,26 @@ deploy_start_remaining_services() {
 
     # Bring up the full stack now that Consul ACL tokens are in .env.
     # consul-init will succeed this time because CONSUL_HTTP_TOKEN is set.
-    if ! installer_run_live_compose up -d >> "$LOG_FILE" 2>&1; then
+    # The full dependency graph is kept (consul-init completion gates Traefik,
+    # Consul health gates the rest). When the database is unchanged but for the
+    # release's image reference, Compose would recreate it for that difference
+    # alone, so this one invocation sees the reference it was created from.
+    local -a full_stack_prefix=()
+    local override_env="" up_status=0
+    if [[ "$DEPLOY_TIMESCALEDB_REF_ONLY" == "true" \
+        && -n "$DEPLOY_TIMESCALEDB_RUNNING_REF" ]]; then
+        override_env=$(deploy_write_database_image_override \
+            "$DEPLOY_TIMESCALEDB_RUNNING_REF") || {
+            fail "Could not pin the running database image for the full-stack start."
+            exit 1
+        }
+        full_stack_prefix=(--env-file "$override_env")
+    fi
+    installer_run_live_compose \
+        ${full_stack_prefix[@]+"${full_stack_prefix[@]}"} up -d \
+        >> "$LOG_FILE" 2>&1 || up_status=$?
+    [[ -z "$override_env" ]] || rm -f "$override_env"
+    if (( up_status != 0 )); then
         draw_box "FAILED: Start remaining services" \
             "" \
             "Docker Compose failed while starting the full stack." \
