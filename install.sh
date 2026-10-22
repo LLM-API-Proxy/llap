@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.199"
+INSTALLER_VERSION="0.0.200"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -99,6 +99,9 @@ umask 077
 
 # ── Signal traps ─────────────────────────────────────────────────────────────
 cleanup() {
+    if declare -F deploy_ingress_probe_abort >/dev/null 2>&1; then
+        deploy_ingress_probe_abort || true
+    fi
     if declare -F deploy_discard_embedded_file_staging >/dev/null 2>&1; then
         deploy_discard_embedded_file_staging || true
     fi
@@ -1016,15 +1019,40 @@ extract_file() {
     if $SUDO test -e "$dest" || $SUDO test -L "$dest"; then
         destination_present="true"
     fi
-    # Recreate every file-bind consumer on every non-fresh run. This makes the
-    # authority durable across process loss: if a previous run atomically
-    # replaced an unsafe inode and died before recreation, the next verified
-    # run still releases the container's unlinked legacy mount.
+    # Recreate a file-bind consumer when what it mounts changed (#2438 follow-up):
+    # the bytes differ, the source is an unsafe inode that is about to be
+    # atomically replaced, or an earlier run replaced it and died before the
+    # recreate (a pending marker survives process loss). Byte-identical safe
+    # files need no recreate: the consumer already has this content.
     if [[ "$preserve_bind_inode" == "true" \
-        && "${COMMAND:-}" != "install" ]] \
-        && ! deploy_note_bind_mount_recreation "$recreate_service"; then
-        deploy_discard_embedded_file_staging || true
-        return 1
+        && "${COMMAND:-}" != "install" ]]; then
+        local bind_reason=""
+        if [[ -z "${METADATA_DIR:-}" ]]; then
+            bind_reason="no pending-recreate record is available"
+        elif [[ "$destination_present" != "true" ]]; then
+            bind_reason="the file is new"
+        elif ! $SUDO cmp -s -- "$staging_file" "$dest"; then
+            bind_reason="the file content changed"
+        elif ! installer_managed_path_is_safe \
+            "$dest" "file" "600:640:644:750"; then
+            bind_reason="the file is an unsafe inode being replaced"
+        elif $SUDO test -e "${METADATA_DIR}/bind-recreate-pending/${recreate_service}"; then
+            bind_reason="an earlier run replaced it and did not finish the recreate"
+        fi
+        if [[ -n "$bind_reason" ]]; then
+            info "Bind-mount source ${dest} needs ${recreate_service} recreated: ${bind_reason}"
+            if [[ -n "${METADATA_DIR:-}" ]]; then
+                if ! $SUDO mkdir -p -- "${METADATA_DIR}/bind-recreate-pending" \
+                    || ! $SUDO touch -- "${METADATA_DIR}/bind-recreate-pending/${recreate_service}"; then
+                    deploy_discard_embedded_file_staging || true
+                    return 1
+                fi
+            fi
+            if ! deploy_note_bind_mount_recreation "$recreate_service"; then
+                deploy_discard_embedded_file_staging || true
+                return 1
+            fi
+        fi
     fi
     if [[ "$preserve_bind_inode" == "true" ]] \
         && installer_managed_path_is_safe \
@@ -1191,6 +1219,14 @@ DATABASE_UPGRADE_DOWNTIME_STRICT="${DATABASE_UPGRADE_DOWNTIME_STRICT:-false}"
 DATABASE_CATCHUP_EXCLUDE_TABLE_DATA="${DATABASE_CATCHUP_EXCLUDE_TABLE_DATA:-_timescaledb_internal.*}"
 # Epoch seconds at which the proxy was stopped; empty while it is serving.
 DATABASE_PROXY_DOWN_SINCE_EPOCH=""
+# Seconds Traefik refused connections because the installer recreated it before
+# the quiesce. Not proxy downtime, but ingress downtime all the same: it is
+# added to the reported downtime and counts against the budget.
+DEPLOY_INGRESS_INTERRUPTION_SECONDS=0
+DEPLOY_INGRESS_REPORTED_SECONDS=""
+DATABASE_LAST_PROXY_DOWN_SECONDS=0
+DEPLOY_INGRESS_PROBE_PID=""
+DEPLOY_INGRESS_PROBE_FILE=""
 # Downtime-window contract (#2438). On an in-place forward upgrade every
 # service except the proxy and TimescaleDB is reconciled BEFORE the quiesce
 # (deploy_reconcile_infrastructure_before_quiesce), and only services whose
@@ -14050,18 +14086,52 @@ database_announce_ledger_retention_change() {
 database_report_proxy_downtime() {
     local since="${DATABASE_PROXY_DOWN_SINCE_EPOCH:-}"
     local budget="${DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS:-60}"
-    local down
+    local down ingress
     [[ "$since" =~ ^[0-9]+$ ]] || return 0
     [[ "$budget" =~ ^[0-9]+$ ]] || budget=60
     down=$(( $(date -u +%s) - since ))
     DATABASE_PROXY_DOWN_SINCE_EPOCH=""
-    if (( down > budget )); then
-        warn "PROXY DOWNTIME ${down}s EXCEEDED the ${budget}s budget (quiesce to healthy)."
+    # Two figures, both measured, both against the budget: the proxy's own
+    # downtime (quiesce to healthy) and any ingress interruption from Traefik
+    # being recreated outside that window. They do not overlap, so they add.
+    ingress="${DEPLOY_INGRESS_INTERRUPTION_SECONDS:-0}"
+    [[ "$ingress" =~ ^[0-9]+$ ]] || ingress=0
+    DATABASE_LAST_PROXY_DOWN_SECONDS=$down
+    DEPLOY_INGRESS_REPORTED_SECONDS=$ingress
+    database_judge_downtime "$down" "$ingress" "$budget"
+}
+
+# database_judge_downtime <proxy seconds> <ingress seconds> <budget>
+database_judge_downtime() {
+    local down="$1" ingress="$2" budget="$3" total
+    total=$(( down + ingress ))
+    if (( ingress > 0 )); then
+        warn "Ingress was unavailable for ${ingress}s while Traefik was recreated (outside the proxy quiesce window)."
+    fi
+    if (( total > budget )); then
+        warn "PROXY DOWNTIME ${total}s EXCEEDED the ${budget}s budget (proxy ${down}s quiesce to healthy + ingress interruption ${ingress}s)."
         warn "  Upgrades must not take LLAP offline for minutes; file an issue with ${LOG_FILE}."
         [[ "${DATABASE_UPGRADE_DOWNTIME_STRICT:-false}" != "true" ]] || return 1
         return 0
     fi
-    info "Proxy downtime ${down}s (budget ${budget}s)"
+    if (( ingress > 0 )); then
+        info "Proxy downtime ${down}s + ingress interruption ${ingress}s = ${total}s (budget ${budget}s)"
+    else
+        info "Proxy downtime ${down}s (budget ${budget}s)"
+    fi
+}
+
+# Traefik recreated after the report (the final full-stack `up`) is the same
+# kind of outage: re-judge the budget with the larger ingress figure.
+database_report_late_ingress() {
+    local ingress="${DEPLOY_INGRESS_INTERRUPTION_SECONDS:-0}"
+    local reported="${DEPLOY_INGRESS_REPORTED_SECONDS:-}"
+    local budget="${DATABASE_UPGRADE_DOWNTIME_BUDGET_SECONDS:-60}"
+    [[ "$reported" =~ ^[0-9]+$ && "$ingress" =~ ^[0-9]+$ ]] || return 0
+    [[ "$budget" =~ ^[0-9]+$ ]] || budget=60
+    (( ingress > reported )) || return 0
+    DEPLOY_INGRESS_REPORTED_SECONDS=$ingress
+    database_judge_downtime "${DATABASE_LAST_PROXY_DOWN_SECONDS:-0}" "$ingress" "$budget"
 }
 
 # garage_source_deployed — whether the SOURCE deployment runs the bundled
@@ -15170,8 +15240,11 @@ deploy_service_needs_recreate() {
     if [[ -n "$image_ref" ]]; then
         have_image=$(installer_docker inspect --format '{{ .Image }}' "$cid" \
             2>> "$LOG_FILE") || return 0
-        want_image=$(installer_docker image inspect --format '{{ .Id }}' "$image_ref" \
-            2>> "$LOG_FILE") || return 0
+        # Content, not ID: with the containerd image store `.Id` is the index
+        # digest, which a re-attestation changes without changing the image.
+        # A genuine rebuild (different layers or config) still differs.
+        have_image=$(deploy_image_content_identity "$have_image") || return 0
+        want_image=$(deploy_image_content_identity "$image_ref") || return 0
         [[ -n "$want_image" && "$want_image" == "$have_image" ]] || return 0
     fi
     return 1
@@ -15189,6 +15262,20 @@ deploy_write_database_image_override() {
         || { rm -f "$env_file"; return 1; }
     chmod 0644 "$env_file" 2>/dev/null || true
     printf '%s\n' "$env_file"
+}
+
+# deploy_image_content_identity <image reference or ID>
+# A digest of the image's content: its layer diff IDs and its configuration
+# (which carries the labels, including the database content-id). Identical for two images that differ only in their
+# manifest/index (attestations), which is exactly the difference between two
+# releases of the same database.
+deploy_image_content_identity() {
+    local data
+    data=$(installer_docker image inspect --format \
+        '{{ json .RootFS.Layers }}|{{ json .Config }}' \
+        "$1" 2>> "$LOG_FILE") || return 1
+    [[ -n "$data" ]] || return 1
+    sha256_stdin <<< "$data"
 }
 
 # deploy_timescaledb_unchanged_but_for_image_ref <hashes> <images>
@@ -15211,8 +15298,12 @@ deploy_timescaledb_unchanged_but_for_image_ref() {
     [[ -n "$image_ref" ]] || return 1
     have_image=$(installer_docker inspect --format '{{ .Image }}' "$cid" \
         2>> "$LOG_FILE") || return 1
-    want_image=$(installer_docker image inspect --format '{{ .Id }}' "$image_ref" \
-        2>> "$LOG_FILE") || return 1
+    # Compare what the image IS (layers, labels, configuration), never its ID:
+    # with Docker's containerd image store `.Id` is the OCI INDEX digest, which
+    # changes with every release's attestations while the bytes behind it do
+    # not (v0.0.197 swapped a byte-identical database for that reason).
+    have_image=$(deploy_image_content_identity "$have_image") || return 1
+    want_image=$(deploy_image_content_identity "$image_ref") || return 1
     [[ -n "$want_image" && "$want_image" == "$have_image" ]] || return 1
     have_ref=$(installer_docker inspect --format '{{ .Config.Image }}' "$cid" \
         2>> "$LOG_FILE") || return 1
@@ -15226,6 +15317,188 @@ deploy_timescaledb_unchanged_but_for_image_ref() {
     rm -f "$env_file"
     [[ -n "$want_hash" && "$want_hash" == "$have_hash" ]] || return 1
     DEPLOY_TIMESCALEDB_RUNNING_REF="$have_ref"
+}
+
+# Run a live-compose command with its output appended to the installer log.
+deploy_compose_logged() {
+    installer_run_live_compose "$@" >> "$LOG_FILE" 2>&1
+}
+
+# A recreate has completed: forget the durable "recreate still owed" record.
+deploy_clear_bind_recreate_pending() {
+    [[ -n "${METADATA_DIR:-}" ]] || return 0
+    $SUDO rm -f -- "${METADATA_DIR}/bind-recreate-pending/$1" 2>/dev/null || true
+}
+
+# The identity of the running Traefik container: its creation timestamp. A
+# recreate gives the new container a new one, whichever path caused it.
+deploy_traefik_created() {
+    local cid
+    cid=$(installer_run_live_compose ps -q traefik 2>> "$LOG_FILE") || return 1
+    [[ -n "$cid" ]] || return 1
+    installer_docker inspect --format '{{ .Created }}' "$cid" 2>> "$LOG_FILE"
+}
+
+# deploy_ingress_watch_begin / deploy_ingress_watch_end
+# The one place ingress downtime is measured. Traefik owns :443 on the host
+# network, so a recreate cannot be seamless: the old container must release the
+# port before the new one binds it, and connections are refused in between.
+# Around any step that may recreate services (changed-list recreate, bind-mount
+# refresh, the Consul ACL reconcile, the final `up`: any path) a probe watches
+# the published ports from BEFORE the step. If Traefik's container was replaced,
+# the wall time the ports were unreachable (the old container's shutdown
+# included) is added to DEPLOY_INGRESS_INTERRUPTION_SECONDS for
+# database_report_proxy_downtime. If it was not replaced the probe is discarded.
+# An aborted step leaves the probe to deploy_ingress_probe_abort (EXIT trap) and
+# the probe's own parent-liveness check.
+DEPLOY_INGRESS_WATCH_BEFORE=""
+DEPLOY_INGRESS_WATCH_ON="false"
+
+deploy_ingress_watch_begin() {
+    DEPLOY_INGRESS_WATCH_ON="false"
+    DEPLOY_INGRESS_WATCH_BEFORE=$(deploy_traefik_created) || DEPLOY_INGRESS_WATCH_BEFORE=""
+    [[ -n "$DEPLOY_INGRESS_WATCH_BEFORE" ]] || return 0
+    deploy_ingress_probe_start
+    DEPLOY_INGRESS_WATCH_ON="true"
+}
+
+deploy_ingress_watch_end() {
+    [[ "$DEPLOY_INGRESS_WATCH_ON" == "true" ]] || return 0
+    DEPLOY_INGRESS_WATCH_ON="false"
+    local after deadline refused
+    after=$(deploy_traefik_created) || after=""
+    if [[ -n "$after" && "$after" != "$DEPLOY_INGRESS_WATCH_BEFORE" ]]; then
+        deadline=$(( $(date -u +%s) + 60 ))
+        until deploy_ingress_port_accepting; do
+            if (( $(date -u +%s) >= deadline )); then
+                warn "Traefik did not accept connections on :443 within 60s of being recreated."
+                break
+            fi
+            sleep 1
+        done
+        deploy_ingress_probe_stop
+        refused=$DEPLOY_INGRESS_PROBE_RESULT
+        DEPLOY_INGRESS_INTERRUPTION_SECONDS=$(( DEPLOY_INGRESS_INTERRUPTION_SECONDS + refused ))
+        warn "Traefik was recreated; ingress refused connections for about ${refused}s (counted in the reported downtime)."
+    else
+        deploy_ingress_probe_stop
+    fi
+}
+
+# deploy_guard_ingress <command...>: watch around one simple command.
+deploy_guard_ingress() {
+    local status=0
+    deploy_ingress_watch_begin
+    "$@" || status=$?
+    deploy_ingress_watch_end
+    return "$status"
+}
+
+# ── Ingress probe ───────────────────────────────────────────────────────────
+#
+# Recreating Traefik refuses connections on :443/:8443 until the new container
+# binds them. (A SO_REUSEPORT standby was evaluated and rejected: the kernel
+# cannot hold a listener back until its routes and certificates are loaded, so
+# live requests could reach an unready instance and fail with 404 or a TLS error,
+# which clients cannot retry, instead of a refusal they can.) The outage is
+# measured instead: a probe connects every 0.2 s from before the step and the
+# wall time during which any published port was unreachable is the figure.
+
+# Whole-bounded connect: IPv6 first, then IPv4 loopback, 1 s each, so a host
+# that listens on one family only is neither missed nor stalled on.
+deploy_ingress_probe_connect() {
+    local host
+    for host in ::1 127.0.0.1; do
+        timeout 1 bash -c ": < /dev/tcp/${host}/$1" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# True (0) when Traefik's HTTPS entrypoint accepts a TCP connection.
+deploy_ingress_port_accepting() {
+    deploy_ingress_probe_connect 443
+}
+
+# Milliseconds since the epoch (EPOCHREALTIME where bash has it).
+deploy_now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local t="${EPOCHREALTIME/[.,]/}"
+        printf '%s\n' "$(( t / 1000 ))"
+    else
+        printf '%s\n' "$(( $(date -u +%s) * 1000 ))"
+    fi
+}
+
+# Start probing every published port that is reachable now. The probe logs
+# "down <ms>" with the START time of the first failing observation (a dropped-
+# packet connect can take a second or more to fail, and all of it is outage) and
+# "up <ms>" with the start of the first good one. Clears any stale state first.
+deploy_ingress_probe_start() {
+    local port
+    local -a ports=()
+    DEPLOY_INGRESS_PROBE_PID=""
+    DEPLOY_INGRESS_PROBE_FILE=""
+    for port in 443 8443; do
+        deploy_ingress_probe_connect "$port" && ports+=("$port")
+    done
+    (( ${#ports[@]} > 0 )) || return 0
+    DEPLOY_INGRESS_PROBE_FILE=$(mktemp "${TMPDIR:-/tmp}/llap-ingress-probe.XXXXXX") || return 0
+    local parent=$$
+    (
+        local is_down="false" tick_failed tick_started
+        while kill -0 "$parent" 2>/dev/null; do
+            tick_failed="false"
+            tick_started=$(deploy_now_ms)
+            for port in "${ports[@]}"; do
+                deploy_ingress_probe_connect "$port" || tick_failed="true"
+            done
+            if [[ "$tick_failed" == "true" && "$is_down" == "false" ]]; then
+                is_down="true"
+                printf 'down %s\n' "$tick_started" >> "$DEPLOY_INGRESS_PROBE_FILE"
+            elif [[ "$tick_failed" == "false" && "$is_down" == "true" ]]; then
+                is_down="false"
+                printf 'up %s\n' "$tick_started" >> "$DEPLOY_INGRESS_PROBE_FILE"
+            fi
+            sleep 0.2
+        done
+    ) &
+    DEPLOY_INGRESS_PROBE_PID=$!
+}
+
+# Stop the probe IN THE CURRENT SHELL (a command substitution would clear the
+# globals only in its subshell). The whole seconds (rounded up) the ports were
+# unreachable, as wall time between a failing observation and the next good one,
+# are left in DEPLOY_INGRESS_PROBE_RESULT.
+DEPLOY_INGRESS_PROBE_RESULT=0
+deploy_ingress_probe_stop() {
+    local total_ms=0 down_at="" kind at
+    if [[ -n "$DEPLOY_INGRESS_PROBE_PID" ]]; then
+        kill "$DEPLOY_INGRESS_PROBE_PID" 2>/dev/null || true
+        wait "$DEPLOY_INGRESS_PROBE_PID" 2>/dev/null || true
+    fi
+    DEPLOY_INGRESS_PROBE_PID=""
+    if [[ -n "$DEPLOY_INGRESS_PROBE_FILE" ]]; then
+        while read -r kind at; do
+            [[ "$at" =~ ^[0-9]+$ ]] || continue
+            if [[ "$kind" == down ]]; then
+                down_at="$at"
+            elif [[ "$kind" == up && -n "$down_at" ]]; then
+                total_ms=$(( total_ms + at - down_at ))
+                down_at=""
+            fi
+        done < "$DEPLOY_INGRESS_PROBE_FILE"
+        # Still unreachable when stopped.
+        [[ -z "$down_at" ]] || total_ms=$(( total_ms + $(deploy_now_ms) - down_at ))
+        rm -f -- "$DEPLOY_INGRESS_PROBE_FILE"
+    fi
+    DEPLOY_INGRESS_PROBE_FILE=""
+    (( total_ms >= 0 )) || total_ms=0
+    DEPLOY_INGRESS_PROBE_RESULT=$(( (total_ms + 999) / 1000 ))
+}
+
+# EXIT-trap hook: never leave the probe running.
+deploy_ingress_probe_abort() {
+    [[ -z "$DEPLOY_INGRESS_PROBE_PID" ]] || deploy_ingress_probe_stop || true
 }
 
 # deploy_reconcile_infrastructure_before_quiesce (#2438)
@@ -15252,6 +15525,7 @@ deploy_reconcile_infrastructure_before_quiesce() {
     DEPLOY_TIMESCALEDB_UNCHANGED="false"
     DEPLOY_TIMESCALEDB_REF_ONLY="false"
     DEPLOY_TIMESCALEDB_RUNNING_REF=""
+    DEPLOY_INGRESS_INTERRUPTION_SECONDS=0
     step "  Reconciling infrastructure services (the proxy keeps serving)..."
     # docker-compose.backup.yml declares proxy_ca_data as external:true; compose
     # validates every declared volume before starting anything.
@@ -15315,28 +15589,45 @@ deploy_reconcile_infrastructure_before_quiesce() {
     # reconciler recreates a token consumer only when its running container
     # does not carry the published tokens (docker/consul-acl-ensure.sh).
     DEPLOY_RECONCILING_BEFORE_QUIESCE="true"
-    deploy_consul_acl_bootstrap
+    # The caller runs this inside `if !`, where errexit is off, so failures are
+    # propagated explicitly rather than relying on `set -e`.
+    deploy_ingress_watch_begin
+    if ! deploy_consul_acl_bootstrap; then
+        DEPLOY_RECONCILING_BEFORE_QUIESCE="false"
+        deploy_ingress_probe_abort
+        fail "The Consul ACL reconcile failed."
+        return 1
+    fi
     DEPLOY_RECONCILING_BEFORE_QUIESCE="false"
+    deploy_ingress_watch_end
+    deploy_ingress_watch_begin
     deploy_garage_bootstrap
+    deploy_ingress_watch_end
 
     # Re-read the hashes: the reconciler may have rewritten the token
     # environment the consumers' configs interpolate.
     hashes=$(deploy_service_config_hashes) || hashes=""
     local -a changed=()
     local -A recreate_now=()
+    local -a bind_recreated=()
     for service in ${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]+"${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]}"}; do
         case "$service" in
             proxy|timescaledb) ;;
             *)
-                if ! installer_run_live_compose up -d --no-deps --force-recreate \
-                    "$service" >> "$LOG_FILE" 2>&1; then
+                if ! deploy_guard_ingress deploy_compose_logged up -d --no-deps --force-recreate \
+                    "$service"; then
                     fail "Docker Compose could not refresh the protected bind mount of ${service}."
                     return 1
                 fi
                 recreate_now[$service]=1
+                bind_recreated+=("$service")
+                deploy_clear_bind_recreate_pending "$service"
                 ;;
         esac
     done
+    if (( ${#bind_recreated[@]} > 0 )); then
+        info "Recreated for the protected bind-mount refresh: ${bind_recreated[*]}"
+    fi
     local -a remaining_bind=()
     for service in ${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]+"${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]}"}; do
         [[ "$service" == proxy || "$service" == timescaledb ]] \
@@ -15359,11 +15650,11 @@ deploy_reconcile_infrastructure_before_quiesce() {
         fi
     done <<< "$listed"
     if (( ${#changed[@]} > 0 )); then
-        if ! installer_run_live_compose up -d --no-deps "${changed[@]}" >> "$LOG_FILE" 2>&1; then
+        if ! deploy_guard_ingress deploy_compose_logged up -d --no-deps "${changed[@]}"; then
             fail "Docker Compose failed while starting: ${changed[*]}"
             return 1
         fi
-        info "Recreated changed services: ${changed[*]}"
+        info "Recreated changed services (image or configuration changed): ${changed[*]}"
     else
         info "No other infrastructure service changed"
     fi
@@ -15490,8 +15781,8 @@ deploy_start_remaining_services() {
     # affected container before the final full-stack reconciliation so Docker
     # drops its mount of the now-unlinked legacy inode.
     for service in "${DEPLOY_BIND_MOUNT_RECREATE_SERVICES[@]}"; do
-        if ! installer_run_live_compose up -d \
-            --no-deps --force-recreate "$service" >> "$LOG_FILE" 2>&1; then
+        if ! deploy_guard_ingress deploy_compose_logged up -d \
+            --no-deps --force-recreate "$service"; then
             draw_box "FAILED: Refresh protected bind mount" \
                 "" \
                 "Docker Compose could not recreate service '${service}'." \
@@ -15500,6 +15791,8 @@ deploy_start_remaining_services() {
                 "Full log: ${LOG_FILE}"
             exit 1
         fi
+        info "Recreated ${service} for the protected bind-mount refresh"
+        deploy_clear_bind_recreate_pending "$service"
     done
     DEPLOY_BIND_MOUNT_RECREATE_SERVICES=()
 
@@ -15524,9 +15817,9 @@ deploy_start_remaining_services() {
         }
         full_stack_prefix=(--env-file "$override_env")
     fi
-    installer_run_live_compose \
+    deploy_guard_ingress deploy_compose_logged \
         ${full_stack_prefix[@]+"${full_stack_prefix[@]}"} up -d \
-        >> "$LOG_FILE" 2>&1 || up_status=$?
+        || up_status=$?
     [[ -z "$override_env" ]] || rm -f "$override_env"
     if (( up_status != 0 )); then
         draw_box "FAILED: Start remaining services" \
@@ -15544,6 +15837,10 @@ deploy_start_remaining_services() {
         exit 1
     fi
     info "All services running"
+    database_report_late_ingress || {
+        fail "Ingress interruption exceeded the rehearsal budget."
+        return 1
+    }
 }
 
 # ── Prometheus scrape credential (issue #1881) ───────────────────────────────
@@ -16269,7 +16566,7 @@ deploy_consul_acl_bootstrap() {
     # proxy: it would start the target image ahead of the recovery boundary.
     local skip_recreate=""
     if [[ "${DEPLOY_RECONCILING_BEFORE_QUIESCE:-false}" == "true" ]]; then
-        skip_recreate="${DEPLOY_WINDOW_OWNED_SERVICES[*]}"
+        skip_recreate="${DEPLOY_WINDOW_OWNED_SERVICES[*]} traefik"
     fi
 
     # Skip-gate (#1550/#1552): only short-circuit when ALL THREE Consul token keys
