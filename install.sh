@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.202"
+INSTALLER_VERSION="0.0.203"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -4384,7 +4384,6 @@ verify_receipt_recovery_running_container() {
     local image_ref
     local candidate_ids candidate_id labels label_service working_dir project
     local container_id="" container_image_id matched="false"
-    local container_content authorized_content
 
     # Never execute the legacy install-root command during preflight: released
     # v0.0.130/v0.0.131 directories may still be service-owned. Discover the
@@ -4422,19 +4421,11 @@ verify_receipt_recovery_running_container() {
         installer_docker container inspect --format '{{.Image}}' \
             "$container_id" 2>/dev/null
     )" || return 1
-    # Compare what the image IS (layers and configuration), never its ID: with
-    # the containerd image store `.Id` is the OCI index digest, which changes
-    # with every release's attestations while the image behind it does not. A
-    # database kept running across releases (same content, older index) is
-    # still the receipt-authorized image; different content still fails closed.
-    container_content="$(deploy_image_content_identity "$container_image_id")" \
-        || container_content=""
+    # By content, never by ID (see image_matches_content): a database kept
+    # running across releases is still the receipt-authorized image.
     for image_ref in "${image_refs[@]}"; do
         [[ -n "$image_ref" ]] || continue
-        authorized_content="$(deploy_image_content_identity "$image_ref")" \
-            || continue
-        [[ -n "$authorized_content" && -n "$container_content" \
-            && "$container_content" == "$authorized_content" ]] || continue
+        image_matches_content "$container_image_id" "$image_ref" || continue
         matched="true"
         break
     done
@@ -9640,7 +9631,11 @@ database_capture_running_source_image_lock() {
                 select(type == "string" and length > 0)
             ' <<< "$config_json" 2>/dev/null
         )" || return 1
-        [[ "$image_ref" == "$rendered_image" ]] || return 1
+        # A service kept running across releases (an unchanged database) keeps
+        # the reference it was created from while the receipt now renders a
+        # newer index of the same image: by content, not reference.
+        [[ "$image_ref" == "$rendered_image" ]] \
+            || image_matches_content "$image_id" "$rendered_image" || return 1
         inspected_id="$(
             installer_docker image inspect "$image_id" 2>/dev/null \
                 | jq -er '
@@ -9736,6 +9731,7 @@ database_validate_rendered_service_against_running_stack() {
     local candidate_ids candidate_id container_json labels
     local service working_dir project config_files
     local selected_container_json="" selected_container_image_id="" image_json
+    local container_image_ref rendered_image_ref reference_ok
     [[ "$expected_service" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || return 1
     [[ "$compare_dns" == "true" || "$compare_dns" == "false" ]] || return 1
     [[ -z "$late_ca_pin" || "$late_ca_pin" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -9788,6 +9784,22 @@ database_validate_rendered_service_against_running_stack() {
         installer_docker image inspect \
             "$selected_container_image_id" 2>/dev/null
     )" || return 1
+    # The container's creation reference must be the rendered one, or an image
+    # with identical content (see image_matches_content).
+    container_image_ref="$(
+        jq -er '.[0].Config.Image' <<< "$selected_container_json" 2>/dev/null
+    )" || return 1
+    rendered_image_ref="$(
+        jq -er --arg service "$expected_service" '
+            .services[$service].image | select(type == "string" and length > 0)
+        ' <<< "$config_json" 2>/dev/null
+    )" || return 1
+    reference_ok=false
+    if [[ "$container_image_ref" == "$rendered_image_ref" ]] \
+        || image_matches_content \
+            "$selected_container_image_id" "$rendered_image_ref"; then
+        reference_ok=true
+    fi
     # JSON, including secrets, travels only on this pipe and is never written to
     # the installer log or process argv.
     {
@@ -9797,6 +9809,7 @@ database_validate_rendered_service_against_running_stack() {
     } | jq -se \
         --arg service "$expected_service" \
         --arg late_ca_pin "$late_ca_pin" \
+        --argjson reference_ok "$reference_ok" \
         --argjson compare_dns "$compare_dns" '
         def env_map:
           reduce .[] as $entry (
@@ -9839,7 +9852,7 @@ database_validate_rendered_service_against_running_stack() {
          then $expected_env | del(.[$pin_key])
          else $expected_env
          end) as $comparable_env |
-        ($container.Config.Image == $compose.services[$service].image) and
+        $reference_ok and
         ($container.Image == $image.Id) and
         ($comparable_env == $running_env) and
         (($compare_dns | not) or
@@ -9976,7 +9989,6 @@ database_validate_source_image_lock_against_base_config() {
     local lock_file="${root}/docker/docker-compose.source-recovery-images.yml"
     local entries expected_services locked_services
     local service image_id receipt_image inspected_id
-    local locked_content receipt_content
     [[ "$include_receipt" == "true" \
         || "$include_receipt" == "false" ]] || return 1
     entries="$(
@@ -10030,13 +10042,8 @@ database_validate_source_image_lock_against_base_config() {
             esac
         fi
         if [[ -n "$receipt_image" ]]; then
-            # Content, not ID (see verify_receipt_recovery_running_container).
-            locked_content="$(deploy_image_content_identity "$image_id")" \
-                || return 1
-            receipt_content="$(deploy_image_content_identity "$receipt_image")" \
-                || return 1
-            [[ -n "$locked_content" \
-                && "$locked_content" == "$receipt_content" ]] || return 1
+            # By content, not ID (see image_matches_content).
+            image_matches_content "$image_id" "$receipt_image" || return 1
         fi
     done <<< "$entries"
 }
@@ -15280,6 +15287,26 @@ deploy_image_content_identity() {
         "$1" 2>> "$LOG_FILE") || return 1
     [[ -n "$data" ]] || return 1
     sha256_stdin <<< "$data"
+}
+
+# image_matches_content <container image ID or reference> <receipt, rendered,
+# locked or target reference>
+# The single decision every comparison of a running container's image against
+# an authorized reference goes through. Accepts an exact match, or two images
+# with identical content (layers and configuration). Under the containerd image
+# store an image's ID and the reference a container was created from are OCI
+# index digests, which change with every release's attestations while the image
+# behind them does not, and a service kept running across releases (an unchanged
+# database) carries the older one. Two identical strings need no inspection (they
+# name one image); otherwise it fails closed on anything it cannot inspect: a
+# missing image, an empty identity, or different content.
+image_matches_content() {
+    local image_id="$1" reference="$2" image_content reference_content
+    [[ -n "$image_id" && -n "$reference" ]] || return 1
+    [[ "$image_id" == "$reference" ]] && return 0
+    image_content="$(deploy_image_content_identity "$image_id")" || return 1
+    reference_content="$(deploy_image_content_identity "$reference")" || return 1
+    [[ -n "$image_content" && "$image_content" == "$reference_content" ]]
 }
 
 # deploy_timescaledb_unchanged_but_for_image_ref <hashes> <images>
