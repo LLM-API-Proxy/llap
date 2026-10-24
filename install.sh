@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.201"
+INSTALLER_VERSION="0.0.202"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -4383,7 +4383,8 @@ verify_receipt_recovery_running_container() {
     local -a image_refs=("$@")
     local image_ref
     local candidate_ids candidate_id labels label_service working_dir project
-    local container_id="" container_image_id authorized_image_id matched="false"
+    local container_id="" container_image_id matched="false"
+    local container_content authorized_content
 
     # Never execute the legacy install-root command during preflight: released
     # v0.0.130/v0.0.131 directories may still be service-owned. Discover the
@@ -4421,14 +4422,19 @@ verify_receipt_recovery_running_container() {
         installer_docker container inspect --format '{{.Image}}' \
             "$container_id" 2>/dev/null
     )" || return 1
+    # Compare what the image IS (layers and configuration), never its ID: with
+    # the containerd image store `.Id` is the OCI index digest, which changes
+    # with every release's attestations while the image behind it does not. A
+    # database kept running across releases (same content, older index) is
+    # still the receipt-authorized image; different content still fails closed.
+    container_content="$(deploy_image_content_identity "$container_image_id")" \
+        || container_content=""
     for image_ref in "${image_refs[@]}"; do
         [[ -n "$image_ref" ]] || continue
-        authorized_image_id="$(
-            installer_docker image inspect --format '{{.Id}}' \
-                "$image_ref" 2>/dev/null
-        )" || continue
-        [[ -n "$authorized_image_id" \
-            && "$container_image_id" == "$authorized_image_id" ]] || continue
+        authorized_content="$(deploy_image_content_identity "$image_ref")" \
+            || continue
+        [[ -n "$authorized_content" && -n "$container_content" \
+            && "$container_content" == "$authorized_content" ]] || continue
         matched="true"
         break
     done
@@ -9970,6 +9976,7 @@ database_validate_source_image_lock_against_base_config() {
     local lock_file="${root}/docker/docker-compose.source-recovery-images.yml"
     local entries expected_services locked_services
     local service image_id receipt_image inspected_id
+    local locked_content receipt_content
     [[ "$include_receipt" == "true" \
         || "$include_receipt" == "false" ]] || return 1
     entries="$(
@@ -10023,16 +10030,13 @@ database_validate_source_image_lock_against_base_config() {
             esac
         fi
         if [[ -n "$receipt_image" ]]; then
-            inspected_id="$(
-                installer_docker image inspect "$receipt_image" 2>/dev/null \
-                    | jq -er '
-                        select(type == "array" and length == 1) |
-                        .[0].Id |
-                        select(type == "string" and
-                          test("^sha256:[0-9a-f]{64}$"))
-                    '
-            )" || return 1
-            [[ "$inspected_id" == "$image_id" ]] || return 1
+            # Content, not ID (see verify_receipt_recovery_running_container).
+            locked_content="$(deploy_image_content_identity "$image_id")" \
+                || return 1
+            receipt_content="$(deploy_image_content_identity "$receipt_image")" \
+                || return 1
+            [[ -n "$locked_content" \
+                && "$locked_content" == "$receipt_content" ]] || return 1
         fi
     done <<< "$entries"
 }
