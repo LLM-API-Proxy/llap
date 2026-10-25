@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.204"
+INSTALLER_VERSION="0.0.205"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -1174,6 +1174,10 @@ DATABASE_ROLLBACK_INSTALL_DIR=""
 DATABASE_ROLLBACK_SOURCE_METADATA_PATH=""
 DATABASE_ROLLBACK_DEPLOY_SNAPSHOT=""
 DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED="false"
+# Set immediately before the FIRST stop, recreate, rm or migration of the
+# running stack. While it is "false" (and the journal is still at
+# deploy-files-mutating) a failed deploy restores files only.
+DEPLOY_CONTAINERS_TOUCHED="false"
 DATABASE_ROLLBACK_RECOVERY_PHASE=""
 DATABASE_ROLLBACK_JOURNAL_FORMAT_VERSION=""
 DATABASE_ROLLBACK_TIMESCALEDB_BIND_SOURCE=""
@@ -11158,6 +11162,12 @@ database_discard_restore_staging() {
 database_restore_source_deploy_state() {
     [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]] || return 0
     local preserve_running_proxy="${1:-false}"
+    # "files-only": no container has been stopped, recreated, removed or
+    # migrated yet (the journal is still at deploy-files-mutating, before
+    # run_deploy writes deploy-mutating), so the running source stack is
+    # already what the restored files describe. Restore the checksummed tree
+    # and .env and touch no container: no compose down/up, no health wait.
+    local files_only="${2:-false}"
     local snapshot_dir archive metadata_archive expected metadata_expected actual metadata_actual
     local restore_staging_root suffix temp_dir metadata_temp_dir failed_dir metadata_path
     local receipt_recovery_present="false"
@@ -11263,11 +11273,15 @@ database_restore_source_deploy_state() {
     # extracted source is recursively link-checked and hardened above; a stopped
     # full-tree replacement is the only publication that revokes every target
     # inode before the recovered root command executes.
-    if [[ "$preserve_running_proxy" == "true" ]]; then
+    if [[ "$files_only" == "true" ]]; then
+        info "No container has been touched; restoring the source deploy files only"
+    elif [[ "$preserve_running_proxy" == "true" ]]; then
         info "Protected source recovery requires a complete stack restart"
     fi
 
-    if $SUDO test -d "${INSTALL_DIR}/docker" \
+    if [[ "$files_only" == "true" ]]; then
+        :
+    elif $SUDO test -d "${INSTALL_DIR}/docker" \
         && ! $SUDO test -L "${INSTALL_DIR}/docker"; then
         # Reconstruct the invocation from the strictly validated source command
         # and use only extracted source configuration. No legacy script bytes
@@ -11288,13 +11302,69 @@ database_restore_source_deploy_state() {
     # snapshot even if SIGKILL lands while the target command/tree is renamed.
     # If a usable command still exists on re-entry, the idempotent down above
     # runs again to remove any partial or manually restarted stack first.
-    if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" != \
-        "deploy-stack-stopped" ]] \
-        && ! database_write_recovery_journal "deploy-stack-stopped"; then
-        warn "Complete target stack was removed, but its durable recovery phase could not be recorded."
-        return 1
+    # A files-only restore removed nothing, so there is no stack-stopped
+    # boundary to record; the journal stays at deploy-files-mutating and a
+    # re-entry repeats this idempotent restore from the same snapshot.
+    if [[ "$files_only" != "true" ]]; then
+        if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" != \
+            "deploy-stack-stopped" ]] \
+            && ! database_write_recovery_journal "deploy-stack-stopped"; then
+            warn "Complete target stack was removed, but its durable recovery phase could not be recorded."
+            return 1
+        fi
+        DATABASE_ROLLBACK_PROXY_STOPPED="true"
     fi
-    DATABASE_ROLLBACK_PROXY_STOPPED="true"
+    if [[ "$files_only" == "true" ]]; then
+        # In place: running containers may bind-mount paths under the docker
+        # tree, so no directory is renamed, removed-and-recreated or swapped.
+        # Directories keep their inode; target-only entries and type conflicts
+        # are deleted; file contents come from the checksummed snapshot.
+        if $SUDO test -d "${INSTALL_DIR}/docker" \
+            && ! $SUDO test -L "${INSTALL_DIR}/docker"; then
+            if ! database_prepare_in_place_docker_restore \
+                    "${temp_dir}/docker" "${INSTALL_DIR}/docker" \
+                || ! $SUDO cp -a "${temp_dir}/docker/." \
+                    "${INSTALL_DIR}/docker/"; then
+                warn "In-place source file restore failed."
+                return 1
+            fi
+        elif ! $SUDO test -e "${INSTALL_DIR}/docker" \
+            && $SUDO mv "${temp_dir}/docker" "${INSTALL_DIR}/docker"; then
+            :
+        else
+            warn "Target deploy tree is absent or unsafe; refusing in-place restore."
+            return 1
+        fi
+        if ! $SUDO mv "${temp_dir}/compose-command.sh" \
+            "${INSTALL_DIR}/compose-command.sh"; then
+            return 1
+        fi
+        if $SUDO test -f "${temp_dir}/compose-command.source.sh"; then
+            $SUDO mv "${temp_dir}/compose-command.source.sh" \
+                "${INSTALL_DIR}/compose-command.source.sh" || return 1
+        else
+            $SUDO rm -f "${INSTALL_DIR}/compose-command.source.sh" || return 1
+        fi
+        if $SUDO test -f "${temp_dir}/.version"; then
+            $SUDO mv "${temp_dir}/.version" "${INSTALL_DIR}/.version" \
+                || return 1
+        else
+            $SUDO rm -f "${INSTALL_DIR}/.version" || return 1
+        fi
+        $SUDO mv "${metadata_temp_dir}/install.json" "$metadata_path" \
+            || return 1
+        if ! deploy_harden_recovered_tree "$INSTALL_DIR"; then
+            warn "Published source deploy tree failed its final protection check."
+            return 1
+        fi
+        database_discard_restore_staging || return 1
+        if ! database_discard_source_deploy_snapshot; then
+            warn "Exact source recovery completed, but its durable snapshot cleanup did not finish."
+            return 1
+        fi
+        info "Exact source deploy files restored in place after rollback failure"
+        return 0
+    fi
     suffix="$(installer_private_staging_suffix)" || return 1
     failed_dir="${INSTALL_DIR}/.rollback-failed-deploy-${suffix}"
     if $SUDO test -e "$failed_dir"; then
@@ -11373,16 +11443,18 @@ database_restore_source_deploy_state() {
         return 1
     fi
 
-    if ! database_run_trusted_recovered_compose \
-        "$INSTALL_DIR" "$DATABASE_ROLLBACK_SOURCE_VERSION" \
-        up -d >> "$LOG_FILE" 2>&1; then
-        warn "Exact source deploy state was restored, but its full stack did not restart."
-        return 1
-    fi
-    DATABASE_ROLLBACK_PROXY_STOPPED="false"
-    if ! database_wait_for_source_stack_healthy; then
-        warn "Exact source deploy stack restarted but did not become healthy; durable recovery state is retained."
-        return 1
+    if [[ "$files_only" != "true" ]]; then
+        if ! database_run_trusted_recovered_compose \
+            "$INSTALL_DIR" "$DATABASE_ROLLBACK_SOURCE_VERSION" \
+            up -d >> "$LOG_FILE" 2>&1; then
+            warn "Exact source deploy state was restored, but its full stack did not restart."
+            return 1
+        fi
+        DATABASE_ROLLBACK_PROXY_STOPPED="false"
+        if ! database_wait_for_source_stack_healthy; then
+            warn "Exact source deploy stack restarted but did not become healthy; durable recovery state is retained."
+            return 1
+        fi
     fi
     if ! database_discard_source_deploy_snapshot; then
         warn "Exact source recovery completed, but its durable snapshot cleanup did not finish."
@@ -11445,6 +11517,7 @@ database_query_migration_version() {
 
 database_quiesce_proxy() {
     [[ "$DATABASE_ROLLBACK_PROXY_STOPPED" != "true" ]] || return 0
+    DEPLOY_CONTAINERS_TOUCHED="true"
     if ! installer_run_live_compose stop proxy >> "$LOG_FILE" 2>&1; then
         fail "Could not stop the proxy before the database recovery snapshot."
         return 1
@@ -12630,6 +12703,14 @@ database_probe_volume_budget() {
 # docs/runbooks/database-rollback.md.
 DATABASE_IN_PLACE_MIGRATION_CHURN_BYTES=$(( 2 * 1024 * 1024 * 1024 ))
 
+# What the target's image pull will write to the same filesystem as the database
+# volume, computed by database_preflight_forward_upgrade_headroom BEFORE the
+# pull (#2466). Added to `required` below. Zero once the images are on disk.
+DEPLOY_PULL_REQUIRED_BYTES=0
+# "true" when the pull's size was determined without pulling; otherwise the
+# gate is repeated after deploy_pull_images, before any stack mutation.
+DEPLOY_PULL_SIZE_KNOWN="false"
+
 database_require_in_place_upgrade_headroom() {
     local budget free_bytes total_bytes wal_bytes reserve_bytes data_directory
     local churn_bytes required_bytes releasable_bytes=0
@@ -12652,7 +12733,8 @@ database_require_in_place_upgrade_headroom() {
     read -r free_bytes total_bytes wal_bytes reserve_bytes data_directory \
         <<< "$budget"
     churn_bytes="$DATABASE_IN_PLACE_MIGRATION_CHURN_BYTES"
-    required_bytes=$(( wal_bytes + churn_bytes + reserve_bytes ))
+    required_bytes=$(( wal_bytes + churn_bytes + reserve_bytes \
+        + DEPLOY_PULL_REQUIRED_BYTES ))
 
     # Artifacts that can never validate again are free to reclaim. This is now
     # housekeeping rather than a precondition — the requirement above is small
@@ -12691,6 +12773,9 @@ database_require_in_place_upgrade_headroom() {
     fail "  WAL allowance: $(( wal_bytes / 1024 / 1024 )) MiB"
     fail "  Migration churn allowance: $(( churn_bytes / 1024 / 1024 )) MiB"
     fail "  Reserve kept free: $(( reserve_bytes / 1024 / 1024 )) MiB"
+    if (( DEPLOY_PULL_REQUIRED_BYTES > 0 )); then
+        fail "  Target image pull allowance: $(( DEPLOY_PULL_REQUIRED_BYTES / 1024 / 1024 )) MiB"
+    fi
     fail "  Required: $(( required_bytes / 1024 / 1024 )) MiB"
     fail "  Available: $(( free_bytes / 1024 / 1024 )) MiB"
     fail "  Short by: $(( (required_bytes - free_bytes) / 1024 / 1024 )) MiB"
@@ -13471,21 +13556,9 @@ database_prepare_forward_upgrade() {
         return 1
     fi
 
-    # Before the proxy stops: a headroom failure must cost zero downtime.
-    #
-    # It must still restore the source deploy tree. By the time this runs,
-    # run_deploy has already executed deploy_extract_files, deploy_upgrade_env,
-    # deploy_write_compose_command and deploy_pull_images, and journalled
-    # "deploy-mutating" — so docker-compose.yml, .env and compose-command.sh
-    # already point at the TARGET release while the OLD stack is still running.
-    # The systemd unit is `ExecStart=${INSTALL_DIR}/compose-command.sh up -d`,
-    # so a reboot or `systemctl restart llm-api-proxy` in that window would
-    # start the NEW binary and migrate the database outside this function's
-    # control. Restoring the source tree on refusal closes that window.
-    if ! database_require_in_place_upgrade_headroom; then
-        database_abort_rollback || true
-        return 1
-    fi
+    # The disk headroom gate no longer runs here: run_deploy runs it before
+    # the source snapshot and any file mutation (#2464), so a refusal has
+    # nothing to restore and never stops or recreates a container.
 
     # Probe the backup channel BEFORE anything is mutated (#2332).
     #
@@ -14831,7 +14904,14 @@ database_abort_rollback() {
     if [[ "${DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED:-false}" == "true" ]]; then
         if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == \
             "deploy-files-mutating" ]]; then
-            database_restore_source_deploy_state true
+            if [[ "$DEPLOY_CONTAINERS_TOUCHED" == "true" ]]; then
+                database_restore_source_deploy_state true
+                return $?
+            fi
+            # The phase is journalled before the first container is touched
+            # and replaced by deploy-mutating before any stop, recreate or
+            # migration, so the running stack never needs restarting.
+            database_restore_source_deploy_state true true
             return $?
         fi
         if [[ "${DATABASE_ROLLBACK_RECOVERY_PHASE:-}" == "staging" ]] \
@@ -15280,11 +15360,34 @@ deploy_write_database_image_override() {
 # (which carries the labels, including the database content-id). Identical for two images that differ only in their
 # manifest/index (attestations), which is exactly the difference between two
 # releases of the same database.
+# A caller that compares many images (deploy_reclaim_superseded_llap_images)
+# primes IMAGE_CONTENT_IDENTITY_CACHE in the current shell, because every
+# lookup runs in a command substitution and cannot fill it itself. Outside that
+# window the cache is empty and every call inspects.
+declare -gA IMAGE_CONTENT_IDENTITY_CACHE=()
 deploy_image_content_identity() {
     local data
+    if [[ -n "${IMAGE_CONTENT_IDENTITY_CACHE[$1]+x}" ]]; then
+        printf '%s\n' "${IMAGE_CONTENT_IDENTITY_CACHE[$1]}"
+        return 0
+    fi
+    local err_file rc=0
+    err_file=$(mktemp) || return 1
     data=$(installer_docker image inspect --format \
         '{{ json .RootFS.Layers }}|{{ json .Config }}' \
-        "$1" 2>> "$LOG_FILE") || return 1
+        "$1" 2>"$err_file") || rc=$?
+    cat "$err_file" >> "$LOG_FILE" 2>/dev/null || true
+    if (( rc != 0 )); then
+        # 2 = the image is simply not present locally (it can match nothing);
+        # 1 = the daemon could not answer, which is not the same thing.
+        if grep -Eiq 'no such (image|object)' "$err_file" 2>/dev/null; then
+            rm -f "$err_file"
+            return 2
+        fi
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
     [[ -n "$data" ]] || return 1
     sha256_stdin <<< "$data"
 }
@@ -15307,6 +15410,278 @@ image_matches_content() {
     image_content="$(deploy_image_content_identity "$image_id")" || return 1
     reference_content="$(deploy_image_content_identity "$reference")" || return 1
     [[ -n "$image_content" && "$image_content" == "$reference_content" ]]
+}
+
+# The registry namespace of every image this project publishes.
+DEPLOY_LLAP_IMAGE_REPOSITORY_PREFIX="ghcr.io/llm-api-proxy/"
+
+# deploy_reclaim_superseded_llap_images
+# Remove LLAP release images that no container uses and no release the installer
+# may still need refers to. Each upgrade pulls a full image set and nothing ever
+# removed the previous ones: llap.sy1 held 125 unreferenced images, ~28 GB, on
+# the same filesystem as the database volume, so the headroom gate refused an
+# upgrade for want of 400 MiB (#2465).
+#
+# KEEP-SET, compared by CONTENT (image_matches_content), never by ID (#2456):
+#   - every image of any container, running or stopped (`ps -a`), by both the
+#     image the container runs and the reference it was created from;
+#   - the images the installed Compose project renders;
+#   - the incoming release's target digests (RELEASE_*), and the receipt's
+#     recovery half (RELEASE_RECOVERY_*) - the running database can be that
+#     rollback half rather than the target, so BOTH halves are kept;
+#   - the incoming version's tags when no receipt lock names digests;
+#   - every image outside the LLAP namespace, and any ID that also carries a
+#     non-LLAP name, is never a candidate.
+# Removal is `image rm <ID>` without --force, one ID at a time (never a prune):
+# the daemon itself refuses an image a container still uses. If ANY keep-set
+# input cannot be read (container list or inspect, the Compose render, or the
+# inspection of a keep-set reference that is not simply absent) the reclaim
+# removes NOTHING, logs which source failed and returns 0: it is housekeeping,
+# never fatal, and the headroom gate then decides on the space there is.
+deploy_reclaim_superseded_llap_images() {
+    local listing cids container_images id repo ref size_bytes data
+    local compose_config compose_images identity_rc
+    local removed=0 freed_bytes=0 kept=0 candidate_count=0
+    local -a keep_refs=() unique_refs=() candidate_ids=()
+    local -A llap_ids=() other_ids=() seen_refs=()
+
+    if ! listing=$(installer_docker image ls --no-trunc \
+        --format '{{ .ID }} {{ .Repository }}' 2>> "$LOG_FILE"); then
+        warn "Could not list Docker images; superseded LLAP images were not reclaimed."
+        return 0
+    fi
+    while read -r id repo; do
+        [[ -n "$id" ]] || continue
+        if [[ "$repo" == "${DEPLOY_LLAP_IMAGE_REPOSITORY_PREFIX}"* ]]; then
+            llap_ids["$id"]=1
+        else
+            other_ids["$id"]=1
+        fi
+    done <<< "$listing"
+    for id in "${!llap_ids[@]}"; do
+        [[ -z "${other_ids[$id]+x}" ]] || continue
+        candidate_ids+=("$id")
+    done
+    candidate_count=${#candidate_ids[@]}
+    if (( candidate_count == 0 )); then
+        info "No LLAP release images to reclaim"
+        return 0
+    fi
+
+    # Containers, running or stopped.
+    if ! cids=$(installer_docker ps -a -q --no-trunc 2>> "$LOG_FILE"); then
+        warn "Could not list containers; superseded LLAP images were not reclaimed."
+        return 0
+    fi
+    if [[ -n "${cids//[[:space:]]/}" ]]; then
+        # shellcheck disable=SC2086  # Container IDs are whitespace-free hex.
+        if ! container_images=$(installer_docker inspect \
+            --format '{{ .Image }}{{ "\n" }}{{ .Config.Image }}' $cids \
+            2>> "$LOG_FILE"); then
+            warn "Could not inspect containers; superseded LLAP images were not reclaimed."
+            return 0
+        fi
+        while read -r ref; do
+            [[ -n "$ref" ]] && keep_refs+=("$ref")
+        done <<< "$container_images"
+    fi
+
+    # What the installed Compose project renders (best effort: the containers
+    # above already pin everything it runs).
+    # An unreadable render means the keep-set is incomplete: reclaim nothing.
+    if ! compose_config=$(installer_run_live_compose config --format json \
+            2>> "$LOG_FILE") \
+        || ! compose_images=$(jq -r '.services[]?.image // empty' \
+            <<< "$compose_config" 2>> "$LOG_FILE"); then
+        warn "Could not render the installed Compose configuration; superseded LLAP images were not reclaimed (the keep-set is incomplete)."
+        return 0
+    fi
+    while read -r ref; do
+        [[ -n "$ref" ]] && keep_refs+=("$ref")
+    done <<< "$compose_images"
+
+    # The incoming release and the receipt's recovery half.
+    for ref in "$RELEASE_SERVER_IMAGE" "$RELEASE_CLI_IMAGE" \
+        "$RELEASE_BACKUP_IMAGE" "$RELEASE_DATABASE_IMAGE" \
+        "$RELEASE_RECOVERY_SERVER_IMAGE" "$RELEASE_RECOVERY_CLI_IMAGE" \
+        "$RELEASE_RECOVERY_BACKUP_IMAGE" "$RELEASE_RECOVERY_DATABASE_IMAGE"; do
+        [[ -n "$ref" && "$ref" != "none" ]] && keep_refs+=("$ref")
+    done
+    if [[ -n "${OPT_VERSION:-}" ]]; then
+        for ref in server cli backup; do
+            keep_refs+=("${DEPLOY_LLAP_IMAGE_REPOSITORY_PREFIX}${ref}:${OPT_VERSION}")
+        done
+    fi
+
+    # Prime the content-identity cache in this shell: one inspection per
+    # reference and per candidate instead of one per pair. A reference that
+    # cannot be inspected is not a local image and cannot match one.
+    IMAGE_CONTENT_IDENTITY_CACHE=()
+    for ref in "${keep_refs[@]}"; do
+        [[ -z "${seen_refs[$ref]+x}" ]] || continue
+        seen_refs["$ref"]=1
+        unique_refs+=("$ref")
+        identity_rc=0
+        data=$(deploy_image_content_identity "$ref") || identity_rc=$?
+        if (( identity_rc == 0 )); then
+            IMAGE_CONTENT_IDENTITY_CACHE["$ref"]="$data"
+        elif (( identity_rc != 2 )); then
+            # Not "absent": the daemon failed to answer for a reference that
+            # protects an image. Never guess; remove nothing.
+            IMAGE_CONTENT_IDENTITY_CACHE=()
+            warn "Could not inspect ${ref} (container, Compose, incoming-target or rollback reference); superseded LLAP images were not reclaimed (the keep-set is incomplete)."
+            return 0
+        fi
+    done
+    local -a removable=()
+    for id in "${candidate_ids[@]}"; do
+        if ! data=$(deploy_image_content_identity "$id") || [[ -z "$data" ]]; then
+            # Cannot establish what it is: keep it.
+            kept=$(( kept + 1 ))
+            continue
+        fi
+        IMAGE_CONTENT_IDENTITY_CACHE["$id"]="$data"
+        local keep="false"
+        for ref in "${unique_refs[@]}"; do
+            if image_matches_content "$id" "$ref"; then
+                keep="true"
+                break
+            fi
+        done
+        if [[ "$keep" == "true" ]]; then
+            kept=$(( kept + 1 ))
+        else
+            removable+=("$id")
+        fi
+    done
+
+    for id in "${removable[@]}"; do
+        size_bytes=$(installer_docker image inspect --format '{{ .Size }}' "$id" \
+            2>> "$LOG_FILE") || size_bytes=0
+        [[ "$size_bytes" =~ ^[0-9]+$ ]] || size_bytes=0
+        if installer_docker image rm "$id" >> "$LOG_FILE" 2>&1; then
+            removed=$(( removed + 1 ))
+            freed_bytes=$(( freed_bytes + size_bytes ))
+            info "  Removed superseded LLAP image ${id} ($(( size_bytes / 1024 / 1024 )) MiB)"
+        else
+            kept=$(( kept + 1 ))
+            warn "  Could not remove LLAP image ${id}; it was kept."
+        fi
+    done
+    IMAGE_CONTENT_IDENTITY_CACHE=()
+    info "Reclaimed ${removed} superseded LLAP image(s), $(( freed_bytes / 1024 / 1024 )) MiB; kept ${kept} of ${candidate_count}"
+    return 0
+}
+
+# The read-only gates of a forward upgrade, run BEFORE the source snapshot, the
+# embedded-file extraction, the .env rewrite and the image pull (#2464).
+# A refusal here has nothing to restore: no file was written and no container
+# touched, so it never reaches database_restore_source_deploy_state (whose
+# `compose down` + `up -d` recreated every container, a 41 s outage, over a gate
+# that exists to protect the running stack). The gate needs only the live
+# database and the installed Compose project, both of which are the SOURCE
+# release's at this point - which is also the correct thing to measure.
+# True for the one case the forward-upgrade headroom gate applies to.
+database_forward_upgrade_headroom_applies() {
+    local installed_version
+    [[ "$COMMAND" == "upgrade" ]] || return 1
+    [[ -z "${OPT_ROLLBACK_BACKUP_ID:-}" ]] || return 1
+    installed_version=$(existing_install_version 2>/dev/null || true)
+    is_stable_semver "$installed_version" || return 1
+    is_stable_semver "$OPT_VERSION" || return 1
+    stable_semver_gt "$OPT_VERSION" "$installed_version" || return 1
+}
+
+# Compressed registry bytes are not disk bytes: layers unpack to about this
+# multiple of their transfer size.
+DEPLOY_IMAGE_PULL_EXPANSION_FACTOR=3
+
+# deploy_remote_image_transfer_bytes <reference>
+# The config + layer bytes of <reference> for this host's platform, from the
+# registry manifest, without pulling. Fails when it cannot be determined.
+deploy_remote_image_transfer_bytes() {
+    local ref="$1" manifest digest arch repo bytes
+    manifest=$(installer_docker manifest inspect "$ref" 2>> "$LOG_FILE") \
+        || return 1
+    if jq -e '(.layers | type) == "array"' <<< "$manifest" >/dev/null 2>&1; then
+        bytes=$(jq -r '(.config.size // 0) + ([.layers[].size] | add // 0)' \
+            <<< "$manifest" 2>> "$LOG_FILE") || return 1
+    else
+        case "$(uname -m)" in
+            x86_64|amd64) arch="amd64" ;;
+            aarch64|arm64) arch="arm64" ;;
+            *) arch="$(uname -m)" ;;
+        esac
+        digest=$(jq -r --arg arch "$arch" \
+            '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == $arch)][0].digest // empty' \
+            <<< "$manifest" 2>> "$LOG_FILE") || return 1
+        [[ -n "$digest" ]] || return 1
+        repo="${ref%%@*}"
+        [[ "${repo##*/}" != *:* ]] || repo="${repo%:*}"
+        manifest=$(installer_docker manifest inspect "${repo}@${digest}" \
+            2>> "$LOG_FILE") || return 1
+        bytes=$(jq -r '(.config.size // 0) + ([.layers[].size] | add // 0)' \
+            <<< "$manifest" 2>> "$LOG_FILE") || return 1
+    fi
+    [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]] || return 1
+    printf '%s\n' "$bytes"
+}
+
+# deploy_compute_pull_bytes_not_local
+# Sets DEPLOY_PULL_REQUIRED_BYTES / DEPLOY_PULL_SIZE_KNOWN: the disk the target
+# release's images will need that is not already present locally, known before
+# pulling only when a receipt lock names the exact references and the registry
+# answers for each missing one. Anything else is "unknown" (the gate is then
+# repeated after the pull).
+deploy_compute_pull_bytes_not_local() {
+    local ref transfer total=0
+    local -a refs=()
+    DEPLOY_PULL_REQUIRED_BYTES=0
+    DEPLOY_PULL_SIZE_KNOWN="false"
+    if [[ "$RELEASE_IMAGE_LOCK_ACTIVE" != "true" ]]; then
+        info "Target image size is not knowable before the pull; the headroom gate is repeated after it"
+        return 0
+    fi
+    [[ -n "${RELEASE_SERVER_IMAGE:-}" ]] && refs+=("$RELEASE_SERVER_IMAGE")
+    [[ "$OPT_BACKUP" == "true" && -n "${RELEASE_BACKUP_IMAGE:-}" ]] \
+        && refs+=("$RELEASE_BACKUP_IMAGE")
+    [[ -n "${RELEASE_DATABASE_IMAGE:-}" && "$RELEASE_DATABASE_IMAGE" != "none" ]] \
+        && refs+=("$RELEASE_DATABASE_IMAGE")
+    for ref in "${refs[@]}"; do
+        if installer_docker image inspect "$ref" >/dev/null 2>&1; then
+            continue
+        fi
+        if ! transfer=$(deploy_remote_image_transfer_bytes "$ref"); then
+            info "Could not size ${ref} before the pull; the headroom gate is repeated after it"
+            return 0
+        fi
+        total=$(( total + transfer * DEPLOY_IMAGE_PULL_EXPANSION_FACTOR ))
+    done
+    DEPLOY_PULL_REQUIRED_BYTES="$total"
+    DEPLOY_PULL_SIZE_KNOWN="true"
+    info "Target images not yet local need about $(( total / 1024 / 1024 )) MiB on disk"
+}
+
+database_preflight_forward_upgrade_headroom() {
+    database_forward_upgrade_headroom_applies || return 0
+    deploy_reclaim_superseded_llap_images \
+        || warn "Superseded LLAP images could not be reclaimed."
+    deploy_compute_pull_bytes_not_local
+    database_require_in_place_upgrade_headroom
+}
+
+# The same gate, repeated once the images are on disk, ALWAYS (a known-size
+# estimate gates early but is not an upper bound). Runs before any stop, recreate or migration of the stack;
+# the pull has already consumed its space, so nothing more is added.
+database_recheck_forward_upgrade_headroom_after_pull() {
+    database_forward_upgrade_headroom_applies || return 0
+    # Always: the pre-pull estimate (3x transfer size) is not an upper bound.
+    [[ "$DEPLOY_PULL_SIZE_KNOWN" != "true" ]] \
+        || info "Re-checking headroom against the real post-pull disk (the pre-pull size was an estimate)"
+    # The explicit rollback-artifact release was honoured by the first run.
+    local OPT_RELEASE_ROLLBACK_ARTIFACT=""
+    DEPLOY_PULL_REQUIRED_BYTES=0
+    database_require_in_place_upgrade_headroom
 }
 
 # deploy_timescaledb_unchanged_but_for_image_ref <hashes> <images>
@@ -17351,6 +17726,11 @@ run_deploy() {
     # Compose/.env mutation for both stable forward upgrades and database-backed
     # rollbacks. Recovery reassigns the archived legacy metadata to the current
     # platform authority before publication.
+    # Every read-only gate runs first: a refusal must leave the tree, the .env
+    # and every container exactly as they were (#2464).
+    database_preflight_forward_upgrade_headroom \
+        || die "The upgrade was refused before anything was changed; the installation and the proxy are untouched."
+
     if database_source_snapshot_required_for_deploy; then
         database_snapshot_source_deploy_state
     fi
@@ -17391,7 +17771,11 @@ run_deploy() {
     deploy_verify_bind_mounts
     ghcr_login
     deploy_pull_images
+    database_recheck_forward_upgrade_headroom_after_pull \
+        || die "The upgrade was refused after the image pull and before the running stack was touched."
     deploy_verify_locked_images
+    # Everything from here may stop, recreate or migrate the running stack.
+    DEPLOY_CONTAINERS_TOUCHED="true"
     if [[ "$DATABASE_ROLLBACK_DEPLOY_RESTORE_REQUIRED" == "true" ]] \
         && ! database_write_recovery_journal "deploy-mutating"; then
         die "Could not persist the runtime-mutation recovery boundary."
