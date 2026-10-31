@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.210"
+INSTALLER_VERSION="0.0.211"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -6294,7 +6294,9 @@ configure_tls() {
     # In non-interactive mode, TLS requires --domain= to be set.
     # Without it, disable TLS rather than dying — the user can reconfigure later.
     if [[ "$OPT_NON_INTERACTIVE" == "true" ]] && [[ -z "${OPT_DOMAIN:-}" ]]; then
-        if [[ ! -f "${INSTALL_DIR:-}/docker/.env" ]] || ! $SUDO grep -q "^PROXY_TLS__DOMAIN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null; then
+        # $SUDO test, not [[ -f ]]: a sudo (non-root) upgrade cannot see the
+        # root-only managed .env, and must keep TLS exactly as root does.
+        if ! $SUDO test -f "${INSTALL_DIR:-}/docker/.env" 2>/dev/null || ! $SUDO grep -q "^PROXY_TLS__DOMAIN=" "${INSTALL_DIR}/docker/.env" 2>/dev/null; then
             warn "TLS disabled — no --domain= provided. Reconfigure with: install.sh reconfigure --domain=your.host"
             OPT_TLS="false"
             return 0
@@ -8164,12 +8166,13 @@ CF_AUTH_KEYS
 # Respects CLI flags and env vars — does NOT override them.
 load_debug_state_from_env() {
     local env_file="${INSTALL_DIR}/docker/.env"
-    [[ -f "$env_file" ]] || return 0
+    # The managed .env is root-only; a sudo (non-root) run reads it via $SUDO.
+    $SUDO test -f "$env_file" 2>/dev/null || return 0
 
     # Read persisted values (|| true prevents set -e exit when key is absent)
     local persisted_debug persisted_profile
-    persisted_debug=$(grep -E '^PROXY_DEBUG=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-    persisted_profile=$(grep -E '^PROXY_DEBUG_PROFILE=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    persisted_debug=$($SUDO grep -E '^PROXY_DEBUG=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    persisted_profile=$($SUDO grep -E '^PROXY_DEBUG_PROFILE=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
 
     # Apply persisted debug flag only if not overridden by CLI or env var
     if [[ "$OPT_DEBUG" == "false" && "$OPT_NO_DEBUG" == "false" && -n "$persisted_debug" ]]; then
@@ -8230,9 +8233,9 @@ warn_debug_mode() {
 # which only appends missing keys — we need to UPDATE and REMOVE too).
 deploy_upgrade_debug_state() {
     local env_file="${INSTALL_DIR}/docker/.env"
-    [[ -f "$env_file" ]] || return 0
+    $SUDO test -f "$env_file" 2>/dev/null || return 0
 
-    if grep -qE '^PROXY_DEBUG=' "$env_file"; then
+    if $SUDO grep -qE '^PROXY_DEBUG=' "$env_file"; then
         # Update existing key
         $SUDO sed -i "s|^PROXY_DEBUG=.*|PROXY_DEBUG=${OPT_DEBUG}|" "$env_file"
     else
@@ -8241,14 +8244,14 @@ deploy_upgrade_debug_state() {
     fi
 
     if [[ "$OPT_DEBUG" == "true" ]]; then
-        if grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
+        if $SUDO grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
             $SUDO sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}|" "$env_file"
         else
             echo "PROXY_DEBUG_PROFILE=${OPT_DEBUG_PROFILE}" | $SUDO tee -a "$env_file" > /dev/null
         fi
     else
         # Clear profile when disabling debug (prevent stale state)
-        if grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
+        if $SUDO grep -qE '^PROXY_DEBUG_PROFILE=' "$env_file"; then
             $SUDO sed -i "s|^PROXY_DEBUG_PROFILE=.*|PROXY_DEBUG_PROFILE=|" "$env_file"
         else
             # Append empty profile key so future loads have a consistent key present
@@ -8648,13 +8651,17 @@ installer_run_live_compose() {
 }
 
 deploy_backup_compose_files() {
-    if [[ ! -d "${INSTALL_DIR}/docker" ]]; then
+    # The install root is root-only: test and glob through $SUDO so a sudo
+    # (non-root) upgrade backs up exactly what a root run does.
+    if ! $SUDO test -d "${INSTALL_DIR}/docker" 2>/dev/null; then
         return 0
     fi
     local backup_dir
     backup_dir="${INSTALL_DIR}/compose-backup-$(date +%Y%m%d-%H%M%S)"
     $SUDO mkdir -p "$backup_dir"
-    $SUDO cp "${INSTALL_DIR}"/docker/docker-compose*.yml "$backup_dir/" 2>/dev/null || true
+    $SUDO /usr/bin/find "${INSTALL_DIR}/docker" -mindepth 1 -maxdepth 1 \
+        -name 'docker-compose*.yml' -type f \
+        -exec cp {} "$backup_dir/" \; 2>/dev/null || true
     $SUDO cp "${INSTALL_DIR}/compose-command.sh" "$backup_dir/" 2>/dev/null || true
     info "Compose files backed up to ${backup_dir}"
 }
@@ -9729,6 +9736,44 @@ installer_late_ca_pin_matches_served_ca() {
     [[ "$FORWARD_PROXY_CA_SERVED_FINGERPRINT" == "$pin" ]]
 }
 
+# A sudo (non-root) upgrade by an installer without the configure_tls $SUDO
+# fix could not see the root-only .env, disabled TLS in memory and wrote
+# PROXY_TLS__ENABLED=false, while compose_active_overlays re-included the TLS
+# overlay from .env evidence (#1869) and that overlay sets the proxy's
+# PROXY_TLS__ENABLED=true. Recognise exactly that installer-authored shape —
+# one canonical `PROXY_TLS__ENABLED=false` line, a non-empty PROXY_TLS__DOMAIN,
+# the TLS overlay in the canonical list and a rendered proxy value of exactly
+# `true` — so the next upgrade (which rewrites the key to true) can converge.
+# Every other key is still compared by the caller.
+installer_source_env_tls_enabled_overlay_drift() {
+    local root="${1%/}" config_json="$2" env_json="$3" tls_overlay="$4"
+    local env_file="${root}/docker/.env" count
+    [[ "$tls_overlay" == "true" ]] || return 1
+    if ! $SUDO test -f "$env_file" || $SUDO test -L "$env_file"; then
+        return 1
+    fi
+    # Count every spelling Compose accepts, so a second definition cannot hide.
+    count="$(
+        $SUDO grep -Ec \
+            '^[[:space:]]*(export[[:space:]]+)?PROXY_TLS__ENABLED[[:space:]]*=' \
+            "$env_file" 2>/dev/null || true
+    )"
+    [[ "$count" == "1" ]] || return 1
+    $SUDO grep -Fxq 'PROXY_TLS__ENABLED=false' "$env_file" 2>/dev/null \
+        || return 1
+    {
+        printf '%s\n' "$config_json"
+        printf '%s\n' "$env_json"
+    } | jq -se '
+        .[0] as $compose |
+        .[1] as $raw_env |
+        ($raw_env.PROXY_TLS__ENABLED == "false") and
+        (($raw_env.PROXY_TLS__DOMAIN // "") | type == "string" and
+          length > 0) and
+        ($compose.services.proxy.environment.PROXY_TLS__ENABLED == "true")
+    ' >/dev/null 2>&1
+}
+
 database_validate_rendered_service_against_running_stack() {
     local config_json="$1" expected_config_files="$2"
     local expected_service="$3" compare_dns="$4" late_ca_pin="${5:-}"
@@ -9865,11 +9910,34 @@ database_validate_rendered_service_against_running_stack() {
     ' >/dev/null 2>&1
 }
 
+# Every raw .env key/value must survive rendering unchanged (see the caller).
+# $3 names at most one key the caller has already authenticated as excusable.
+database_validate_raw_env_survives_rendering() {
+    local config_json="$1" env_json="$2" excused_key="$3"
+    {
+        printf '%s\n' "$config_json"
+        printf '%s\n' "$env_json"
+    } | jq -se --arg excused "$excused_key" '
+        .[0] as $compose |
+        .[1] as $raw_env |
+        ($raw_env | to_entries |
+          all(.[];
+            . as $entry |
+            ($excused != "" and $entry.key == $excused) or
+            ($compose.services.traefik.environment[$entry.key] ==
+              $entry.value) or
+            ($entry.key != "CONSUL_HTTP_TOKEN" and
+              $compose.services.proxy.environment[$entry.key] ==
+                $entry.value)))
+    ' >/dev/null 2>&1
+}
+
 database_validate_staged_compose_against_running_stack() {
     local root="${1%/}" source_version="$2"
     local image_lock_destination="${3:-}"
     local config_json env_json expected_config_files="" overlays_output
     local overlay include_receipt="false" backup_enabled="false"
+    local tls_overlay="false" excused_env_key=""
     local source_command="${root}/compose-command.sh" late_ca_pin=""
     local -a overlays=()
     if $SUDO test -f "${root}/compose-command.source.sh"; then
@@ -9885,6 +9953,8 @@ database_validate_staged_compose_against_running_stack() {
     for overlay in "${overlays[@]}"; do
         [[ "$overlay" != "docker-compose.backup.yml" ]] \
             || backup_enabled="true"
+        [[ "$overlay" != "docker-compose.tls.yml" ]] \
+            || tls_overlay="true"
         if [[ -n "$expected_config_files" ]]; then
             expected_config_files+=","
         fi
@@ -9945,21 +10015,18 @@ database_validate_staged_compose_against_running_stack() {
     # key now survives in Traefik, or in the proxy, which consumes the
     # complete .env except its renamed-key override: CONSUL_HTTP_TOKEN (the
     # proxy's carries PROXY_CONSUL_TOKEN) must survive in Traefik itself.
-    {
-        printf '%s\n' "$config_json"
-        printf '%s\n' "$env_json"
-    } | jq -se '
-        .[0] as $compose |
-        .[1] as $raw_env |
-        ($raw_env | to_entries |
-          all(.[];
-            . as $entry |
-            ($compose.services.traefik.environment[$entry.key] ==
-              $entry.value) or
-            ($entry.key != "CONSUL_HTTP_TOKEN" and
-              $compose.services.proxy.environment[$entry.key] ==
-                $entry.value)))
-    ' >/dev/null 2>&1 || return 1
+    # The one excusable key is the installer-authored PROXY_TLS__ENABLED=false
+    # under the TLS overlay (installer_source_env_tls_enabled_overlay_drift).
+    if ! database_validate_raw_env_survives_rendering \
+            "$config_json" "$env_json" ""; then
+        installer_source_env_tls_enabled_overlay_drift \
+            "$root" "$config_json" "$env_json" "$tls_overlay" || return 1
+        excused_env_key="PROXY_TLS__ENABLED"
+        database_validate_raw_env_survives_rendering \
+            "$config_json" "$env_json" "$excused_env_key" || return 1
+        printf 'Captured source model: accepted the installer-authored PROXY_TLS__ENABLED=false in .env while the canonical TLS overlay renders the proxy with PROXY_TLS__ENABLED=true (sudo-upgrade configure_tls defect); this upgrade rewrites .env with PROXY_TLS__ENABLED=true.\n' \
+            >> "$LOG_FILE"
+    fi
     if ! database_validate_rendered_service_against_running_stack \
             "$config_json" "$expected_config_files" proxy true \
         || ! database_validate_rendered_service_against_running_stack \
@@ -16983,9 +17050,9 @@ deploy_consul_acl_bootstrap() {
     # after the `=`. If the gate does NOT pass we fall through to the reconciler,
     # which runs its own LIVE traefik/ write probe (presence is never trust — it
     # re-mints only when the probe fails).
-    if grep -qE "^CONSUL_HTTP_TOKEN=.+" "$env_file" 2>/dev/null && \
-       grep -qE "^BACKUP_CONSUL_HTTP_TOKEN=.+" "$env_file" 2>/dev/null && \
-       grep -qE "^PROXY_BACKUP_CONSUL_TOKEN=.+" "$env_file" 2>/dev/null; then
+    if $SUDO grep -qE "^CONSUL_HTTP_TOKEN=.+" "$env_file" 2>/dev/null && \
+       $SUDO grep -qE "^BACKUP_CONSUL_HTTP_TOKEN=.+" "$env_file" 2>/dev/null && \
+       $SUDO grep -qE "^PROXY_BACKUP_CONSUL_TOKEN=.+" "$env_file" 2>/dev/null; then
         info "Consul ACL tokens already present — running reconciler to validate + seed"
     fi
 
