@@ -1,12 +1,12 @@
 # LLAP — The Tactical LLM API Proxy for Secure Orchestration
 
-[![Version](https://img.shields.io/badge/version-0.0.212-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.212)
+[![Version](https://img.shields.io/badge/version-0.0.213-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.213)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-llm--api--proxy.com-informational)](https://llm-api-proxy.com)
 
 **LLAP** is a multi-tenant LLM API proxy that centralises credential management, enforces RBAC, and provides observability across all LLM traffic — without touching your application code.
 
-> Release **v0.0.212** · 2026-11-01T19:06:10Z · `f5018caff768083f4407d3df82b89fa2d2436ff2`
+> Release **v0.0.213** · 2026-11-02T08:31:13Z · `2816944c2d1da5d2cad54646f52c10516a30679f`
 
 ---
 
@@ -32,7 +32,7 @@ cleanup_install() {
 trap cleanup_install EXIT
 base_url="https://llm-api-proxy.com"
 # GitHub fallback for this release:
-# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212"
+# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213"
 
 command -v gpg >/dev/null 2>&1 || {
   printf '%s\n' 'Install GnuPG first (macOS: brew install gnupg; Linux: use your package manager).' >&2
@@ -162,6 +162,48 @@ execution.
 
 ---
 
+## Upgrading a digest-locked installation
+
+If the signed installer above reports `This digest-locked installation requires a signed-receipt-bound version change.`, use the receipt-bound upgrade path below. A plain (non-digest-locked) installation upgrades with the installer block above.
+
+Bootstrap the public integrity wrapper and its receipt trust anchor for this release. Verify the signed checksum manifest's `VALIDSIG` against the pinned release fingerprint before checking the wrapper and anchor hashes:
+
+```bash
+(
+set -euo pipefail
+base="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213"
+for artifact in release-signing.pub.asc SHA256SUMS SHA256SUMS.sig \
+  installer-release-integrity.sh publication-receipt-signing.pub.asc; do
+  curl --disable --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --max-time 30 \
+    --output "$artifact" "${base}/${artifact}"
+done
+GNUPGHOME="$(mktemp -d)" && chmod 0700 "$GNUPGHOME" && export GNUPGHOME
+gpg --batch --import release-signing.pub.asc
+gpg --batch --status-fd 1 --verify SHA256SUMS.sig SHA256SUMS \
+  | awk -v fpr=4F2BBCD92F7AEC826BF4C156D6443D2B4B6AB71F \
+    '$2 == "VALIDSIG" && ($3 == fpr || $NF == fpr) { ok = 1 } END { exit !ok }' \
+  || { printf '%s\n' 'SHA256SUMS signature is not valid for the pinned release key' >&2; exit 1; }
+awk '$2 == "installer-release-integrity.sh" ||
+  $2 == "publication-receipt-signing.pub.asc"' \
+  SHA256SUMS | sha256sum --check --strict
+chmod 0700 installer-release-integrity.sh
+chmod 0600 publication-receipt-signing.pub.asc
+)
+```
+
+The signed publication receipt for the target release is required and is issued by the release operator; obtain that receipt from the release operator. Then stage the public bundle and run the receipt-bound upgrade:
+
+```bash
+./installer-release-integrity.sh download-public \
+  <tag> <bundle-dir>
+./installer-release-integrity.sh run-evidence-verified \
+  <bundle-dir> <signed-receipt.asc> <tag> \
+  upgrade --version=<version>
+```
+
+---
+
 ## Quick Start — Docker Compose
 
 Manual compose setup:
@@ -182,16 +224,16 @@ Pre-built binaries are available for all supported platforms:
 
 | Platform | Download |
 |---|---|
-| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212/llap-linux-amd64) |
-| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212/llap-linux-arm64) |
-| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212/llap-darwin-amd64) |
-| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212/llap-darwin-arm64) |
+| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213/llap-linux-amd64) |
+| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213/llap-linux-arm64) |
+| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213/llap-darwin-amd64) |
+| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213/llap-darwin-arm64) |
 
 Verify the checksum after downloading:
 
 ```bash
 # Download the checksum file
-curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.212/llap-SHA256SUMS -o llap-SHA256SUMS
+curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.213/llap-SHA256SUMS -o llap-SHA256SUMS
 
 # Verify (Linux / macOS with sha256sum)
 sha256sum --check --ignore-missing llap-SHA256SUMS
@@ -215,23 +257,23 @@ All images are published to the GitHub Container Registry:
 
 | Image | Tag |
 |---|---|
-| `ghcr.io/llm-api-proxy/server:0.0.212` | Proxy server |
-| `ghcr.io/llm-api-proxy/cli:0.0.212` | Management CLI |
-| `ghcr.io/llm-api-proxy/backup:0.0.212` | Restic backup agent |
+| `ghcr.io/llm-api-proxy/server:0.0.213` | Proxy server |
+| `ghcr.io/llm-api-proxy/cli:0.0.213` | Management CLI |
+| `ghcr.io/llm-api-proxy/backup:0.0.213` | Restic backup agent |
 
 ### Tag Conventions
 
 | Tag | Meaning |
 |---|---|
 | `latest` | Most recent stable release |
-| `0.0.212` | Exact version (e.g. `1.2.3`) |
+| `0.0.213` | Exact version (e.g. `1.2.3`) |
 | `X.Y` | Latest patch for this minor (e.g. `1.2`) |
 | `X` | Latest minor for this major (e.g. `1`) |
 
 Pull a specific version to avoid unexpected upgrades:
 
 ```bash
-docker pull ghcr.io/llm-api-proxy/server:0.0.212
+docker pull ghcr.io/llm-api-proxy/server:0.0.213
 ```
 
 ---

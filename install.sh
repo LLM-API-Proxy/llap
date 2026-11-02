@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.212"
+INSTALLER_VERSION="0.0.213"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -191,7 +191,9 @@ cleanup() {
         echo "Re-run install.sh to resume."
         echo ""
     fi
-    release_installer_single_flight_lock
+    if declare -F release_installer_single_flight_lock >/dev/null 2>&1; then
+        release_installer_single_flight_lock || true
+    fi
 }
 # Register signal traps for real execution only. A leaked EXIT trap interferes
 # with BATS' test teardown/reporting (see the strict-mode guard above).
@@ -203,13 +205,13 @@ fi
 
 # ── Colour output ────────────────────────────────────────────────────────────
 if [[ -t 1 ]] && command -v tput &>/dev/null; then
-    RED=$(tput setaf 1)
-    GREEN=$(tput setaf 2)
-    YELLOW=$(tput setaf 3)
+    RED=$(tput setaf 1 2>/dev/null || true)
+    GREEN=$(tput setaf 2 2>/dev/null || true)
+    YELLOW=$(tput setaf 3 2>/dev/null || true)
     # shellcheck disable=SC2034  # BLUE used by phase functions appended by build-installer.sh
-    BLUE=$(tput setaf 4)
-    BOLD=$(tput bold)
-    RESET=$(tput sgr0)
+    BLUE=$(tput setaf 4 2>/dev/null || true)
+    BOLD=$(tput bold 2>/dev/null || true)
+    RESET=$(tput sgr0 2>/dev/null || true)
 else
     RED="" GREEN="" YELLOW=""
     # shellcheck disable=SC2034
