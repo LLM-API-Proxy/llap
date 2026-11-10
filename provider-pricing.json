@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-10-01T00:00:00Z",
+  "generated_at": "2026-11-10T00:00:00Z",
   "entries": [
     {
       "provider_type": "anthropic",
@@ -89,6 +89,19 @@
       "us_inference_geo_multiplier": "1.1000",
       "web_search_per_request_usd": "0.010000",
       "notes": "claude-fable-5-1 (Claude Fable 5.1, claude-cli 2.1.260 primary, released 2026-09-01); Anthropic published model page (platform.claude.com/docs/en/models/fable-5-1/overview, fetched 2026-09-23): $10 / $50 per MTok, cache read $0.25 (a quarter of Fable 5's $1.00), 5-minute cache write $12.50, 1-hour cache write $20.00 used for cache_write_1h_per_million_usd (differential 1h/5m cache-write pricing landed in #2108/#2138/#2153). Dedicated row so the slug no longer prefix-matches claude-fable-5; seeded by migration 0147 for issue #2141; 1h rate added by migration 0149. #2160/migration 0150: rates above mirror the 0150 seeds exactly (fast cache/1h derived from the published fast base and stacking multipliers; US multiplier 1.1 only on Claude 4.6+; hosted web search $10 / 1,000)."
+    },
+    {
+      "provider_type": "anthropic",
+      "model": "claude-fable-5-2",
+      "effective_from": "2026-11-09T00:00:00Z",
+      "input_per_million_usd": "8.000000",
+      "output_per_million_usd": "40.000000",
+      "cache_read_per_million_usd": "0.200000",
+      "cache_create_per_million_usd": "10.000000",
+      "cache_write_1h_per_million_usd": "16.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-fable-5-2 (Claude Fable 5.2, released 2026-11-09; the 2.1.322 pin's verified wire surface \u2014 typed /model claude-fable-5-2 passed the server-side model check and answered a main and a thinking turn HTTP 200 on the real consumer surface, docs/reference/claude-code-2.1.322-wire-capture.md D8); Anthropic pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-11-10): $8 / $40 per MTok (20% below Fable 5.1 \u2014 the family's first price cut), 5-minute cache write $10, 1-hour cache write $16, cache read $0.20 (0.025x input). Dedicated row so the slug never prefix-matches claude-fable-5 (whose $1.00 cache read would over-bill 5x); seeded by migration 0254. US-inference 1.1x (Claude 4.6+) and hosted web search $10/1,000 follow the 0150 convention."
     },
     {
       "provider_type": "anthropic",
@@ -317,6 +330,19 @@
       "us_inference_geo_multiplier": "1.1000",
       "web_search_per_request_usd": "0.010000",
       "notes": "claude-mythos-5-1 (Claude Mythos 5.1, limited availability); Anthropic pricing page (platform.claude.com/docs/en/about-claude/pricing, fetched 2026-09-26): $10 / $50 per MTok, cache read $0.25 (0.025x), 5-minute cache write $12.50, 1-hour cache write $20. effective_from is the source OBSERVATION date, not a vendor launch date. Seeded by migration 0150 for issue #2160."
+    },
+    {
+      "provider_type": "anthropic",
+      "model": "claude-mythos-5-2",
+      "effective_from": "2026-11-09T00:00:00Z",
+      "input_per_million_usd": "8.000000",
+      "output_per_million_usd": "40.000000",
+      "cache_read_per_million_usd": "0.200000",
+      "cache_create_per_million_usd": "10.000000",
+      "cache_write_1h_per_million_usd": "16.000000",
+      "us_inference_geo_multiplier": "1.1000",
+      "web_search_per_request_usd": "0.010000",
+      "notes": "claude-mythos-5-2 (Claude Mythos 5.2, limited availability \u2014 organizations verified through Anthropic's verification programs); shares Claude Fable 5.2's specifications and pricing per the pricing page and the fable-5-2 model overview (fetched 2026-11-10): $8 / $40 per MTok, 5-minute cache write $10, 1-hour cache write $16, cache read $0.20. Dedicated row so the slug never prefix-matches claude-mythos-5; seeded by migration 0254 alongside claude-fable-5-2."
     },
     {
       "provider_type": "openai",
@@ -773,7 +799,7 @@
       "output_per_million_usd": "18.000000",
       "cache_read_per_million_usd": "1.500000",
       "cache_create_per_million_usd": "0.000000",
-      "notes": "OpenAI Codex — no cache creation charge"
+      "notes": "OpenAI Codex \u2014 no cache creation charge"
     },
     {
       "provider_type": "openai_codex",
@@ -906,7 +932,7 @@
       "output_per_million_usd": "2.000000",
       "cache_read_per_million_usd": "0.025000",
       "cache_create_per_million_usd": "0.000000",
-      "notes": "OpenAI Codex gpt-5-codex-mini (deprecated id) — replacement-reference equivalent of its mandatory successor gpt-5.1-codex-mini at the same published rate, not an exact historical PAYG rate for the deprecated id. Seeded by migration 0140 for issue #1616"
+      "notes": "OpenAI Codex gpt-5-codex-mini (deprecated id) \u2014 replacement-reference equivalent of its mandatory successor gpt-5.1-codex-mini at the same published rate, not an exact historical PAYG rate for the deprecated id. Seeded by migration 0140 for issue #1616"
     },
     {
       "provider_type": "openai_codex",
