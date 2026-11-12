@@ -1,12 +1,12 @@
 # LLAP — The Tactical LLM API Proxy for Secure Orchestration
 
-[![Version](https://img.shields.io/badge/version-0.0.220-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.220)
+[![Version](https://img.shields.io/badge/version-0.0.221-blue)](https://github.com/LLM-API-Proxy/llap/releases/tag/v0.0.221)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Website](https://img.shields.io/badge/website-llm--api--proxy.com-informational)](https://llm-api-proxy.com)
 
 **LLAP** is a multi-tenant LLM API proxy that centralises credential management, enforces RBAC, and provides observability across all LLM traffic — without touching your application code.
 
-> Release **v0.0.220** · 2026-11-12T00:13:52Z · `ebb0ae4ffff378d2dc64b6c22317d811d86e9563`
+> Release **v0.0.221** · 2026-11-12T06:40:00Z · `a1032b8a615b493a952ffa1b07e77413afb0fef1`
 
 ---
 
@@ -32,7 +32,7 @@ cleanup_install() {
 trap cleanup_install EXIT
 base_url="https://llm-api-proxy.com"
 # GitHub fallback for this release:
-# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220"
+# base_url="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221"
 
 command -v gpg >/dev/null 2>&1 || {
   printf '%s\n' 'Install GnuPG first (macOS: brew install gnupg; Linux: use your package manager).' >&2
@@ -171,7 +171,7 @@ Bootstrap the public integrity wrapper and its receipt trust anchor for this rel
 ```bash
 (
 set -euo pipefail
-base="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220"
+base="https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221"
 for artifact in release-signing.pub.asc SHA256SUMS SHA256SUMS.sig \
   installer-release-integrity.sh publication-receipt-signing.pub.asc; do
   curl --disable --fail --silent --show-error --location \
@@ -224,16 +224,18 @@ Pre-built binaries are available for all supported platforms:
 
 | Platform | Download |
 |---|---|
-| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220/llap-linux-amd64) |
-| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220/llap-linux-arm64) |
-| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220/llap-darwin-amd64) |
-| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220/llap-darwin-arm64) |
+| Linux x86-64 | [llap-linux-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-linux-amd64) |
+| Linux ARM64 | [llap-linux-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-linux-arm64) |
+| macOS x86-64 | [llap-darwin-amd64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-darwin-amd64) |
+| macOS ARM64 (Apple Silicon) | [llap-darwin-arm64](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-darwin-arm64) |
+| Windows x86-64 | [llap-windows-amd64.exe](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-windows-amd64.exe) |
+| Windows ARM64 | [llap-windows-arm64.exe](https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-windows-arm64.exe) |
 
 Verify the checksum after downloading:
 
 ```bash
 # Download the checksum file
-curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.220/llap-SHA256SUMS -o llap-SHA256SUMS
+curl --disable -fsSL https://github.com/LLM-API-Proxy/llap/releases/download/v0.0.221/llap-SHA256SUMS -o llap-SHA256SUMS
 
 # Verify (Linux / macOS with sha256sum)
 sha256sum --check --ignore-missing llap-SHA256SUMS
@@ -241,6 +243,15 @@ sha256sum --check --ignore-missing llap-SHA256SUMS
 # Verify (macOS with shasum)
 shasum -a 256 --check --ignore-missing llap-SHA256SUMS
 ```
+
+On Windows (PowerShell), compare the hash with the matching line of `llap-SHA256SUMS` (`llap-windows-amd64.exe` on x64, `llap-windows-arm64.exe` on Arm):
+
+```powershell
+(Get-FileHash .\llap-windows-amd64.exe -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\llap-windows-arm64.exe -Algorithm SHA256).Hash.ToLower()
+```
+
+Both Windows builds are native (x64 for Windows 10 and 11 on Intel/AMD, arm64 for Windows on Arm) and need no Visual C++ runtime. Rename the one for your machine to `llap.exe` and put it in a directory on your `PATH`.
 
 Make the binary executable and move it onto your `PATH`:
 
@@ -257,23 +268,23 @@ All images are published to the GitHub Container Registry:
 
 | Image | Tag |
 |---|---|
-| `ghcr.io/llm-api-proxy/server:0.0.220` | Proxy server |
-| `ghcr.io/llm-api-proxy/cli:0.0.220` | Management CLI |
-| `ghcr.io/llm-api-proxy/backup:0.0.220` | Restic backup agent |
+| `ghcr.io/llm-api-proxy/server:0.0.221` | Proxy server |
+| `ghcr.io/llm-api-proxy/cli:0.0.221` | Management CLI |
+| `ghcr.io/llm-api-proxy/backup:0.0.221` | Restic backup agent |
 
 ### Tag Conventions
 
 | Tag | Meaning |
 |---|---|
 | `latest` | Most recent stable release |
-| `0.0.220` | Exact version (e.g. `1.2.3`) |
+| `0.0.221` | Exact version (e.g. `1.2.3`) |
 | `X.Y` | Latest patch for this minor (e.g. `1.2`) |
 | `X` | Latest minor for this major (e.g. `1`) |
 
 Pull a specific version to avoid unexpected upgrades:
 
 ```bash
-docker pull ghcr.io/llm-api-proxy/server:0.0.220
+docker pull ghcr.io/llm-api-proxy/server:0.0.221
 ```
 
 ---
