@@ -36,6 +36,8 @@ rule_files:
   - 'rules/llap-forward-proxy-ca.yml'
   # Thread-store breaker and silent client-history rewrites (#2485).
   - 'rules/llap-history-rewrite.yml'
+  # Host root filesystem free space (#2527). Fed by the `cadvisor` job below.
+  - 'rules/llap-host-disk.yml'
 
 # Alertmanager connection — only active when the monitoring overlay includes
 # the alertmanager service (docker-compose.monitoring.yml).

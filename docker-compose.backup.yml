@@ -93,6 +93,10 @@ services:
       # Backup schedule (cron expression).
       # Written to the supercronic crontab at container start.
       BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
+      # Installed release. Retention pins every pre-upgrade recovery point of
+      # the upgrade to this version: the installer's rollback still needs it
+      # (#2531). Empty means unknown, and then no upgrade snapshot is forgotten.
+      LLAP_INSTALLED_VERSION: ${PROXY_VERSION:-}
       # Restic repository configuration.
       RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:?RESTIC_REPOSITORY must be set (e.g. s3:s3.amazonaws.com/mybucket/llm-proxy)}
       RESTIC_PASSWORD: ${RESTIC_PASSWORD:?RESTIC_PASSWORD must be set}
@@ -151,7 +155,12 @@ services:
       resources:
         limits:
           cpus: "0.5"
-          memory: 512m
+          # 1 GiB, not 512 MiB (#2531): restic was OOM-killed in this cgroup
+          # three times (7-8 Nov 2026) while it loaded the index of a
+          # 490-snapshot repository for a ~55 GB `backup --stdin` plus a
+          # `dump`. The job lock now serialises restic jobs, and the first
+          # prune after the retention fix still reads the full index.
+          memory: 1g
         reservations:
           cpus: "0.1"
           memory: 64m
