@@ -629,7 +629,7 @@ services:
   # bridge networking, so no published host port is needed). TLS terminates at
   # Traefik, so the responder speaks plain HTTP.
   backend-unavailable:
-    image: nginx:1.27-alpine
+    image: nginx:1.31.9-alpine@sha256:90b6bd2aec278b16b98221d64deb1d6d35d164567f507ab0716e6053878315aa
     restart: unless-stopped
     volumes:
       - ./backend-unavailable/default.conf:/etc/nginx/conf.d/default.conf:ro

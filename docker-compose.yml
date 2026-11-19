@@ -579,7 +579,7 @@ services:
   # host-networked Traefik reaches it at [::1]:8081 (matching the WAF sidecar
   # pattern). Listens plain-HTTP; TLS terminates at Traefik.
   backend-unavailable:
-    image: nginx:1.27-alpine
+    image: nginx:1.31.9-alpine@sha256:90b6bd2aec278b16b98221d64deb1d6d35d164567f507ab0716e6053878315aa
     restart: unless-stopped
     networks:
       - proxy_net
