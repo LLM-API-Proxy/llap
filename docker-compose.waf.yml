@@ -9,15 +9,16 @@
 
 services:
   modsecurity:
-    image: owasp/modsecurity-crs:4-nginx-alpine-202603150103
+    # #2542: upstream rebuild includes patched nginx 1.30.7 on amd64 and arm64.
+    image: owasp/modsecurity-crs:4.30.0-nginx-alpine-202611190211@sha256:f7b4ec036553aa65e65fe792394099f597d6130465e63ff58d84f087617f5412
     networks:
       - proxy_net
     ports:
-      - "[::1]:8180:80"
+      - "[::1]:8180:8080"
     environment:
-      # CRS Paranoia Level 1 — catches the vast majority of real attacks
-      # with minimal false positives.
-      PARANOIA: "1"
+      # Send accepted request copies to a local empty response, never to LLAP.
+      BACKEND: "http://127.0.0.1:8181"
+      BLOCKING_PARANOIA: "1"
       # 50 MB body limit for LLM payloads (base64 vision images can be ~25 MB)
       MODSEC_REQ_BODY_LIMIT: "52428800"
       MODSEC_REQ_BODY_NOFILES_LIMIT: "52428800"
@@ -29,9 +30,10 @@ services:
       MODSEC_AUDIT_ENGINE: "RelevantOnly"
       MODSEC_AUDIT_LOG_TYPE: "Serial"
       # Allowed request content types
-      ALLOWED_REQUEST_CONTENT_TYPE: "application/json|application/x-www-form-urlencoded|multipart/form-data|text/event-stream|text/plain"
+      ALLOWED_REQUEST_CONTENT_TYPE: "|application/json|application/x-www-form-urlencoded|multipart/form-data|text/event-stream|text/plain|"
     volumes:
       - ./modsecurity/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:ro
+      - ./modsecurity/inspection-sink.conf:/etc/nginx/conf.d/inspection-sink.conf:ro
     labels:
       # The WAF middleware is declared on the WAF's OWN container (issue #1951).
       # It used to sit on the proxy container's labels, which coupled it to the
@@ -51,7 +53,7 @@ services:
       - "traefik.http.middlewares.modsecurity-waf.plugin.modsecurity.maxBodySize=52428800"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -74,43 +76,7 @@ services:
       TRAEFIK_PROXY_API_MIDDLEWARES: ${TRAEFIK_PROXY_API_MIDDLEWARES:-service-unavailable@consul,modsecurity-waf@docker,hsts@consul}
 
   traefik:
-    command:
-      # IMPORTANT: Compose replaces command arrays entirely — this MUST include
-      # ALL flags from the base compose plus any new ones. If using multiple
-      # overlays that set command (hardened, tls, waf), only the LAST one wins.
-      # The installer's compose-command.sh ensures correct overlay ordering.
-      # Full base flags are repeated here for standalone WAF testing.
-      - "--providers.consul.endpoints=[::1]:8500"
-      - "--providers.consul.rootkey=traefik"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedByDefault=false"
-      - "--entrypoints.websecure.address=[::]:443"
-      - "--entrypoints.forward-proxy.address=[::]:8443"
-      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
-      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
-      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
-      - "--api=false"
-      # Liveness ping entrypoint (#1550 / #1551). This overlay replaces the base
-      # command wholesale, so the ping flags MUST be repeated here — otherwise the
-      # base traefik healthcheck (inherited) would probe a ping entrypoint that
-      # does not exist and mark a healthy WAF Traefik unhealthy. Uses 127.0.0.1:8083
-      # so the liveness probe stays loopback-only and never collides with the
-      # metrics entrypoint on 8082 (which is bridge-reachable, see below).
-      - "--ping=true"
-      - "--ping.entrypoint=ping"
-      - "--entrypoints.ping.address=127.0.0.1:8083"
-      - "--log.level=INFO"
-      - "--accesslog=true"
-      # Traefik metrics endpoint for Prometheus scraping (#1881).
-      # `entryPoint` is the Traefik v3 flag spelling (the lowercase variant is
-      # not recognised), and the address must be reachable from the proxy_net
-      # bridge — Prometheus scrapes host.docker.internal:8082, never the
-      # container's own loopback, so a [::1] bind is unscrapeable by design.
-      # Public exposure is prevented by the installer's INPUT chain, which
-      # admits 8082 from Docker bridges only.
-      - "--metrics.prometheus=true"
-      - "--metrics.prometheus.entryPoint=metrics"
-      - "--entrypoints.metrics.address=[::]:8082"
-      # ModSecurity WAF plugin
-      - "--experimental.plugins.modsecurity.moduleName=github.com/acouvreur/traefik-modsecurity-plugin"
-      - "--experimental.plugins.modsecurity.version=v1.6.0"
+    # Keep the selected base/TLS command. The wrapper adds only the plugin flags.
+    entrypoint: ["/bin/sh", "/etc/traefik/modsecurity-entrypoint.sh"]
+    volumes:
+      - ./modsecurity/traefik-entrypoint.sh:/etc/traefik/modsecurity-entrypoint.sh:ro
