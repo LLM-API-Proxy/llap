@@ -78,7 +78,8 @@ services:
       # will load no TLS options from Consul and fall back to defaults (TLS 1.0
       # allowed). The depends_on: consul-init: service_completed_successfully ordering
       # in the base compose prevents this under normal operation.
-      - "--providers.consul.endpoints=[::1]:8500"
+      # Match the base CLI selector even when this overlay replaces its command.
+      - "--providers.consul.endpoints=${TRAEFIK_CONSUL_ENDPOINT:-[::1]:8500}"
       - "--providers.consul.rootkey=traefik"
       # Docker provider: discovers routing config from container labels
       - "--providers.docker=true"

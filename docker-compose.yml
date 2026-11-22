@@ -640,7 +640,10 @@ services:
       # will load no TLS options from Consul and fall back to defaults (TLS 1.0
       # allowed). The depends_on: consul-init: service_completed_successfully ordering
       # below prevents this under normal operation.
-      - "--providers.consul.endpoints=[::1]:8500"
+      # The installer selects consul:8500 for the no-mdns bridge topology (#2545).
+      # Keep this CLI setting (not a competing TRAEFIK_PROVIDERS_* env setting)
+      # in both command lists: the TLS overlay replaces this sequence wholesale.
+      - "--providers.consul.endpoints=${TRAEFIK_CONSUL_ENDPOINT:-[::1]:8500}"
       - "--providers.consul.rootkey=traefik"
       # Docker provider: discovers routing config from container labels
       - "--providers.docker=true"
@@ -839,12 +842,18 @@ services:
       PROXY_KEK_VALUE: ${PROXY_KEK_VALUE:-}
       PROXY_KEK_PASSPHRASE: ${PROXY_KEK_PASSPHRASE:-}
       PROXY_ALLOW_FIRSTRUN_WIZARD: ${PROXY_ALLOW_FIRSTRUN_WIZARD:-true}
+      LLAP_LICENSE_DATA_DIR: /opt/llm-api-proxy/data/licensing
+      LLAP_INTERNAL_GRANT_FILE: /opt/llm-api-proxy/data/licensing/internal-grant.jwt
+      LLAP_EXPECT_INTERNAL_GRANT: ${LLAP_EXPECT_INTERNAL_GRANT:-false}
       # Consul KV — host networking means consul is at localhost
       CONSUL_HTTP_ADDR: http://localhost:8500
       CONSUL_HTTP_TOKEN: ${PROXY_CONSUL_TOKEN:-}
     depends_on:
       consul:
         condition: service_healthy
+    # Keep proof independent of PostgreSQL and outside rollback deployment tar.
+    volumes:
+      - ${LLAP_LICENSE_STORAGE:-licensing_data}:/opt/llm-api-proxy/data/licensing
     # ── No Traefik labels on this container (issue #1951) ─────────────────────
     # Every product router, service and middleware is seeded into Consul KV by
     # consul-init above, NOT declared here. Traefik's Docker provider silently
@@ -862,5 +871,7 @@ networks:
     enable_ipv6: true
 
 volumes:
+  licensing_data:
+  licensing_debug_data:
   timescaledb_data:
   consul_data:

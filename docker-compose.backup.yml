@@ -56,6 +56,28 @@
 #   proxy/backup/config     — JSON config (schedule, retention, targets) — read-only by agent
 
 services:
+  # Narrow read-only exporter. No Restic/AWS/Consul credentials, network, or
+  # capabilities. The UID matches the private engine store; modes stay 0700/0600.
+  licensing-export:
+    image: ${PROXY_BACKUP_IMAGE:-ghcr.io/llm-api-proxy/backup:${PROXY_VERSION:-latest}}
+    entrypoint: ["python3", "/app/licensing.py", "serve"]
+    user: "65532:0"
+    environment:
+      LLAP_EXPECT_INTERNAL_GRANT: ${LLAP_EXPECT_INTERNAL_GRANT:-false}
+    network_mode: none
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${LLAP_LICENSE_STORAGE:-licensing_data}:/licensing:ro
+      - licensing_export:/run/licensing
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.1"
+
   # ─── Restic backup agent ──────────────────────────────────────────────────
   backup:
     # Pre-built backup agent image from GHCR.
@@ -64,6 +86,8 @@ services:
     image: ${PROXY_BACKUP_IMAGE:-ghcr.io/llm-api-proxy/backup:${PROXY_VERSION:-latest}}
     restart: unless-stopped
     depends_on:
+      licensing-export:
+        condition: service_started
       consul:
         condition: service_healthy
       consul-init:
@@ -97,6 +121,7 @@ services:
       # the upgrade to this version: the installer's rollback still needs it
       # (#2531). Empty means unknown, and then no upgrade snapshot is forgotten.
       LLAP_INSTALLED_VERSION: ${PROXY_VERSION:-}
+      LLAP_EXPECT_INTERNAL_GRANT: ${LLAP_EXPECT_INTERNAL_GRANT:-false}
       # Restic repository configuration.
       RESTIC_REPOSITORY: ${RESTIC_REPOSITORY:?RESTIC_REPOSITORY must be set (e.g. s3:s3.amazonaws.com/mybucket/llm-proxy)}
       RESTIC_PASSWORD: ${RESTIC_PASSWORD:?RESTIC_PASSWORD must be set}
@@ -130,6 +155,7 @@ services:
     # volumes also preserves a store whose overlay was dropped (they are never
     # deleted).
     volumes:
+      - licensing_export:/run/licensing:ro
       - garage_meta:/garage/meta:ro
       - garage_data:/garage/data:ro
     # Run as root (user: "0:0") so entrypoint.sh can write the crontab into the
@@ -167,5 +193,7 @@ services:
 
 # Shared with docker-compose.garage.yml (same project, same named volumes).
 volumes:
+  licensing_data:
+  licensing_export:
   garage_meta:
   garage_data:

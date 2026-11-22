@@ -8,7 +8,13 @@
 #   - CI/CD pipelines that do not require mDNS service discovery
 #
 # Usage (always layer on top of the base compose):
-#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.no-mdns.yml up -d
+#   TRAEFIK_CONSUL_ENDPOINT=consul:8500 docker compose -f docker/docker-compose.yml -f docker/docker-compose.no-mdns.yml up -d
+#
+# The official installer writes TRAEFIK_CONSUL_ENDPOINT automatically to its
+# Compose .env, including when the TLS overlay is enabled.
+# Manual Compose callers MUST set it as above (or in the Compose .env): the
+# base/TLS CLI default [::1]:8500 is only reachable with host networking (#2545).
+# A container environment variable cannot override that CLI configuration.
 #
 # What this overlay does:
 #   1. Clears network_mode: host from the traefik service (restores bridge networking)
