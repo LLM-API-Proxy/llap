@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.230"
+INSTALLER_VERSION="0.0.231"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -18594,8 +18594,14 @@ installer_license_stage() {
     # A digest-qualified anonymous public pull cannot fall back to private core.
     installer_docker pull "$image" >> "$LOG_FILE" 2>&1 \
         || die "Could not pull the public receipt-authorized licensing image."
-    [[ "$(installer_docker image inspect --format '{{.Config.User}}' "$image")" == "nonroot:nonroot" ]] \
-        || die "Unexpected public server runtime user."
+    local runtime_user
+    runtime_user="$(installer_docker image inspect --format '{{.Config.User}}' "$image")" \
+        || die "Could not inspect public server runtime user."
+    # Distroless publishes its nonroot UID in OCI metadata as a number.
+    case "$runtime_user" in
+        65532|65532:65532|nonroot:nonroot) ;;
+        *) die "Unexpected public server runtime user." ;;
+    esac
     installer_install_private_directories "${INSTALL_DIR}/data" \
         || die "Could not prepare private licensing parent."
     if ! $SUDO test -d "$data"; then
@@ -18630,7 +18636,7 @@ installer_license_stage() {
         fi
         # Validate candidate without replacing the current grant. No secret output.
         if ! installer_docker run --rm --network none --read-only --cap-drop ALL \
-            --security-opt no-new-privileges \
+            --security-opt no-new-privileges --user 65532:65532 \
             --mount "type=bind,src=${data},dst=/opt/llm-api-proxy/data/licensing,readonly=true" \
             -e LLAP_LICENSE_DATA_DIR=/opt/llm-api-proxy/data/licensing \
             -e LLAP_INTERNAL_GRANT_FILE=/opt/llm-api-proxy/data/licensing/.internal-grant.new \
@@ -18650,7 +18656,7 @@ installer_license_stage() {
     fi
     local -a mount=(--mount "type=bind,src=${data},dst=/opt/llm-api-proxy/data/licensing,${access}")
     installer_docker run --rm --network none --read-only --cap-drop ALL \
-        --security-opt no-new-privileges "${mount[@]}" \
+        --security-opt no-new-privileges --user 65532:65532 "${mount[@]}" \
         -e LLAP_LICENSE_DATA_DIR=/opt/llm-api-proxy/data/licensing \
         -e LLAP_INTERNAL_GRANT_FILE=/opt/llm-api-proxy/data/licensing/internal-grant.jwt \
         -e LLAP_EXPECT_INTERNAL_GRANT=true "$image" "$mode" \
