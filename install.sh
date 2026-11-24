@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.233"
+INSTALLER_VERSION="0.0.234"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -225,7 +225,9 @@ log_init() {
     local safe_args="" argument safe_argument quoted_argument
     if [[ -z "$LOG_FILE" ]]; then
         LOG_FILE="$(
-            mktemp "${TMPDIR:-/tmp}/llm-api-proxy-install.XXXXXXXX.log"
+            # The receipt wrapper deletes its private TMPDIR on exit. Keep this
+            # diagnostic in a separate, atomically created owner-only file.
+            mktemp /var/tmp/llm-api-proxy-install.XXXXXXXX
         )" || {
             echo "Could not allocate a private installer log." >&2
             return 1
@@ -8961,9 +8963,87 @@ deploy_backup_compose_files() {
     info "Compose files backed up to ${backup_dir}"
 }
 
+# Classify only known registry/transport diagnostics. Never guess a retry from
+# a bare cancellation, an HTTP code embedded in a digest, or a Compose error.
+# Full original stderr stays in the private log, not on a potentially public TTY.
+installer_pull_error_class() {
+    # Return a private stderr record number (0 = no attributable record) and
+    # a fixed public label. Unknown text vetoes retry; never search arbitrary
+    # prose for an incidental status code. A collateral cancellation alone is
+    # not an initiating cause. A permanent signal wins regardless of ordering.
+    LC_ALL=C awk '
+        {
+            msg=tolower($0); sub(/^[[:space:]]+/, "", msg); sub(/[[:space:]]+$/, "", msg)
+            sub(/^error response from daemon: /, "", msg)
+            if (msg == "" || msg ~ /^context cancel(l)?ed$/) next
+            if (msg ~ /authenticat|unauthorized|credential|access denied|forbidden|permission denied|(^|[ :])(401|403)([ :]|$)/) label="registry authentication or permission error"
+            else if (msg ~ /manifest unknown|not found|no matching manifest|(^|[ :])404([ :]|$)/) label="image or platform manifest not found"
+            else if (msg ~ /digest|verif(y|ication)|failed precondition|invalid reference|authority|certificate|unsupported/) label="image identity or configuration error"
+            else label=""
+            if (label != "") { print NR, label; hard=1; exit }
+            if (msg ~ /^(toomanyrequests: http 429|too many requests|http 429( too many requests)?)$/) kind="registry throttling"
+            else if (msg ~ /^(read: connection reset by peer|connection reset by peer|i\/o timeout|net\/http: tls handshake timeout|context deadline exceeded|unexpected eof)$/) kind="transport interruption or timeout"
+            else if (msg ~ /^(http |unexpected status from registry: )(500 internal server error|502 bad gateway|503 service unavailable|504 gateway timeout|5[0-9][0-9])$/) kind="registry server error"
+            else { ambiguous=1; next }
+            if (!first) { first=NR; reason=kind }
+            else if (reason != kind) ambiguous=1
+        }
+        END {
+            if (!hard && first && !ambiguous) print first, "transient: " reason
+            else if (!hard) print 0, "insufficient or ambiguous stderr; initiating cause unknown"
+        }
+    ' "$1"
+}
+
+installer_pull_compose_services() {
+    local services service attempt diagnostic result rc prior_lines record location
+    # A project-wide Compose pull starts siblings concurrently. One failure can
+    # cancel all other pulls (v0.0.233): the daemon's context-canceled messages
+    # need not identify the original service. Enumerate the *live* overlay set
+    # through the same trusted launcher, not a hand-maintained list of images.
+    if ! services=$(installer_run_live_compose config --services 2>>"$LOG_FILE") || [[ -z "$services" ]]; then
+        fail "Could not resolve the active Compose services; no pull attempted. See ${LOG_FILE}."
+        return 1
+    fi
+    diagnostic=$(mktemp "${TMPDIR:-/tmp}/llap-pull.XXXXXXXX") || return 1
+    CLEANUP_FILES+=("$diagnostic")
+    while IFS= read -r service; do
+        [[ "$service" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
+            fail "Invalid service in the resolved Compose model; refusing to pull."
+            return 1
+        }
+        for attempt in 1 2 3; do
+            info "Pulling Compose service ${service} (attempt ${attempt}/3)"
+            if installer_run_live_compose pull --quiet "$service" >>"$LOG_FILE" 2>"$diagnostic"; then
+                cat "$diagnostic" >> "$LOG_FILE" || return 1
+                break
+            else
+                rc=$?
+            fi
+            # Separate the raw stderr block even when progress had no final LF.
+            printf '\n' >> "$LOG_FILE" || return 1
+            prior_lines=$(wc -l < "$LOG_FILE") || return 1
+            cat "$diagnostic" >> "$LOG_FILE" || return 1
+            printf '\n' >> "$LOG_FILE" || return 1
+            result=$(installer_pull_error_class "$diagnostic") || return 1
+            record=${result%% *}
+            result=${result#* }
+            location="see protected log ${LOG_FILE}"
+            if (( record > 0 )); then
+                location="stderr evidence: ${LOG_FILE}, line $((prior_lines + record))"
+            fi
+            warn "Pull failed for Compose service ${service}: ${result} (exit ${rc}); ${location}."
+            if [[ "$result" != transient:* || "$attempt" == 3 ]]; then
+                return "$rc"
+            fi
+            sleep "$((attempt * 2))" || return 1
+        done
+    done <<< "$services"
+}
+
 deploy_pull_images() {
     step "  Pulling Docker images..."
-    installer_run_live_compose pull >> "$LOG_FILE" 2>&1 || {
+    installer_pull_compose_services || {
         if [[ "$OPT_DEBUG" == "true" ]]; then
             local version_tag="${OPT_VERSION:-edge}-debug"
             local images="ghcr.io/llm-api-proxy/server-debug:${version_tag}"
@@ -8987,17 +9067,9 @@ deploy_pull_images() {
         else
             draw_box "FAILED: Pull Docker images" \
                 "" \
-                "Error pulling one or more images." \
-                "" \
-                "This usually means:" \
-                "  • The version tag doesn't exist" \
-                "  • GHCR is temporarily unavailable" \
-                "  • Network/proxy is blocking the request" \
-                "" \
-                "Try:" \
-                "  1. Check: ghcr.io/llm-api-proxy/server" \
-                "  2. Run: docker pull <image> manually" \
-                "  3. Re-run install.sh to retry" \
+                "See the failing service or Compose configuration step above." \
+                "The original Compose diagnostic is in the protected log." \
+                "A working ghcr.io/llm-api-proxy/server pull does not test the other services." \
                 "" \
                 "Full log: ${LOG_FILE}"
         fi
