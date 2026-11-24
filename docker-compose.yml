@@ -282,7 +282,7 @@ services:
         # re-deploys never clobber operator overrides.
         #
         # NOTE: $${TRAEFIK_UNAVAILABLE_BACKEND_URL} is escaped ($$) so Docker
-        # Compose passes it through to the shell as a literal $VAR — the value is
+        # Compose passes it through to the shell as a literal variable reference — the value is
         # read from the container ENVIRONMENT (set above), not substituted by
         # Compose at render time.
         #

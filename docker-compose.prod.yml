@@ -213,7 +213,7 @@ services:
         # Idempotent: only writes keys that do not already exist.
         #
         # $${TRAEFIK_UNAVAILABLE_BACKEND_URL} is escaped so Compose passes a
-        # literal $VAR to the shell; the value comes from the container ENV above.
+        # literal variable reference to the shell; the value comes from the container ENV above.
         #
         # 1. Static responder service. Write the URL EVERY run: it is
         #    infrastructure-derived (tracks the networking mode), not an operator
@@ -484,7 +484,7 @@ services:
           # Tokens are stored in Consul's token store only — never in KV or files.
           EXISTING=$(consul acl token list -format=json 2>/dev/null | \
             grep -o '"Description":"backup-agent-token"' | head -1) || EXISTING=""
-          if [ -z "$EXISTING" ]; then
+          if [ -z "$$EXISTING" ]; then
             echo ">>> Creating backup-agent-token — copy SecretID to BACKUP_CONSUL_HTTP_TOKEN"
             consul acl token create \
               -description "backup-agent-token" \
@@ -496,7 +496,7 @@ services:
           # Token: proxy-server-backup-token
           EXISTING2=$(consul acl token list -format=json 2>/dev/null | \
             grep -o '"Description":"proxy-server-backup-token"' | head -1) || EXISTING2=""
-          if [ -z "$EXISTING2" ]; then
+          if [ -z "$$EXISTING2" ]; then
             echo ">>> Creating proxy-server-backup-token — copy SecretID to PROXY_BACKUP_CONSUL_TOKEN"
             consul acl token create \
               -description "proxy-server-backup-token" \
