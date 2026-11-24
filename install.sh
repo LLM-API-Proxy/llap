@@ -38,7 +38,7 @@ fi
 _main() {
 
 # ── Constants ────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="0.0.234"
+INSTALLER_VERSION="0.0.235"
 # sha256 of docker/timescaledb/Dockerfile at this release, stamped by
 # build-installer.sh. The release's database image carries it as its
 # com.llap.database-image.content-id label (docs/operations/database-image.md).
@@ -10343,7 +10343,8 @@ database_validate_staged_compose_against_running_stack() {
     local overlay include_receipt="false" backup_enabled="false"
     local tls_overlay="false" excused_env_key=""
     local source_command="${root}/compose-command.sh" late_ca_pin=""
-    local -a overlays=()
+    local managed_suffix pre_recovery_files="" label_files matched="false"
+    local -a overlays=() label_candidates=()
     if $SUDO test -f "${root}/compose-command.source.sh"; then
         source_command="${root}/compose-command.source.sh"
     fi
@@ -10368,6 +10369,14 @@ database_validate_staged_compose_against_running_stack() {
         include_receipt="true"
         installer_existing_receipt_recovery_files_are_authorized \
             "$root" "$backup_enabled" "$source_version" || return 1
+        # Files-only recovery publishes the two managed image overlays without
+        # recreating containers. Engine labels still name their original files.
+        # Derive one exact alternate from the canonical, authorized launcher;
+        # never strip, sort or normalize any part of an observed Engine label.
+        managed_suffix=",${INSTALL_DIR%/}/docker/docker-compose.source-recovery-images.yml"
+        if [[ "$expected_config_files" == *"$managed_suffix" ]]; then
+            pre_recovery_files=${expected_config_files%"$managed_suffix"}
+        fi
         expected_config_files+=",${INSTALL_DIR%/}/docker/docker-compose.receipt-recovery.yml"
     fi
     database_run_staged_source_compose \
@@ -10431,30 +10440,38 @@ database_validate_staged_compose_against_running_stack() {
         printf 'Captured source model: accepted the installer-authored PROXY_TLS__ENABLED=false in .env while the canonical TLS overlay renders the proxy with PROXY_TLS__ENABLED=true (sudo-upgrade configure_tls defect); this upgrade rewrites .env with PROXY_TLS__ENABLED=true.\n' \
             >> "$LOG_FILE"
     fi
-    if ! database_validate_rendered_service_against_running_stack \
-            "$config_json" "$expected_config_files" proxy true \
-        || ! database_validate_rendered_service_against_running_stack \
-            "$config_json" "$expected_config_files" traefik false; then
-        # A host left by a v0.0.182+ installer carries the forward-proxy CA pin
-        # that install.sh appends to .env after `compose up`, so the running
-        # proxy and Traefik never received it. Accept that one installer-
-        # authored write — and nothing else — once it is authenticated.
-        late_ca_pin="$(
-            installer_source_env_late_ca_pin "$root" "$source_version"
-        )" || return 1
+    label_candidates=("$expected_config_files")
+    [[ -z "$pre_recovery_files" ]] || label_candidates+=("$pre_recovery_files")
+    # Select one label for the entire stack, not independent exceptions for
+    # individual containers. The full image-lock capture below uses it too.
+    for label_files in "${label_candidates[@]}"; do
+        if database_validate_rendered_service_against_running_stack \
+                "$config_json" "$label_files" proxy true \
+            && database_validate_rendered_service_against_running_stack \
+                "$config_json" "$label_files" traefik false; then
+            matched=true
+            break
+        fi
+    done
+    if [[ "$matched" != true ]]; then
+        late_ca_pin="$(installer_source_env_late_ca_pin "$root" "$source_version")" || return 1
         installer_late_ca_pin_matches_served_ca "$late_ca_pin" || return 1
-        database_validate_rendered_service_against_running_stack \
-            "$config_json" "$expected_config_files" proxy true \
-            "$late_ca_pin" || return 1
-        database_validate_rendered_service_against_running_stack \
-            "$config_json" "$expected_config_files" traefik false \
-            "$late_ca_pin" || return 1
+        for label_files in "${label_candidates[@]}"; do
+            if database_validate_rendered_service_against_running_stack \
+                    "$config_json" "$label_files" proxy true "$late_ca_pin" \
+                && database_validate_rendered_service_against_running_stack \
+                    "$config_json" "$label_files" traefik false "$late_ca_pin"; then
+                matched=true
+                break
+            fi
+        done
+        [[ "$matched" == true ]] || return 1
         printf 'Captured source model: accepted the installer-authored forward-proxy CA pin (sha256 %s) written after the source deploy started its containers (#2336).\n' \
             "$late_ca_pin" >> "$LOG_FILE"
     fi
     [[ -z "$image_lock_destination" ]] \
         || database_capture_running_source_image_lock \
-            "$config_json" "$expected_config_files" \
+            "$config_json" "$label_files" \
             "$image_lock_destination" "$source_version"
 }
 
